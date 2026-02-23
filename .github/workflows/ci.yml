@@ -66,18 +66,18 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all --all-targets --features mlkem
       - name: Check docs
-        run: cargo doc --no-deps -p boring2 -p boring-sys2 --features underscore-wildcards
+        run: cargo doc --no-deps -p btls -p btls-sys --features underscore-wildcards
         env:
           CARGO_BUILD_RUSTDOCFLAGS: "--cfg=docsrs"
           RUSTC_BOOTSTRAP: 1
           DOCS_RS: 1
-      - name: Cargo.toml boring versions consistency
+      - name: Cargo.toml btls versions consistency
         shell: bash
         run: |
           WORKSPACE_VERSION=$(grep -F '[workspace.package]' -A1 Cargo.toml | grep -F version | grep -Eo '".*"')
-          if [[ -z "$WORKSPACE_VERSION" ]]; then echo 2>&1 "error: can't find boring version"; exit 1; fi
-          if grep -E 'boring.* =' Cargo.toml | grep -vF "$WORKSPACE_VERSION"; then
-            echo 2>&1 "error: boring dependencies must match workspace version $WORKSPACE_VERSION"
+          if [[ -z "$WORKSPACE_VERSION" ]]; then echo 2>&1 "error: can't find btls version"; exit 1; fi
+          if grep -E 'btls.* =' Cargo.toml | grep -vF "$WORKSPACE_VERSION"; then
+            echo 2>&1 "error: btls dependencies must match workspace version $WORKSPACE_VERSION"
             exit 1
           fi
   test:
@@ -203,7 +203,7 @@ jobs:
               LIBRARY_PATH: "C:\\msys64\\usr\\lib"
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-boring2 -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
           - thing: i686-mingw
             target: i686-pc-windows-gnu
             rust: stable
@@ -214,7 +214,7 @@ jobs:
               CMAKE_GENERATOR: "MinGW Makefiles"
               COLLECT_GCC: null
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-boring2 -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
           - thing: i686-msvc
             target: i686-pc-windows-msvc
             rust: stable-x86_64-msvc
@@ -223,7 +223,7 @@ jobs:
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
               CXXFLAGS: -msse2
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-boring2 -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
           - thing: x86_64-msvc
             target: x86_64-pc-windows-msvc
             rust: stable-x86_64-msvc
@@ -231,7 +231,7 @@ jobs:
             custom_env:
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-boring2 -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
           - thing: x86_64-msvc-static
             target: x86_64-pc-windows-msvc
             rust: stable-x86_64-msvc
@@ -240,7 +240,7 @@ jobs:
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
               RUSTFLAGS: -Dwarnings -C target-feature=+crt-static
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-boring2 -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
     env:
       CARGO_HOME: ${{ github.workspace }}/.cache/cargo
       CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/.cache/build-dir
@@ -343,18 +343,18 @@ jobs:
         run: cargo test --target ${{ matrix.target }} ${{ matrix.extra_test_args }}
         shell: bash
         env: ${{ matrix.custom_env }}
-      - name: Test boring-sys2 cargo publish
+      - name: Test btls-sys cargo publish
         # Running `cargo publish --dry-run` tests two things:
         #
-        # 1. That `boring-sys` can build BoringSSL with just the files included
+        # 1. That `btls-sys` can build BoringSSL with just the files included
         #    in the crates.io package (as determined by the `include` field in
         #    the `Cargo.toml`).
-        # 2. That the final `boring-sys` package size, including the BoringSSL
+        # 2. That the final `btls-sys` package size, including the BoringSSL
         #    submodules, is not too large to be published to `crates.io`.
         #
         # Both of these may no longer be the case after updating the BoringSSL
         # submodules to a new revision, so it's important to test this on CI.
-        run: cargo publish --dry-run --target ${{ matrix.target }} -p boring-sys2
+        run: cargo publish --dry-run --target ${{ matrix.target }} -p btls-sys
         shell: bash
         env: ${{ matrix.custom_env }}
 
@@ -414,19 +414,19 @@ jobs:
         with:
           toolchain: stable
           override: true
-      - name: Prebuild boring-sys2
-        run: cargo build -p boring-sys2
+      - name: Prebuild btls-sys
+        run: cargo build -p btls-sys
       - name: publish crates
         run: |
           cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          echo "===  Publishing boring-sys2... ==="
-          (cd boring-sys && cargo publish)
+          echo "===  Publishing btls-sys... ==="
+          (cd btls-sys && cargo publish)
           sleep 10
-          echo "===  Publishing boring2... ==="
-          (cd boring && cargo publish)
+          echo "===  Publishing btls... ==="
+          (cd btls && cargo publish)
           sleep 10
-          echo "===  Publishing tokio-boring2... ==="
-          (cd tokio-boring && cargo publish)
+          echo "===  Publishing tokio-btls... ==="
+          (cd tokio-btls && cargo publish)
 
       - name: Upload binaries to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -480,9 +480,9 @@ jobs:
         run: |
           cargo init test-project
           cd test-project
-          cargo add boring-sys2 --path ../boring-sys/
+          cargo add btls-sys --path ../btls-sys/
           cargo add openssl-sys -F vendored
-          echo "fn main() {boring_sys2::init(); openssl_sys::init();}" > src/main.rs
+          echo "fn main() {btls_sys::init(); openssl_sys::init();}" > src/main.rs
       - name: Install Rust toolchain
         shell: bash
         run: rustup target add ${{ matrix.target }}
@@ -507,7 +507,7 @@ jobs:
           echo "Failed as expected: $RC"
       - name: Add prefix-symbols feature
         shell: bash
-        run: cargo add boring-sys2 --path ../boring-sys/ -F prefix-symbols
+        run: cargo add btls-sys --path ../btls-sys/ -F prefix-symbols
       - name: Build with prefixing
         env: ${{ matrix.custom_env }}
         shell: bash

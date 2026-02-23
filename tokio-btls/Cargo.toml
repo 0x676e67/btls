@@ -1,0 +1,37 @@
+[package]
+name = "tokio-btls"
+version = { workspace = true }
+authors = ["0x676e67 <gngppz@gmail.com>", "Alex Crichton <alex@alexcrichton.com>", "Ivan Nikulin <ifaaan@gmail.com>"]
+license = "MIT OR Apache-2.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+homepage = "https://github.com/0x676e67/btls"
+documentation = "https://docs.rs/tokio-btls"
+description = """
+An implementation of SSL streams for Tokio backed by BoringSSL
+"""
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["btls/default"]
+
+# Use a FIPS-validated version of boringssl.
+fips = ["btls/fips"]
+
+# Add a prefix to all symbols in libcrypto and libssl to prevent conflicts
+# with OpenSSL versions that might be linked in the same process.
+prefix-symbols = ["btls/prefix-symbols"]
+
+read_uninit = []
+
+[dependencies]
+btls = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tokio = { workspace = true, features = [ "full" ] }
+anyhow = { workspace = true }

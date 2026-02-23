@@ -4,3 +4,5 @@ Cargo.lock
 *.iml
 .vscode/
 .DS_Store
+.venv
+boring-sys/deps/

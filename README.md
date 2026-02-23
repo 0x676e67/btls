@@ -1,13 +1,13 @@
-# boring2
+# btls
 
-[![crates.io](https://img.shields.io/crates/v/boring2.svg)](https://crates.io/crates/boring2)
+[![crates.io](https://img.shields.io/crates/v/btls.svg)](https://crates.io/crates/btls)
 
 BoringSSL bindings for the Rust programming language and TLS adapters for [tokio](https://github.com/tokio-rs/tokio).
 
 ## Documentation
- - Boring API: <https://docs.rs/boring2>
- - tokio TLS adapters: <https://docs.rs/tokio-boring2>
- - FFI bindings: <https://docs.rs/boring-sys2>
+ - BoringSSL API: <https://docs.rs/btls>
+ - tokio BoringSSL adapters: <https://docs.rs/tokio-btls>
+ - FFI bindings: <https://docs.rs/btls-sys>
 
 ## Contribution
 
@@ -18,4 +18,4 @@ Version 2.0 and the MIT license without any additional terms or conditions.
 
 ## Accolades
 
-The project is based on a fork of [boring](https://github.com/cloudflare/boring).
+A hard fork of [boring](https://github.com/cloudflare/boring).

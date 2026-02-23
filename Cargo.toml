@@ -1,14 +1,14 @@
 [workspace]
 members = [
-    "boring",
-    "boring-sys",
-    "tokio-boring",
+    "btls",
+    "btls-sys",
+    "tokio-btls",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "5.0.0-alpha.13"
-repository = "https://github.com/0x676e67/boring2"
+version = "0.5.0-alpha.1"
+repository = "https://github.com/0x676e67/btls"
 edition = "2021"
 rust-version = "1.85"
 
@@ -19,9 +19,9 @@ tag-prefix = ""
 publish = false
 
 [workspace.dependencies]
-boring-sys = { package = "boring-sys2", version = "5.0.0-alpha.13", path = "./boring-sys" }
-boring = { package = "boring2", version = "5.0.0-alpha.13", path = "./boring" }
-tokio-boring = { package = "tokio-boring2", version = "5.0.0-alpha.13", path = "./tokio-boring" }
+btls-sys = { package = "btls-sys", version = "0.5.0-alpha.1", path = "./btls-sys" }
+btls = { package = "btls", version = "0.5.0-alpha.1", path = "./btls" }
+tokio-btls = { package = "tokio-btls", version = "0.5.0-alpha.1", path = "./tokio-btls" }
 
 bindgen = { version = "0.72.0", default-features = false, features = ["runtime"] }
 bitflags = "2.9"
