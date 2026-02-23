@@ -25,22 +25,11 @@ fips = ["boring-sys/fips"]
 # **DO NOT USE** This will be removed without warning in future releases.
 legacy-compat-deprecated = []
 
-# **DO NOT USE** This will be removed without warning in future releases.
-# PQ is always enabled. This feature is a no-op, only for backwards compatibility.
-pq-experimental = []
-
 # Interface for ML-KEM (FIPS 203) post-quantum key encapsulation. Does not affect ciphers used in TLS.
 mlkem = []
 
 # SslCredential API
 credential = []
-
-# Enables Raw public key API (https://datatracker.ietf.org/doc/html/rfc7250)
-# This feature is necessary in order to compile the bindings for the
-# default branch of boringSSL. Alternatively, a version of boringSSL that
-# implements the same feature set can be provided by setting
-# `BORING_BSSL{,_FIPS}_SOURCE_PATH` and `BORING_BSSL{,_FIPS}_ASSUME_PATCHED`.
-rpk = ["credential", "boring-sys/rpk"]
 
 # Applies a patch to enable `ffi::X509_CHECK_FLAG_UNDERSCORE_WILDCARDS`. This
 # feature is necessary in order to compile the bindings for the default branch

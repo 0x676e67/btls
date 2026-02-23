@@ -1,5 +1,3 @@
-#[cfg(feature = "rpk")]
-use crate::cvt_p;
 use crate::error::ErrorStack;
 use crate::ex_data::Index;
 use crate::pkey::{PKeyRef, Private};
@@ -28,17 +26,6 @@ foreign_type_and_impl_send_sync! {
 }
 
 impl SslCredential {
-    /// Create a credential suitable for a handshake using a raw public key.
-    #[corresponds(SSL_CREDENTIAL_new_raw_public_key)]
-    #[cfg(feature = "rpk")]
-    pub fn new_raw_public_key() -> Result<SslCredentialBuilder, ErrorStack> {
-        unsafe {
-            Ok(SslCredentialBuilder(Self::from_ptr(cvt_p(
-                ffi::SSL_CREDENTIAL_new_raw_public_key(),
-            )?)))
-        }
-    }
-
     /// Returns a new extra data index.
     ///
     /// Each invocation of this function is guaranteed to return a distinct index. These can be used
@@ -169,34 +156,6 @@ impl SslCredentialBuilder {
                 },
             ))
             .map(|_| ())
-        }
-    }
-
-    // Sets the SPKI of the raw public key credential.
-    //
-    // If `spki` is `None`, the SPKI is extracted from the credential's private key.
-    #[corresponds(SSL_CREDENTIAL_set1_spki)]
-    #[cfg(feature = "rpk")]
-    pub fn set_spki_bytes(&mut self, spki: Option<&[u8]>) -> Result<(), ErrorStack> {
-        unsafe {
-            let spki = spki
-                .map(|spki| {
-                    cvt_p(ffi::CRYPTO_BUFFER_new(
-                        spki.as_ptr(),
-                        spki.len(),
-                        ptr::null_mut(),
-                    ))
-                })
-                .transpose()?
-                .unwrap_or(ptr::null_mut());
-
-            let ret = cvt_0i(ffi::SSL_CREDENTIAL_set1_spki(self.0.as_ptr(), spki)).map(|_| ());
-
-            if !spki.is_null() {
-                ffi::CRYPTO_BUFFER_free(spki);
-            }
-
-            ret
         }
     }
 

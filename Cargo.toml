@@ -3,7 +3,6 @@ members = [
     "boring",
     "boring-sys",
     "tokio-boring",
-    "quinn-boring",
 ]
 resolver = "2"
 
