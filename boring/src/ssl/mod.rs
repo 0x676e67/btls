@@ -83,8 +83,6 @@ use crate::error::ErrorStack;
 use crate::ex_data::Index;
 use crate::hmac::HmacCtxRef;
 use crate::nid::Nid;
-#[cfg(feature = "rpk")]
-use crate::pkey::Public;
 use crate::pkey::{HasPrivate, PKeyRef, Params, Private};
 use crate::srtp::{SrtpProtectionProfile, SrtpProtectionProfileRef};
 use crate::ssl::bio::BioMethod;
@@ -608,8 +606,8 @@ impl ExtensionType {
     pub const RENEGOTIATE: Self = Self(ffi::TLSEXT_TYPE_renegotiate as u16);
     pub const DELEGATED_CREDENTIAL: Self = Self(ffi::TLSEXT_TYPE_delegated_credential as u16);
     pub const APPLICATION_SETTINGS: Self = Self(ffi::TLSEXT_TYPE_application_settings as u16);
-    pub const APPLICATION_SETTINGS_NEW: Self =
-        Self(ffi::TLSEXT_TYPE_application_settings_new as u16);
+    pub const APPLICATION_SETTINGS_OLD: Self =
+        Self(ffi::TLSEXT_TYPE_application_settings_old as u16);
     pub const ENCRYPTED_CLIENT_HELLO: Self = Self(ffi::TLSEXT_TYPE_encrypted_client_hello as u16);
     pub const CERTIFICATE_TIMESTAMP: Self = Self(ffi::TLSEXT_TYPE_certificate_timestamp as u16);
     pub const NEXT_PROTO_NEG: Self = Self(ffi::TLSEXT_TYPE_next_proto_neg as u16);
@@ -738,6 +736,34 @@ impl From<u16> for SslSignatureAlgorithm {
     fn from(value: u16) -> Self {
         Self(value)
     }
+}
+
+/// A TLS Curve.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct SslCurve(u16);
+
+impl SslCurve {
+    pub const SECP256R1: SslCurve = SslCurve(ffi::SSL_GROUP_SECP256R1 as _);
+
+    pub const SECP384R1: SslCurve = SslCurve(ffi::SSL_GROUP_SECP384R1 as _);
+
+    pub const SECP521R1: SslCurve = SslCurve(ffi::SSL_GROUP_SECP521R1 as _);
+
+    pub const X25519: SslCurve = SslCurve(ffi::SSL_GROUP_X25519 as _);
+
+    pub const X25519_MLKEM768: SslCurve = SslCurve(ffi::SSL_GROUP_X25519_MLKEM768 as _);
+
+    pub const X25519_KYBER768_DRAFT00: SslCurve =
+        SslCurve(ffi::SSL_GROUP_X25519_KYBER768_DRAFT00 as _);
+
+    pub const P256_KYBER768_DRAFT00: SslCurve = SslCurve(ffi::SSL_GROUP_P256_KYBER768_DRAFT00 as _);
+
+    pub const MLKEM1024: SslCurve = SslCurve(ffi::SSL_GROUP_MLKEM1024 as _);
+
+    pub const FFDHE2048: SslCurve = SslCurve(ffi::SSL_GROUP_FFDHE2048 as _);
+
+    pub const FFDHE3072: SslCurve = SslCurve(ffi::SSL_GROUP_FFDHE3072 as _);
 }
 
 /// A compliance policy.
@@ -1988,12 +2014,6 @@ impl SslContextBuilder {
         }
     }
 
-    /// Sets whether the context should enable there key share extension.
-    #[corresponds(SSL_CTX_set_key_shares_limit)]
-    pub fn set_key_shares_limit(&mut self, limit: u8) {
-        unsafe { ffi::SSL_CTX_set_key_shares_limit(self.as_ptr(), limit as _) }
-    }
-
     /// Sets whether the aes hardware override should be enabled.
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_aes_hw_override)]
@@ -2127,24 +2147,6 @@ impl SslContextBuilder {
             cvt_0i(ffi::SSL_CTX_add1_credential(
                 self.as_ptr(),
                 credential.as_ptr(),
-            ))
-            .map(|_| ())
-        }
-    }
-
-    /// Sets the list of server certificate types that clients attached to this context
-    /// can process.
-    #[corresponds(SSL_CTX_set_server_certificate_types)]
-    #[cfg(feature = "rpk")]
-    pub fn set_server_certificate_types(
-        &mut self,
-        types: &[CertificateType],
-    ) -> Result<(), ErrorStack> {
-        unsafe {
-            cvt_0i(ffi::SSL_CTX_set_server_certificate_types(
-                self.as_ptr(),
-                types.as_ptr() as *const u8,
-                types.len(),
             ))
             .map(|_| ())
         }
@@ -2428,27 +2430,6 @@ impl SslContextRef {
     #[corresponds(SSL_CTX_set1_ech_keys)]
     pub fn set_ech_keys(&self, keys: &SslEchKeys) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::SSL_CTX_set1_ech_keys(self.as_ptr(), keys.as_ptr())) }
-    }
-
-    /// Returns the list of server certificate types.
-    #[corresponds(SSL_CTX_get0_server_certificate_types)]
-    #[cfg(feature = "rpk")]
-    #[must_use]
-    pub fn server_certificate_types(&self) -> Option<&[CertificateType]> {
-        let mut types = ptr::null();
-        let mut types_len = 0;
-        unsafe {
-            ffi::SSL_CTX_get0_server_certificate_types(self.as_ptr(), &mut types, &mut types_len);
-
-            if types_len == 0 {
-                return None;
-            }
-
-            Some(slice::from_raw_parts(
-                types as *const CertificateType,
-                types_len,
-            ))
-        }
     }
 }
 
@@ -2908,21 +2889,6 @@ impl Ssl {
     where
         S: Read + Write,
     {
-        // #[cfg(feature = "rpk")]
-        // {
-        //     let ctx = self.ssl_context();
-
-        //     if !ctx.has_x509_support() {
-        //         unsafe {
-        //             ffi::SSL_CTX_set_custom_verify(
-        //                 ctx.as_ptr(),
-        //                 SslVerifyMode::PEER.bits(),
-        //                 Some(rpk_verify_failure_callback),
-        //             );
-        //         }
-        //     }
-        // }
-
         SslStreamBuilder::new(self, stream).setup_accept()
     }
 
@@ -2955,7 +2921,6 @@ impl fmt::Debug for SslRef {
             builder.field("verify_result", &self.verify_result());
         }
 
-        #[cfg(not(feature = "rpk"))]
         builder.field("verify_result", &self.verify_result());
 
         builder.finish()
@@ -3913,69 +3878,6 @@ impl SslRef {
     pub fn add_credential(&mut self, credential: &SslCredentialRef) -> Result<(), ErrorStack> {
         unsafe { cvt_0i(ffi::SSL_add1_credential(self.as_ptr(), credential.as_ptr())).map(|_| ()) }
     }
-
-    /// Returns the public key sent by the other peer, `None` if there is no ongoing handshake.
-    #[corresponds(SSL_get0_peer_pubkey)]
-    #[cfg(feature = "rpk")]
-    pub fn peer_pubkey(&self) -> Option<&PKeyRef<Public>> {
-        unsafe {
-            let pubkey = ffi::SSL_get0_peer_pubkey(self.as_ptr());
-
-            if pubkey.is_null() {
-                return None;
-            }
-
-            Some(PKeyRef::from_ptr(pubkey as *mut _))
-        }
-    }
-
-    /// Sets the list of server certificate types that clients attached to this `Ssl`
-    /// can process.
-    #[corresponds(SSL_set_server_certificate_types)]
-    #[cfg(feature = "rpk")]
-    pub fn set_server_certificate_types(
-        &mut self,
-        types: &[CertificateType],
-    ) -> Result<(), ErrorStack> {
-        unsafe {
-            cvt_0i(ffi::SSL_set_server_certificate_types(
-                self.as_ptr(),
-                types.as_ptr() as *const u8,
-                types.len(),
-            ))
-            .map(|_| ())
-        }
-    }
-
-    /// Returns the list of server certificate types.
-    #[corresponds(SSL_get0_server_certificate_types)]
-    #[must_use]
-    #[cfg(feature = "rpk")]
-    pub fn server_certificate_types(&self) -> Option<&[CertificateType]> {
-        let mut types = ptr::null();
-        let mut types_len = 0;
-        unsafe {
-            ffi::SSL_get0_server_certificate_types(self.as_ptr(), &mut types, &mut types_len);
-
-            if types_len == 0 {
-                return None;
-            }
-
-            Some(slice::from_raw_parts(
-                types as *const CertificateType,
-                types_len,
-            ))
-        }
-    }
-
-    /// Returns the server certificate type selected by the server, or `CertificateType::X509`
-    /// if there is no handshake.
-    #[corresponds(SSL_get_server_certificate_type_selected)]
-    #[must_use]
-    #[cfg(feature = "rpk")]
-    pub fn selected_server_certificate_type(&self) -> CertificateType {
-        unsafe { CertificateType(ffi::SSL_get_server_certificate_type_selected(self.as_ptr())) }
-    }
 }
 
 /// An SSL stream midway through the handshake process.
@@ -4516,21 +4418,6 @@ impl<S> SslStreamBuilder<S> {
             bio::set_dtls_mtu_size::<S>(bio, mtu_size);
         }
     }
-}
-
-/// A certificate type.
-#[cfg(feature = "rpk")]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct CertificateType(u8);
-
-#[cfg(feature = "rpk")]
-impl CertificateType {
-    /// A X.509 certificate.
-    pub const X509: Self = Self(ffi::TLS_CERTIFICATE_TYPE_X509 as u8);
-
-    /// A raw public key.
-    pub const RAW_PUBLIC_KEY: Self = Self(ffi::TLS_CERTIFICATE_TYPE_RAW_PUBLIC_KEY as u8);
 }
 
 /// The result of a shutdown request.

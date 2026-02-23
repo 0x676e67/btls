@@ -7,8 +7,8 @@ use openssl_macros::corresponds;
 use crate::dh::Dh;
 use crate::error::ErrorStack;
 use crate::ssl::{
-    HandshakeError, Ssl, SslContext, SslContextBuilder, SslContextRef, SslMethod, SslMode,
-    SslOptions, SslRef, SslStream, SslVerifyMode,
+    HandshakeError, Ssl, SslContext, SslContextBuilder, SslContextRef, SslCurve, SslMethod,
+    SslMode, SslOptions, SslRef, SslStream, SslVerifyMode,
 };
 use crate::{cvt, version};
 use std::net::IpAddr;
@@ -75,15 +75,15 @@ impl SslConnector {
         ctx.set_cipher_list(
             "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK",
         )?;
-        setup_verify(&mut ctx);
+        ctx.set_verify(SslVerifyMode::PEER);
 
         Ok(SslConnectorBuilder(ctx))
     }
 
-    /// Creates a new builder for TLS connections with no verification.
+    /// Creates a bare builder for TLS connections without default CA certificates.
     ///
-    /// This is useful for testing and other purposes where you want to skip verification.
-    pub fn no_default_verify_builder(method: SslMethod) -> Result<SslConnectorBuilder, ErrorStack> {
+    /// The caller is responsible for providing a custom certificate store.
+    pub fn bare_builder(method: SslMethod) -> Result<SslConnectorBuilder, ErrorStack> {
         let mut ctx = ctx(method)?;
         ctx.set_cipher_list(
             "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK",
@@ -299,6 +299,19 @@ impl ConnectConfiguration {
     pub fn set_options(&mut self, options: SslOptions) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::SSL_set_options(self.as_ptr(), options.bits()) as _).map(|_| ()) }
     }
+
+    /// Sets the client key shares to be used in the TLS 1.3 handshake.
+    #[corresponds(SSL_set1_client_key_shares)]
+    pub fn set_client_key_shares(&mut self, key_shares: &[SslCurve]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_set1_client_key_shares(
+                self.as_ptr(),
+                key_shares.as_ptr() as *const _,
+                key_shares.len(),
+            ))
+            .map(|_| ())
+        }
+    }
 }
 
 impl Deref for ConnectConfiguration {
@@ -452,10 +465,6 @@ impl DerefMut for SslAcceptorBuilder {
     fn deref_mut(&mut self) -> &mut SslContextBuilder {
         &mut self.0
     }
-}
-
-fn setup_verify(ctx: &mut SslContextBuilder) {
-    ctx.set_verify(SslVerifyMode::PEER);
 }
 
 fn setup_verify_hostname(ssl: &mut SslRef, domain: &str) -> Result<(), ErrorStack> {
