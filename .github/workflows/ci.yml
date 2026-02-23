@@ -265,7 +265,7 @@ jobs:
           key: index-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml') }}
           enableCrossOsArchive: true
       - name: Install golang
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ">=1.22.0"
       - name: Install target-specific APT dependencies
