@@ -300,10 +300,7 @@ impl ConnectConfiguration {
         unsafe { cvt(ffi::SSL_set_options(self.as_ptr(), options.bits()) as _).map(|_| ()) }
     }
 
-    /// group_ids may contain a subsequence of the supported_group_list,
-    /// specifying which groups to send in the key_share extension.
-    /// This is Some only if set_client_key_shares was successfully called to configure key shares.
-    /// If present, the groups are ordered as in supported_group_list and must not contain duplicates.
+    /// Sets the client key shares to be used in the TLS 1.3 handshake.
     #[corresponds(SSL_set1_client_key_shares)]
     pub fn set_client_key_shares(&mut self, key_shares: &[SslCurve]) -> Result<(), ErrorStack> {
         unsafe {
