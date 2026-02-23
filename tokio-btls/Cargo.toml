@@ -25,8 +25,6 @@ fips = ["btls/fips"]
 # with OpenSSL versions that might be linked in the same process.
 prefix-symbols = ["btls/prefix-symbols"]
 
-read_uninit = []
-
 [dependencies]
 btls = { workspace = true }
 tokio = { workspace = true }
