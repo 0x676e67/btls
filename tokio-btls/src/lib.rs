@@ -106,11 +106,13 @@ fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
 pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
 
 impl<S: AsyncRead + AsyncWrite> SslStream<S> {
+    #[inline]
     /// Like [`SslStream::new`](ssl::SslStream::new).
     pub fn new(ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
         SslStreamCore::new(ssl, StreamWrapper { stream, context: 0 }).map(SslStream)
     }
 
+    #[inline]
     /// Like [`SslStream::connect`](ssl::SslStream::connect).
     pub fn poll_connect(
         self: Pin<&mut Self>,
@@ -119,21 +121,25 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
         self.with_context(cx, |s| cvt_ossl(s.connect()))
     }
 
+    #[inline]
     /// A convenience method wrapping [`poll_connect`](Self::poll_connect).
     pub async fn connect(mut self: Pin<&mut Self>) -> Result<(), ssl::Error> {
         future::poll_fn(|cx| self.as_mut().poll_connect(cx)).await
     }
 
+    #[inline]
     /// Like [`SslStream::accept`](ssl::SslStream::accept).
     pub fn poll_accept(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ssl::Error>> {
         self.with_context(cx, |s| cvt_ossl(s.accept()))
     }
 
+    #[inline]
     /// A convenience method wrapping [`poll_accept`](Self::poll_accept).
     pub async fn accept(mut self: Pin<&mut Self>) -> Result<(), ssl::Error> {
         future::poll_fn(|cx| self.as_mut().poll_accept(cx)).await
     }
 
+    #[inline]
     /// Like [`SslStream::do_handshake`](ssl::SslStream::do_handshake).
     pub fn poll_do_handshake(
         self: Pin<&mut Self>,
@@ -142,6 +148,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
         self.with_context(cx, |s| cvt_ossl(s.do_handshake()))
     }
 
+    #[inline]
     /// A convenience method wrapping [`poll_do_handshake`](Self::poll_do_handshake).
     pub async fn do_handshake(mut self: Pin<&mut Self>) -> Result<(), ssl::Error> {
         future::poll_fn(|cx| self.as_mut().poll_do_handshake(cx)).await
@@ -149,21 +156,25 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
 }
 
 impl<S> SslStream<S> {
+    #[inline]
     /// Returns a shared reference to the `Ssl` object associated with this stream.
     pub fn ssl(&self) -> &SslRef {
         self.0.ssl()
     }
 
+    #[inline]
     /// Returns a shared reference to the underlying stream.
     pub fn get_ref(&self) -> &S {
         &self.0.get_ref().stream
     }
 
+    #[inline]
     /// Returns a mutable reference to the underlying stream.
     pub fn get_mut(&mut self) -> &mut S {
         &mut self.0.get_mut().stream
     }
 
+    #[inline]
     /// Returns a pinned mutable reference to the underlying stream.
     pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut S> {
         unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0.get_mut().stream) }
@@ -243,10 +254,12 @@ impl<S> AsyncWrite for SslStream<S>
 where
     S: AsyncRead + AsyncWrite,
 {
+    #[inline]
     fn poll_write(self: Pin<&mut Self>, ctx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.with_context(ctx, |s| cvt(s.write(buf)))
     }
 
+    #[inline]
     fn poll_flush(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<io::Result<()>> {
         self.with_context(ctx, |s| cvt(s.flush()))
     }
