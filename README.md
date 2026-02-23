@@ -4,27 +4,10 @@
 
 BoringSSL bindings for the Rust programming language and TLS adapters for [tokio](https://github.com/tokio-rs/tokio).
 
-It supports [FIPS-compatible builds of BoringSSL](https://boringssl.googlesource.com/boringssl/+/master/crypto/fipsmodule/FIPS.md),
-as well as [Post-Quantum crypto](https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/)
-and [Raw Public Key](https://docs.rs/boring/latest/boring/ssl/struct.SslRef.html#method.peer_pubkey) extensions.
-
 ## Documentation
  - Boring API: <https://docs.rs/boring2>
  - tokio TLS adapters: <https://docs.rs/tokio-boring2>
  - FFI bindings: <https://docs.rs/boring-sys2>
-
-# Upgrading from `boring` v4
-
- * First update to boring 4.21 and ensure it builds without any deprecation warnings.
- * `pq-experimental` Cargo feature is no longer needed. Post-quantum crypto is enabled by default.
- * `fips-precompiled` Cargo feature has been merged into `fips`. Set `BORING_BSSL_FIPS_PATH` env var to use a precompiled library.
- * `fips-compat` Cargo feature has been renamed to `legacy-compat-deprecated` (4cb7e260a85b7)
- * `SslCurve` and `SslCurveNid` have been removed. Curve names are more stable and portable identifiers. Use `curve_name()` and `set_curves_list()`.
- * `Ssl::new_from_ref` -> `Ssl::new()`.
- * `X509Builder::append_extension2` -> `X509Builder::append_extension`.
- * `X509Store` is now cheaply cloneable, but immutable. `SslContextBuilder.cert_store_mut()` can't be used after `.set_cert_store()`. If you need `.cert_store_mut()`, either don't overwrite the default store, or use `.set_cert_store_builder()`.
- * `X509StoreBuilder::add_cert` takes a reference.
- * `hyper` 0.x support has been removed. Use `hyper` 1.x.
 
 ## Contribution
 
