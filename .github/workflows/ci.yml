@@ -245,7 +245,7 @@ jobs:
       CARGO_HOME: ${{ github.workspace }}/.cache/cargo
       CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/.cache/build-dir
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: "recursive"
       - name: Install Rust (rustup)
