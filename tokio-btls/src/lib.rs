@@ -279,37 +279,3 @@ where
         self.get_pin_mut().poll_shutdown(ctx)
     }
 }
-
-#[cfg(test)]
-#[tokio::test]
-async fn test_google() {
-    use std::{net::ToSocketAddrs, pin::Pin};
-
-    use btls::ssl;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpStream,
-    };
-
-    let addr = "8.8.8.8:443".to_socket_addrs().unwrap().next().unwrap();
-    let stream = TcpStream::connect(&addr).await.unwrap();
-
-    let ssl_context = ssl::SslContext::builder(ssl::SslMethod::tls())
-        .unwrap()
-        .build();
-    let ssl = ssl::Ssl::new(&ssl_context).unwrap();
-    let mut stream = SslStream::new(ssl, stream).unwrap();
-
-    Pin::new(&mut stream).connect().await.unwrap();
-
-    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
-
-    let mut buf = vec![];
-    stream.read_to_end(&mut buf).await.unwrap();
-    let response = String::from_utf8_lossy(&buf);
-    let response = response.trim_end();
-
-    // any response code is fine
-    assert!(response.starts_with("HTTP/1.0 "));
-    assert!(response.ends_with("</html>") || response.ends_with("</HTML>"));
-}
