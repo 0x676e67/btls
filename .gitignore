@@ -6,3 +6,4 @@ Cargo.lock
 .DS_Store
 .venv
 boring-sys/deps/
+*.py
