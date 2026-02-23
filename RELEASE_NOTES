@@ -1,47 +1,199 @@
+
+Unreleased
+- 2026-02-23 build(deps): bump actions/cache from 4 to 5 (#121)
+- 2026-02-23 build(deps): bump actions/checkout from 4 to 6 (#122)
+- 2026-02-23 build(deps): bump KyleMayes/install-llvm-action from 1 to 2 (#123)
+- 2026-02-23 build(deps): bump actions/setup-go from 5 to 6 (#124)
+- 2026-02-23 rename to `btls`
+- 2026-02-23 patch: sync upstream boringssl patch (#120)
+- 2026-02-23 Update README.md
+
+5.0.2
+- 2026-02-13 Re-add fips-precompiled for v4 compat
+- 2026-02-12 Don't add build/ to non-FIPS pre-built path
+- 2026-02-13 Expose load_verify_locations like rust-openssl
+- 2026-02-13 Fix null handling, sync with rust-openssl
+- 2026-02-12 boring-sys: Support static MSVC runtime
+
+5.0.1
+- 2026-02-11 Bump
+- 2026-02-10 README links
+- 2026-02-10 Support building without default features
+- 2026-02-03 Make SslCredential optional
+- 2026-02-10 Make ML-KEM optional
+- 2026-02-10 Don't always require all headers from all versions of BoringSSL
+- 2026-02-10 Backwards-compatible add_cert()
+- 2026-02-10 Ensure we don't leave unit memory if generate_key fails
+- 2026-02-10 Add missing error handling in ML-KEM generate
+- 2026-02-10 Don't always require all headers from all versions of BoringSSL
+- 2026-02-10 Make ML-KEM optional
+
 5.0.0
-- 2025-12-19 Update vendored boring to a newer version (2023.11 to 2025.11)
-- 2025-12-20 Rework RPK/SslMethod (c2f063cf4711f15b8b417b6926496fbf1c2a03ac)
-- 2025-09-29 Remove `SslCurve` API
-- 2025-09-30 Remove the "kx-*" features
-- 2025-09-25 Remove legacy FIPS options (they're controlled via `BORING_BSSL_` env vars instead)
-- 2026-01-05 Remove deprecated X509CheckFlags flag
-- 2025-09-30 Remove "pq-experimental" Cargo feature, apply PQ patch by default + P256Kyber768Draft00
-- 2026-01-05 Safe clone for X509Store
-- 2025-03-08 Add set_ticket_key_callback (SSL_CTX_set_tlsext_ticket_key_cb)
-- 2025-09-30 Add SslRef::curve_name()
-- 2025-09-30 Expose a safe Rust interface for the session resumption callback
-- 2026-01-05 Fix leaky set_ex_data() API
-- 2025-12-12 Add boring specific api set_strict_cipher_list to SslContextBuilder
-- 2025-11-20 Introduce SslCipherRef::protocol_id
+- 2026-02-03 v5.0.0
+- 2026-02-04 Update README
+- 2026-02-03 rm symlink
+- 2026-02-10 symm: Ensure `Cipher::from_nid()` handles GCM NIDs
+- 2026-02-10 symm: Add regression test for cipher NIDs
+- 2026-02-04 FIXMEs
+- 2025-12-29 Handle overflows in FFI integer conversions
+- 2026-02-03 Bump rust-version to 1.85
+- 2026-01-30 Detect bad headers in boring-sys
+- 2025-12-29 Use std helper methods for pointer casts
+- 2025-12-29 mem::forget -= 1
+- 2025-12-29 Avoid useless malloc for SSL_set_tlsext_status_ocsp_resp
+- 2026-02-03 Allow pq-experimental for v4 back-compat
+- 2026-02-03 Use separate MlKemPrivateKey/MlKemPublicKey instead of exposing slices
+- 2026-02-03 Rename MlKem to Algorithm
+- 2026-02-02 Skip MlKemParams
+- 2026-02-02 Tests don't need AsRef and other accessors
+- 2026-02-02 Use associated constants
+- 2026-01-31 Expose a cipher's NID
+- 2026-01-31 Add an init-update-finalize API for HMAC
+- 2026-01-30 Add safe Rust wrappers for ML-KEM-268 and ML-KEM-1020
+- 2026-01-27 feat(boring-sys): add mlkem.h to bindgen headers (#455)
+- 2026-01-26 OpenBSD uses -lc++ as well
+- 2026-01-06 More helpful build errors
+- 2026-01-20 Handle broken include dirs
+- 2026-01-26 Split SslCredential into a module
+- 2026-01-23 Cache Windows builds harder
+- 2025-12-29 Avoid cvt.map(drop)
+- 2026-01-21 Cache test deps on Windows
+- 2026-01-21 Fix docs warnings
+- 2026-01-21 Fix docs.rs build
+- 2026-01-16 Ensure dependency requirements are bumped
+- 2026-01-20 Fix missing import in tests
+- 2026-01-07 Upgrading to v5
 - 2023-05-11 fix: BIO_set_retry_write when BIO_CTRL_FLUSH to allow writer returns WouldBlock on flush
 - 2025-11-14 Remove blanket Eq from FFI types
+- 2026-01-19 MaybeUninit is stable now
+- 2026-01-06 Clippy
+- 2025-12-29 Avoid unicode chars
+- 2026-01-06 Cleaner include path check
+- 2026-01-13 Test MinGW32
+- 2026-01-05 Remove obsolete hack for OpenSSL 1.0.2
+- 2026-01-20 Remove unnecessary as_mut
+- 2026-01-20 Don't readd leaky set_ex_data
+- 2026-01-20 Fix spki leak
+- 2026-01-20 Use existing macro for ForeignType
+- 2025-12-20 Rework SslMethod
+- 2025-12-19 Update boring to a newer version
+- 2026-01-20 Flip is_rpk to has_x509_support
+- 2025-12-22 Fix MinGW builds
+- 2025-12-22 Fix Android builds
 - 2025-12-20 Never use the debug CRT on Windows
+- 2025-12-20 Pass -msse2 to i686 platforms on CI
+- 2025-12-20 Define __STDC_FORMAT_MACROS when cross-building from macOS to Linux
+- 2026-01-19 Use fips-build-compatible ERR_add_error_data
+- 2026-01-16 Include err.h in FFI bindings
+- 2026-01-16 cargo publish is target-specific
+- 2026-01-07 Cross-platform Cargo registry cache
+- 2026-02-15 build: fix docs.rs build (#119)
+- 2026-02-15 docs: clarify symbol conflict with OpenSSL (#118)
+
+5.0.0-alpha.13
+- 2026-02-13 v5.0.0-alpha.13
+- 2026-02-13 build: fix docs.rs build (#116)
+
+5.0.0-alpha.12
+- 2026-01-17 v5.0.0-alpha.12
+- 2026-01-17 build: warn instead of panic for unsupported `prefix_symbols` (#113)
+- 2026-01-17 v5.0.0-alpha.11
+- 2026-01-17 fix(test): fix build
+- 2026-01-12 build(deps): bump actions/cache from 4 to 5 (#112)
+- 2026-01-07 Warn about BORING_BSSL_FIPS_PATH vs BORING_BSSL_PATH
+- 2026-01-07 Clippy CI blocker
+- 2025-12-29 Fewer unwrap()s
+- 2025-12-29 set_strict_cipher_list docs
+- 2025-12-10 Cached index in tests
+- 2025-12-10 Smaller cache, quicker rustup
+- 2024-04-01 docs: add docs
+- 2024-04-01 feat: support openharmony platform
+- 2026-01-05 Remove deprecated X509CheckFlags flag
+- 2026-01-05 Safe clone for X509Store
+- 2026-01-05 Fix leak in set_ex_data
+- 2025-12-12 Add boring specific api set_strict_cipher_list to SslContextBuilder
+- 2026-01-01 Update README to remove usage section
+- 2026-01-01 Delete scripts directory
+- 2026-01-01 chore: drop maintenance of compio-boring2 crate (#111)
+- 2026-01-01 Fix documentation typo in lib.rs
+- 2026-01-01 build(boring-sys): simplify prefix_symbols build (#110)
+- 2026-01-01 feat(tokio-boring): Overhaul crate API (#109)
+- 2025-12-23 build: add loongarch conditional compilation patch (#108)
+- 2025-12-23 Update README.md
+- 2025-12-18 build(ci): fix https://github.com/cloudflare/boring/issues/414 (#107)
+- 2025-12-18 build(compio/quinn/tokio): Add symbol prefixing feature for BoringSSL (#106)
+- 2025-12-15 build(deps): bump actions/checkout from 5 to 6 (#104)
+- 2025-12-15 build(deps): bump actions/cache from 4 to 5 (#105)
+- 2025-12-14 Add symbol prefixing feature for BoringSSL (#103)
+- 2025-12-10 Can't build with clang-12 to libc++ mismatch
+- 2025-12-09 Update README.md
+- 2025-11-25 Remove DerefMut for SslCipher
+- 2025-11-24 Store a &'static SslCipherRef in SslCipher
+- 2025-11-20 Introduce SslCipherRef::protocol_id
+- 2025-11-12 Fix peer_cert_chain doc
+- 2025-11-23 build(deps): bump actions/checkout from 4 to 6 (#100)
+- 2025-11-23 build(deps): bump actions/setup-go from 5 to 6 (#101)
+- 2025-11-23 build(deps): bump KyleMayes/install-llvm-action from 1 to 2 (#102)
+- 2025-11-23 Update Dependabot configuration for GitHub Actions
+- 2025-10-03 pq patch: also enable P256Kyber768Draft00 by default
+- 2025-10-02 pq patch: enable PQ by default like upstream
+- 2025-10-21 chore(ssl): remove deprecated code (#98)
+- 2025-10-21 Modify prerelease condition in CI workflow
+- 2025-10-14 Update main.rs
+- 2025-09-30 Remove "pq-experimental", apply PQ patch by default
+- 2025-10-01 Simplify Error::reason()
+- 2025-10-01 Safer CryptoBufferBuilder::build
+- 2025-10-01 ErrorStack ctor for custom errors
+- 2025-10-01 Fix string data conversion in ErrorStack::put()
+- 2025-10-01 Convert CipherCtx fns into a safe abstraction. Additional testing.
+- 2025-10-01 Use Ref foreign type instead of forgetting
+- 2025-09-30 Expose a safe Rust interface for the session resumption callback
+- 2025-09-30 Use MaybeUninit for raw_ticket_key key/iv
+- 2025-09-29 initialize key_name and iv. mark fn as _unsafe to allow for future changes to the api
+- 2025-04-02 clippy
+- 2025-04-02 simplify tests
+- 2025-04-01 update documentation
+- 2025-03-11 add test case for TicketKeyCallbackResult::Noop
+- 2025-03-11 pr comments: safety, receive multiple nst, return status refactor
+- 2025-03-08 Add set_ticket_key_callback (SSL_CTX_set_tlsext_ticket_key_cb)
+- 2025-09-30 Add SslRef::curve_name()
+- 2025-09-26 Make rpk feature flag additive
+- 2025-09-30 Add back the `curve()` method on `SslRef`
+- 2025-09-29 Remove outdated comments on FIPS API compatibility
+- 2025-09-29 Remove `SslCurve` API
+- 2025-09-30 pq: fix MSVC C4146 warning
+- 2025-09-30 Remove the "kx-*" features
 - 2025-02-19 X509Builder::append_extension2 -> X509Builder::append_extension
 - 2025-02-19 `Ssl::new_from_ref` -> `Ssl::new()`
 - 2025-02-19 Align SslStream APIs with upstream
+- 2025-09-25 Clean-up legacy FIPS options
+- 2025-06-13 Add more reliable library_reason()
+- 2025-06-13 Ensure that ERR_LIB type can be named
 - 2025-09-26 Remove support for Hyper v0
-
-4.21.0
-- 2026-01-05 Warn about set_curves() removal
-- 2026-01-05 Deprecate set_ex_data()
-- 2026-01-05 Fix build with --no-default-features
-- 2026-01-05 Make set_curves_list always available
-- 2026-01-19 Use fips-build-compatible ERR_add_error_data
-
-4.20.0
+- 2025-09-26 Upgrade deps
+- 2025-09-26 Skip Rust version detection for bindgen
+- 2025-09-26 Style nits
+- 2025-09-26 Deprecated GHA feature
+- 2025-09-26 Ensure rustfmt and clippy are available
 - 2025-08-26 Support TARGET_CC and CC_{target}
 - 2025-08-26 Fix swapped host/target args
 - 2025-06-13 CStr UTF-8 improvements
-- 2025-09-26 Skip Rust version detection for bindgen
-- 2025-09-26 Upgrade deps
-- 2025-06-13 Ensure that ERR_LIB type can be named
-- 2025-06-13 Add more reliable library_reason()
-- 2025-09-30 pq: fix MSVC C4146 warning
-- 2025-10-14 Freebsd build
-- 2025-10-01 Fix string data conversion in ErrorStack::put()
+- 2025-09-21 Fix duplicate entry for RPK support in README
+- 2025-09-21 Fix formatting in FUNDING.yml for ko-fi entry
+- 2025-09-21 Update FUNDING.yml for sponsorship links
+
+5.0.0-alpha.10
+- 2025-09-19 v5.0.0-alpha.10
+- 2025-09-19 feat: Add `set_preserve_tls13_cipher_list` method to `SslContextBuilder` (#97)
+- 2025-09-12 Remove CI badge from README
+
+5.0.0-alpha.9
+- 2025-09-08 v5.0.0-alpha.9
 
 4.19.0
 - 2025-09-03 Add binding for X509_check_ip_asc
+- 2025-09-08 build(deps): update compio requirement from 0.15.0 to 0.16.0 (#96)
+- 2025-09-08 build(deps): update compio-io requirement from 0.7.0 to 0.8.0 (#95)
 - 2025-06-13 Use ERR_clear_error
 - 2025-06-13 Error descriptions and docs
 - 2025-06-13 Boring doesn't use function codes
@@ -50,23 +202,75 @@
 - 2025-09-03 Fix doc links
 
 4.18.0
-- 2025-05-29 Add set_verify_param
-- 2025-05-28 Add support for X509_STORE_CTX_get0_untrusted
-- 2025-06-02 Add X509VerifyParamRef::copy_from (#361)
-- 2025-06-02 Fix X509VerifyContextRef::set_verify_param (#358)
-- 2025-06-02 Ensure we call X509_STORE_CTX_cleanup on error path too (#360)
-- 2025-06-02 Add mutable ex_data APIs for X509StoreContext
-- 2025-06-02 Add X509StoreContextRef::init_without_cleanup
-- 2025-06-04 Rename to reset_with_context_data
-- 2025-06-05 Avoid panicking in error handling
-- 2025-06-05 Don't unwrap when Result can be returned instead
-- 2025-06-04 Make X509Store shareable between contexts
-- 2025-06-05 Sprinkle #[must_use] (#368)
-- 2025-06-05 Expose SSL_set1_groups to Efficiently Set Curves on SSL Session (#346)
-- 2025-06-09 Upgrade bindgen to v0.72.0
-- 2025-06-13 Expose PKey::raw_{private,public}_key (#364)
+- 2025-08-29 Bump
+- 2025-08-26 Clippy
+- 2025-09-04 Reapply "Don't link binaries on docs.rs" (#94)
+- 2025-08-31 Fix grammar in README description
+
+5.0.0-alpha.8
+- 2025-08-31 v5.0.0-alpha.8
+- 2025-08-31 Revert "Don't link binaries on docs.rs" (#94)
+
+5.0.0-alpha.7
+- 2025-08-21 v5.0.0-alpha.7
+- 2025-08-21 boring-sys: Implement `MLKEM1024` for TLS (#93)
+- 2025-07-28 build(deps): update hex-literal requirement from 0.4 to 1.0 (#89)
+- 2025-07-28 build(deps): update rcgen requirement from 0.13 to 0.14 (#88)
+- 2025-07-26 Create FUNDING.yml
+- 2025-07-24 feat(boring): adapt boring2 for quinn (#87)
+- 2025-07-21 Remove some comments referring to OpenSSL
+- 2025-07-10 Update README.md
+- 2025-07-07 chore(compio-boring): update homepage and docs
+
+5.0.0-alpha.4
+- 2025-07-07 v5.0.0-alpha.4
+- 2025-07-07 chore(compio-boring2): remove unused docs
+- 2025-07-07 chore: fix ci and docs
+- 2025-07-07 docs: update README.md
+- 2025-07-07 chore: update `compio-boring` version
+- 2025-07-07 feat(boring): adapt `boring2` for compio async runtime (#85)
+
+5.0.0-alpha.3
+- 2025-07-06 v5.0.0-alpha.3
+- 2025-07-06 feat: Add Hash impls for extension types (#84)
+
+5.0.0-alpha.2
+- 2025-06-23 v5.0.0-alpha.2
+- 2025-06-23 feat: add support for FreeBSD (#83)
+- 2025-06-21 docs(connector): update documents
+- 2025-06-18 docs: update prefer chacha20 option docs
+- 2025-06-18 docs: update prefer chacha20 option docs
+- 2025-06-18 docs: update prefer chacha20 option docs (#81)
+
+5.0.0-alpha.1
+- 2025-06-18 v5.0.0-alpha.1
+- 2025-06-18 feat(boring): sync updated extension permutation patch (#80)
+- 2025-06-17 chore(boring): Remove deprecated or outdated APIs (#79)
+- 2025-06-17 Update README.md
+- 2025-06-17 test(boring): fix ech test (#77)
+- 2025-06-17 revert(boring): Restore `src/x509/store.rs` to match upstream
+- 2025-06-10 Use cargo:warning for warnings
 - 2025-06-10 Don't link binaries on docs.rs
-- 2025-06-11 Use cargo:warning for warnings
+- 2025-06-13 Expose PKey::raw_{private,public}_key (#364)
+- 2025-06-09 Upgrade bindgen to v0.72.0
+- 2025-06-09 build(deps): update bindgen requirement from 0.71.1 to 0.72.0
+- 2025-06-07 chore: remove dead code
+- 2025-06-06 Expose SSL_set1_groups to Efficiently Set Curves on SSL Session (#346)
+- 2025-06-05 Sprinkle #[must_use] (#368)
+- 2025-06-04 Make X509Store shareable between contexts
+- 2025-05-20 Clippy
+- 2025-06-05 Don't unwrap when Result can be returned instead
+- 2025-06-05 Avoid panicking in error handling
+- 2025-06-04 Rename to reset_with_context_data
+- 2025-06-02 Add X509StoreContextRef::init_without_cleanup
+- 2025-06-02 Add mutable ex_data APIs for X509StoreContext
+- 2025-06-02 Ensure we call X509_STORE_CTX_cleanup on error path too (#360)
+- 2025-06-02 Fix X509VerifyContextRef::set_verify_param (#358)
+- 2025-06-02 Add X509VerifyParamRef::copy_from (#361)
+- 2025-05-28 Add support for X509_STORE_CTX_get0_untrusted
+- 2025-05-30 sync upstream (#74)
+- 2025-05-30 clippy fix
+- 2025-05-30 Add set_verify_param
 
 4.17.0
 - 2025-05-27 Revert "feat(x509): Implement `Clone` for `X509Store` (#339)" (#353)
@@ -86,6 +290,34 @@
 
 4.16.0
 - 2025-03-31 Add fips-precompiled feature to support newer versions of FIPS (#338)
+- 2025-05-19 boring(ssl): add ZSTD to `CertificateCompressionAlgorithm` (#71)
+- 2025-05-18 boring(ssl): use `corresponds` macro in `add_certificate_compression_algorithm` (#70)
+- 2025-05-18 chore(boring): deprecate legacy `CertCompressionAlgorithm` API (#69)
+- 2025-05-13 chore(boring): deprecate `set_verify_cert_store_ref` on `SslContextBuilder` (#68)
+
+4.15.13
+- 2025-04-27 v4.15.13
+- 2025-04-27 feat: Add basic support for LoongArch (#67)
+
+4.15.12
+- 2025-04-23 v4.15.12
+- 2025-04-23 ci: use ubuntu-latest (#66)
+- 2025-04-23 docs(boring): fix doc warning (#65)
+- 2025-04-23 build(deps): update brotli requirement from 7 to 8 (#64)
+- 2025-04-05 Create dependabot.yml
+
+4.15.11
+- 2025-03-21 v4.15.11
+- 2025-03-21 build: update workflows action (#61)
+- 2025-03-21 chore: clippy fix
+- 2025-03-21 Update issue templates
+- 2025-03-21 Update ci.yml
+- 2025-03-21 Delete .github/workflows/semgrep.yml
+- 2025-03-21 Update README.md
+- 2025-03-21 build: fix doc test
+- 2025-03-21 build: Ignore tests that bundle with the upstream boringssl binary
+- 2025-03-21 boring(x509): impl `Clone` of `X509Store` (#59)
+- 2025-03-21 build: fix `pq-experimental` feature build
 - 2025-03-18 Document linking to C++ standard library (#335)
 - 2025-03-18 Revert "Remove "fips-no-compat", decouple "fips-compat" from "fips"" (#334)
 - 2025-03-11 boring: Disable `SslCurve` API with "fips" feature
@@ -95,8 +327,6 @@
 - 2025-03-10 Advertise X25519MLKEM768 with "kx-client-pq-preferred" (#329)
 - 2025-03-10 Update to actions/cache@v4 (#328)
 - 2025-02-28 Add missing release notes entry (#324)
-
-4.15.0
 - 2025-02-27 Expose API to enable certificate compression. (#241)
 - 2025-02-23 Fix lifetimes in ssl::select_next_proto
 - 2025-02-23 Revert cmake bump (for now) as it is overly restrictive (#321)
@@ -122,12 +352,106 @@
 - 2025-01-22 fix manual_c_str_literals clippy warning
 - 2025-01-22 replace once_cell with LazyLock
 - 2025-01-13 RTG-3333 Support X25519MLKEM768 by default, but don't sent it as client
+- 2025-03-20 chore(boring): simplify extensions sort order calculation (#58)
+
+4.15.9
+- 2025-03-07 v4.15.9
+- 2025-03-07 feat: Allow overriding AES encryption for Encrypted Client Hello (#57)
+
+4.15.8
+- 2025-02-24 v4.15.8
+- 2025-02-24 Fix lifetimes in ssl::select_next_proto (#55)
+
+4.15.7
+- 2025-02-23 v4.15.7
+- 2025-02-23 sync upstream (#54)
+- 2025-02-23 fix(patch): Fix alps use new codepoint negotiation (#53)
+
+4.15.6
+- 2025-02-16 v4.15.6
+- 2025-02-16 boring(patch): Fix `alps_use_new_codepoint` not initialized, may lead to undefined behavior, then get any value (#52)
+- 2025-02-13 v4.15.5
+- 2025-02-13 build: Fix 32-bit platform build (#51)
+- 2025-02-13 Use corresponds macro (#50)
+- 2025-02-13 Expose SSL_set_enable_ech_grease (#49)
+- 2025-02-12 Expose client/server-side ECH (#48)
+- 2025-02-12 Sync `Detailed error codes` and `Clean up boring_sys::init()` (#47)
+
+4.15.3
+- 2025-02-11 v4.15.3
+- 2025-02-11 fix: Fix `key share` patch (#46)
+
+4.15.2
+- 2025-02-07 v4.15.2
+- 2025-02-07 feat(boring): Add set_verify_cert_store_ref method to SslContextBuilder (#45)
+- 2025-02-07 feat(boring): Add add_cert_compression_alg support (#44)
+
+4.15.1
+- 2025-02-07 v4.15.1
+- 2025-02-07 chore: Removal unused deps
+- 2025-02-07 feat: Add `set_options` binding function to ConnectConfiguration (#43)
+- 2025-02-07 feat: Add new binding functions to `ConnectConfiguration` (#42)
+- 2025-02-07 chore: update documentation link
+- 2025-02-07 feat: Removal of `rpk` support
+- 2025-02-07 feat: Removal of `rpk` support (#41)
+- 2025-02-07 chore: remove unused `hyper-boring` crate
+- 2025-02-07 chore: Fix docs on SslRef::replace_ex_data (#40)
+
+4.15.0
+- 2025-02-02 v4.15.0
+- 2025-02-02 feat: Add ALPS use new endpoint (#39)
+
+4.14.2
+- 2025-01-23 v4.14.2
+- 2025-01-23 feat: replace once_cell with LazyLock (#38)
+
+4.14.1
+- 2025-01-22 v4.14.1
+- 2025-01-22 feat: deprecated `set_key_shares_length_limit` (#37)
+- 2025-01-22 Update README.md
+- 2025-01-22 feat: Add `kDHE` && `ffdhe2048`/`ffdhe3072` curves working implement (#36)
+- 2025-01-14 RTG-3333 Support X25519MLKEM768 by default, but don't sent it as client (#35)
+
+4.13.8
+- 2025-01-13 v4.13.8
+- 2025-01-13 docs: Fix docs build (#34)
+- 2025-01-10 boring-sys: Optional SSL_OP_NO_RENEGOTIATION to disable client renegotiation extension (#33)
 - 2024-07-31 Allow dead_code instead of disabling clippy entirely for bindgen
 - 2024-11-12 Remove INVALID_CALL from mid-handshake error message
 - 2024-08-16 Fix bug with accessing memzero'd X509StoreContext in tests
 - 2024-08-16 Support linking with a runtime cpp library
+
+4.13.6
+- 2025-01-05 v4.13.6
+- 2025-01-05 feat(boring): Add optional disable `PSK_DHE_KE` (#32)
+
+4.13.5
+- 2024-12-23 v4.13.5
+- 2024-12-23 chore: Remove extended alignment bounds validation unless the user is knowledgeable (#31)
+
+4.13.4
+- 2024-12-20 v4.13.4
+- 2024-12-20 chore: Disable extended permutation deduplication verification (#30)
+- 2024-12-20 feat: Expose extended sorting from indices (#29)
+
+4.13.3
+- 2024-12-19 v4.13.3
+- 2024-12-19 feat: Add setup extension permutation (#28)
+- 2024-12-19 refactor: refactor `key_shares` length limit (#27)
+- 2024-12-18 boring-sys: Add TLS extension zstd cert compression (#24)
+- 2024-12-18 patch: Add enable three `key_shares` limit (#23)
+- 2024-12-18 patch: Add option enable delegated_credentials (#22)
+- 2024-12-18 patch: Add option enable record_size_limit (#21)
+- 2024-12-18 boring: Add SslCurve `FFDHE2048`/`FFDHE3072` NID support  (#20)
+- 2024-12-17 boring: Add SslCurve `FFDHE2048`/`FFDHE3072` support (#19)
+- 2024-12-17 boring: update old ciphers patch (#18)
 - 2024-12-06 Refactor!: Introduce a Cargo feature for optional Hyper 0 support
 - 2024-12-06 Refactor!: Remove strict `TokioIo` response requirement from `hyper_boring::v1::HttpsConnector`
+
+4.13.2
+- 2024-12-06 v4.13.2
+- 2024-12-06 boring: Add SslConnector no default cert verify paths builder (#16)
+- 2024-12-06 sync upstream
 
 4.13.0
 - 2024-11-26 Sync X509StoreBuilder with openssl
@@ -136,6 +460,10 @@
 - 2024-11-28 Work around Rust settings inconsistent iOS SDK version
 - 2024-11-28 Clippy
 - 2024-03-11 Fix Windows build
+
+4.12.1
+- 2024-11-27 v4.12.1
+- 2024-11-27 Fix Windows build (#13)
 
 4.12.0
 - 2024-11-20 Add bindings for SSL_CB_ACCEPT_EXIT and SSL_CB_CONNECT_EXIT
@@ -149,9 +477,22 @@
 - 2024-09-25 Create semgrep.yml
 
 4.10.3
-- 2024-09-21 Set MSRV to 1.70 (#279)
+- 2024-11-15 Update README.md
+- 2024-11-15 Update README.md
+- 2024-11-15 rename rboring to boring2
+- 2024-11-15 rename tokio-rboring to tokio-boring2
+- 2024-11-15 rename rboring-sys to boring-sys2
+
+4.11.1
+- 2024-11-03 v4.11.1
+- 2024-11-03 Fix X25519_MLKEM768 mapper
+- 2024-11-03 sync upstream (#12)
+- 2024-11-03 feat(boring): Add SSL_CURVE_X25519_MLKEM768 curve binding (#11)
 
 4.10.2
+- 2024-09-22 Update docs link
+- 2024-09-21 v4.10.2
+- 2024-09-21 Set MSRV to 1.70 (#279)
 - 2024-09-18 boring-pq.patch Fix by not updating crypto_test_data.cc
 
 4.10.1
@@ -243,7 +584,7 @@
 
 4.2.0
 - 2023-12-13 Introduce set_custom_verify_callback and set_async_custom_verify_callback
-- 2023-12-13 Restore rpk feature in tokio-btls
+- 2023-12-13 Restore rpk feature in tokio-boring
 - 2023-12-13 Remove rpk from hyper docsrs features
 - 2023-12-14 Introduce tokio_boring::SslStreamBuilder
 - 2023-11-14 Swap build and run order; always build
@@ -290,7 +631,7 @@
 - 2023-10-24 Test new session callback on server side
 - 2023-10-24 Move session tests to their own module
 - 2023-10-11 Replace feature no-patches with BORING_BSSL{,_FIPS}_ASSUME_PATCHED
-- 2023-10-11 Remove feature rpk from hyper-boring and tokio-btls
+- 2023-10-11 Remove feature rpk from hyper-boring and tokio-boring
 - 2023-10-10 Introduce a new set of env variables for FIPS-like builds
 - 2023-10-10 Use prefix BORING_BSSL_ for all boringssl env variables
 - 2023-10-10 Don't read BORINGSSL_BUILD_DIR anymore
@@ -309,7 +650,7 @@
 - 2023-07-28 Change signature for set_select_certificate_callback
 - 2023-08-04 Introduce AsyncStreamBridge
 - 2023-06-23 Add a few WouldBlock cases
-- 2023-08-04 Introduce helper module in tokio-btls tests
+- 2023-08-04 Introduce helper module in tokio-boring tests
 - 2023-08-03 Introduce setup_accept and setup_connect
 - 2023-09-14 Panic on error when setting default curves list
 - 2023-06-23 Introduce ssl::Error::would_block
@@ -386,7 +727,7 @@
 - 2023-03-27 Fix google test
 - 2023-03-27 Use ubuntu-20.04 image for FIPS build
 - 2022-06-22 Add minimal cross-compilation support for Windows and AArch64 Linux
-- 2022-09-16 bump version number for tokio-btls
+- 2022-09-16 bump version number for tokio-boring
 
 2.1.0
 - 2022-09-16 Update changelogs and bump version numbers
@@ -415,7 +756,7 @@
 - 2021-12-16 Add/update changelogs
 - 2021-12-16 Bump versions for release
 - 2021-10-06 Remove PasswordCallback
-- 2021-11-04 Relax constraints on `Display for tokio-btls::HandshakeError`
+- 2021-11-04 Relax constraints on `Display for tokio-boring::HandshakeError`
 - 2021-11-02 boring-sys: Disable unnecessary bindgen dependencies
 - 2021-08-10 Remove unused and deprecated `tempdir` dependency
 - 2021-08-09 Remove unused `*Ref` parameters to macro
@@ -426,19 +767,19 @@
 - 2021-06-14 Remove unused dependency on bytes
 - 2021-07-29 Update bindgen to 0.59 and bytes to 1
 - 2021-07-29 Fix clippy warnings for 1.54
-- 2021-07-28 Update documentation for tokio-btls
+- 2021-07-28 Update documentation for tokio-boring
 - 2021-07-27 Fetch git submodule automatically
 - 2021-06-01 pre-built binaries: Update readme and fix clippy
 - 2021-05-18 Check for env var for pre-built binaries of bssl
 - 2021-07-27 Ignore bindgen warnings until they're fixed upstream
-- 2021-04-16 Bump tokio-btls to 2.1.3
+- 2021-04-16 Bump tokio-boring to 2.1.3
 - 2021-04-16 Bump boring to 1.1.6
 - 2021-04-16 Introduce ClientHello::client_version
 - 2021-04-16 Introduce HandshakeError::code
 - 2021-04-13 Bump boring to 1.1.5
 - 2021-04-13 Allow retrieving the version string from early callback
 - 2021-04-13 Allow returning the server name from the early callback
-- 2021-04-06 Bump boring-sys to 1.1.1, tokio-btls to 2.1.2
+- 2021-04-06 Bump boring-sys to 1.1.1, tokio-boring to 2.1.2
 - 2021-04-06 Allow uppercase acronyms
 - 2021-04-06 Provide access to inner I/O error during handshake
 - 2021-03-15 Bump boring to 1.1.4
@@ -446,7 +787,7 @@
 - 2021-03-15 Tweak yet again the boring error reporting
 - 2021-03-11 Bump boring to 1.1.3
 - 2021-03-11 Remove file/line from Display for HandshakeError
-- 2021-03-09 Bump boring to 1.1.2, tokio-btls 2.1.1
+- 2021-03-09 Bump boring to 1.1.2, tokio-boring 2.1.1
 - 2021-03-09 Add tokio_boring::HandshakeError::as_source_stream
 - 2021-03-09 Introduce MidHandshakeSslStream::into_parts
 - 2021-03-04 Print handshake errors in a better way
@@ -480,7 +821,7 @@
 - 2020-11-11 Fix doc comment
 - 2020-11-11 Fix docs
 - 2020-11-11 Add hyper-boring
-- 2020-11-11 Add tokio-btls
+- 2020-11-11 Add tokio-boring
 - 2020-11-11 Revive CI
 - 2020-11-11 Fix doc comments
 - 2020-11-11 Rename stuff
@@ -1170,6 +1511,8 @@
 - 2017-07-22 Build OpenSSL with debuginfo
 - 2017-07-22 Set RUST_BACKTRACE=1 on tests
 - 2017-07-22 Mention Debian for apt-get instructions
+
+0.9.15
 - 2017-07-20 Forbid LibreSSL 2.5.6+
 - 2017-07-20 Fix X509::clone impl
 - 2017-07-17 Support for LibreSSL 2.5.5
@@ -1191,6 +1534,8 @@
 - 2017-05-26 Expose PSK via a SslContextBuilder::set_psk_callback method
 - 2017-06-25 Enable build on LibreSSL 5.6.0 development branch.
 - 2017-06-24 Add PKey::private_key_from_der
+
+0.9.14
 - 2017-06-15 Properly reexport ConnectConfiguration
 - 2017-06-10 Fix documentation typo
 - 2017-06-07 remove unused dependencies on windows
@@ -1198,9 +1543,13 @@
 - 2017-06-03 Add pkg-config
 - 2017-05-30 Little docs fix
 - 2017-05-30 Add a fixme
+
+0.9.13
 - 2017-05-22 Update bitflags 0.8 -> 0.9
 - 2017-05-20 Explicitly initialize OpenSSL 1.1.0
 - 2017-05-20 Rustfmt
+
+0.9.12
 - 2017-05-12 Test LibreSSL 2.5.4
 - 2017-05-12 Fix support for LibreSSL versions other than 2.5.0
 - 2017-05-11 use appveyor DownloadFile to download cacert.pem
@@ -1210,16 +1559,24 @@
 - 2017-05-06 Add a note to rename variant
 - 2017-05-03 Clarify use of ssl::HandshakeError::Interrupted
 - 2017-04-15 Expose the lower level SHA functions
+
+0.9.11
 - 2017-04-12 Don't force allocation for message digests
 - 2017-04-11 (issues-600) Avoid compiling ec2m code against no-ec2m openssl
 - 2017-04-04 Add new EC/PKEY methods to permit deriving shared secrets.
 - 2017-04-04 Don't exclude test data from package
 - 2017-04-03 bump bitflags to 0.8
 - 2017-03-29 show help message when pkg-config is missing
+
+0.9.10
 - 2017-03-25 Fix order of arguments to BN_rand_range and BN_pseudo_rand_range
 - 2017-03-25 Logic to support client-side session reuse
 - 2017-03-16 Panic if lock managed by `locking_function` is doubly unlocked
+
+0.9.9
 - 2017-03-13 (maint) Recreate ability to pass in OPENSSL_LIBS variable
+
+0.9.8
 - 2017-03-07 Don't allow Stacks to be allocated with a null-ptr
 - 2017-03-06 Fix for empty stacks
 - 2017-03-06 Add test to run into issue with stack.len()
@@ -1246,6 +1603,8 @@
 - 2017-02-16 Update 1.1.0 version
 - 2017-02-15 De-quote README line
 - 2017-02-15 Support PKCS#8 private key deserialization
+
+0.9.7
 - 2017-02-11 Fix for libressl
 - 2017-02-11 Update deprecation version
 - 2017-02-11 Use published foreign_types
@@ -1286,6 +1645,8 @@
 - 2017-01-23 add pkcs12_create and to_der funcs
 - 2017-01-20 Add categories
 - 2017-01-14 OCSP functionality
+
+0.9.6
 - 2017-01-08 Fix typo
 - 2017-01-08 Add methods to construct SslAcceptorBuilder without key and cert
 - 2017-01-07 Adjust minimum pkg-config version
@@ -1297,6 +1658,8 @@
 - 2017-01-05 Types and accessor for SslSession
 - 2017-01-05 Add SSL_SESSION functions
 - 2017-01-05 Add SSL_SESSION
+
+0.9.5
 - 2017-01-03 Clean up EcKey example a bit
 - 2017-01-03 Add X509::stack_from_pem
 - 2016-12-31 add EcKey creation from EcPoint, public_key
@@ -1312,18 +1675,24 @@
 - 2017-01-01 Fix doc reference
 - 2016-12-31 Indicate that memcmp::eq should be used for HMACs
 - 2016-12-24 Use metadeps to specify pkg-config dependencies declaratively
+
+0.9.4
 - 2016-12-20 Add Travis build against LibreSSL
 - 2016-12-21 Add LibreSSL 2.5.0 support
 - 2016-12-21 duplicate ossl10x.rs to libressl.rs
 - 2016-12-20 Handle zero-length reads/writes
 - 2016-12-14 Explain how to install trusted root certificates
 - 2016-12-12 Allow OPENSSL_{LIB,INCLUDE}_DIR to override OPENSSL_DIR
+
+0.9.3
 - 2016-12-10 Switch to docs.rs for docs
 - 2016-12-10 Fix ErrorStack display
 - 2016-12-09 Add Blowfish tests
 - 2016-12-09 Use EVP_bf_cfb64 instead of EVP_bf_cfb
 - 2016-12-09 Add Blowfish support
 - 2016-12-02 Update README.md
+
+0.9.2
 - 2016-11-28 Implement Clone for SslConnector and SslAcceptor
 - 2016-11-19 Cleanup
 - 2016-11-16 Return Option from group
@@ -1373,6 +1742,8 @@
 - 2016-11-11 Add EcKey <-> PKey conversions
 - 2016-11-11 PKey <-> DH conversions
 - 2016-11-11 Add PKey::dsa
+
+0.9.1
 - 2016-11-11 Don't test 32 bit osx openssl install
 - 2016-11-11 Move osx builds to top of list
 - 2016-11-11 Fix EOF detection
@@ -1399,6 +1770,8 @@
 - 2016-11-06 Fix build on 1.0.1
 - 2016-11-06 Add accessors for cert and private key
 - 2016-11-06 Provide a tailored error message on Linux
+
+0.9.0
 - 2016-11-06 Fixes
 - 2016-11-06 Remove set_rsa
 - 2016-11-06 Implement Pkcs12 via type_!
@@ -1704,10 +2077,16 @@
 - 2016-06-14 Move into utility module
 - 2016-06-13 Try to propagate callback panics
 - 2016-06-13 Add PKey::private_key_from_pem_cb
+
+0.7.14
 - 2016-07-01 Set auto retry
 - 2016-06-26 Test on 1.8
 - 2016-06-13 Document BigNum
+
+0.7.13
 - 2016-05-19 Update user32-sys and gdi32-sys to 0.2
+
+0.7.12
 - 2016-05-17 Rustfmt
 - 2016-05-17 Clean up RSA signature API
 - 2016-03-14 Fix order of 32- and 64-bit for mingw toolchain
@@ -1719,6 +2098,8 @@
 - 2016-05-04 add missing NIDs and use Nid as input to signing
 - 2016-05-03 take enum instead of ints from openssl header file
 - 2016-05-03 add constructor for private keys from bignums
+
+0.7.11
 - 2016-05-04 fixes typo in appveyor config
 - 2016-05-03 Update openssl version in CI
 - 2016-05-02 Remove dead C code
@@ -1737,6 +2118,8 @@
 - 2016-04-14 Add 1DES symm ciphers (des-cbc, des-ecb, des-cfb, des-ofb)
 - 2016-04-30 Add accessors for x509 subject alt names
 - 2016-04-29 Start on GeneralName
+
+0.7.10
 - 2016-04-17 Add docs for set_default_verify_paths
 - 2016-04-17 Add SslContext::set_default_verify_paths
 - 2016-04-14 Update for nightly changes
@@ -1744,14 +2127,20 @@
 - 2016-04-13 Resolves #378 - Module version with the version information
 - 2016-04-13 Add ability to set session ID context on an SSL context
 - 2016-04-10 copy PKey using DER encode and decode
+
+0.7.9
 - 2016-04-06 add EVP_PKEY_copy_parameters to FFI
 - 2016-04-04 Add safe wrapper BioMethod for ffi::BIO_METHOD
 - 2016-03-27 Cleanup
 - 2016-03-27 Update for nightly changes
 - 2016-03-21 Cast correctly c_char raw pointers (fixes build on ARM #363)
+
+0.7.8
 - 2016-03-18 Allow Rust to infer the type of the argument to SSL_CIPHER_description.
 - 2016-03-18 Clean up BIO name
 - 2016-03-18 Simplify panic safety logic for new nightly
+
+0.7.7
 - 2016-03-11 Fix nightly warnings about zero-sized fn pointers
 - 2015-10-11 Update README.md.
 - 2015-10-11 Update README.md
@@ -1768,6 +2157,8 @@
 - 2016-02-18 Add SSL_get_version
 - 2016-02-17 Add support for SSL_CIPHER
 - 2016-02-28 Bump bitflags to 0.4
+
+0.7.6
 - 2016-02-09 More deprecated function cleanup
 - 2016-02-09 Stop using deprecated method
 - 2016-02-02 Update appveyor openssl version
@@ -1790,6 +2181,8 @@
 - 2016-01-01 Implement the possibility to create BigNums from their ffi counterpart
 - 2016-01-01 Add RSA structs
 - 2016-01-23 Exclude test directory from package
+
+0.7.5
 - 2016-01-22 Fix connect and accept error reporting
 - 2016-01-22 Remove raw_pointer_derive lint.
 - 2016-01-18 openssl/ssl/context: test that we are refcounting correctly
@@ -1804,12 +2197,16 @@
 - 2016-01-05 Added PEM_read_bio_RSAPrivateKey and PEM_read_bio_RSA_PUBKEY
 - 2016-01-07 Mark PKey as `Send` and `Sync`
 - 2015-12-19 Update README doc link
+
+0.7.4
 - 2015-12-19 Rustfmt
 - 2015-12-19 Fix deprecation location
 - 2015-12-19 Drop verbose flag
 - 2015-12-19 Add a script to build docs with all features enabled
 - 2015-12-19 Work around the worst of clone bogusness
 - 2015-12-18 Fix Cargo.toml to actually depend on gdi32-sys and user32-sys
+
+0.7.3
 - 2015-12-18 Disable cross compilation for now
 - 2015-12-18 Fix nonblocking behavior
 - 2015-12-17 Travis fixes
@@ -1820,6 +2217,8 @@
 - 2015-12-16 Fix regression of c_char type mismatches on ARM
 - 2015-12-16 Rustfmt
 - 2015-12-16 Fix bounds on ssl_read and ssl_write
+
+0.7.2
 - 2015-12-16 Cleanup SNI stuff
 - 2015-12-16 Cleanup
 - 2015-12-10 Put pbkdf2_hmac_{256,512}() behind feature gate
@@ -1847,11 +2246,15 @@
 - 2015-12-08 (maint) Update appveyor link to the OpenSSL download
 - 2015-11-30 Cast correctly c_char raw pointers (fixes build on ARM #314)
 - 2015-11-29 Mention el cap changes in readme
+
+0.7.1
 - 2015-11-28 Avoid empty include paths (i.e. cc -I "" ) as they are not supported by GCC. Fix #311
 - 2015-11-21 Implement try_clone for MaybeSslStream
 - 2015-11-20 Fixed a typo in a comment.
 - 2015-11-18 Fix a leak when using `EVP_PKEY_get1_RSA`.
 - 2015-11-17 Remove unecessary build dependency
+
+0.7.0
 - 2015-11-17 Mention why the windows deps are there
 - 2015-11-17 Don't depend on wildcard windows deps
 - 2015-10-25 Explicitly depend on gdi32 and user32 on Windows
@@ -1880,6 +2283,8 @@
 - 2015-09-23 Get nonblocking tests working on OSX/Windows
 - 2015-09-20 Nonblocking streams support.
 - 2015-10-15 Expose RSA_generate_key_ex.
+
+0.6.7
 - 2015-10-13 Add metadata for the include dir of openssl
 - 2015-10-15 Revert "Merge pull request #280 from ltratt/libressl_build"
 - 2015-10-15 Update OpenSSL version checks to 1.0 numbers instead of 0.10 numbers
@@ -1888,6 +2293,8 @@
 - 2015-10-12 Add certs.pem in cert probe list
 - 2015-10-03 Fix build on LibreSSL.
 - 2015-10-02 Add public key PEM read function.
+
+0.6.6
 - 2015-10-05 Clean up init stuff
 - 2015-10-05 Set threadid_func on linux/osx (fixes #281)
 - 2015-10-02 Update documentation about SSLv23
@@ -2453,6 +2860,8 @@
 - 2012-10-09 Expose the submodules
 - 2012-10-02 Update for language changes
 - 2012-09-28 Update to rust HEAD
+
+0.1
 - 2012-07-04 Add a .gitignore
 - 2012-07-04 Update to latest rustc syntax.
 - 2012-06-21 Fix no-implicit-copies warnings
