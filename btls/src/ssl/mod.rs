@@ -741,14 +741,14 @@ impl From<u16> for SslSignatureAlgorithm {
 /// A TLS key share group.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub struct KeyShare(c_int);
+pub struct KeyShare(u16);
 
 impl KeyShare {
-    pub const P_256: KeyShare = KeyShare(ffi::SSL_GROUP_SECP256R1 as _);
+    pub const SECP256R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP256R1 as _);
 
-    pub const P_384: KeyShare = KeyShare(ffi::SSL_GROUP_SECP384R1 as _);
+    pub const SECP384R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP384R1 as _);
 
-    pub const P_521: KeyShare = KeyShare(ffi::SSL_GROUP_SECP521R1 as _);
+    pub const SECP521R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP521R1 as _);
 
     pub const X25519: KeyShare = KeyShare(ffi::SSL_GROUP_X25519 as _);
 
@@ -764,6 +764,13 @@ impl KeyShare {
     pub const FFDHE2048: KeyShare = KeyShare(ffi::SSL_GROUP_FFDHE2048 as _);
 
     pub const FFDHE3072: KeyShare = KeyShare(ffi::SSL_GROUP_FFDHE3072 as _);
+}
+
+impl From<u16> for KeyShare {
+    #[inline]
+    fn from(value: u16) -> Self {
+        Self(value)
+    }
 }
 
 /// A compliance policy.
