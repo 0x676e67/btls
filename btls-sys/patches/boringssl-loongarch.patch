@@ -1,43 +1,14 @@
-From d39506c373dc03b1bfab2c01abc2232e36d13ed6 Mon Sep 17 00:00:00 2001
-From: WANG Rui <wangrui@loongson.cn>
-Date: Sun, 27 Apr 2025 16:09:06 +0800
-Subject: [PATCH] Add basic support for LoongArch
-
-Signed-off-by: WANG Rui <wangrui@loongson.cn>
----
- src/crypto/fipsmodule/rand/getrandom_fillin.h | 2 ++
- src/include/openssl/base.h                    | 5 +++++
- 2 files changed, 7 insertions(+)
-
-diff --git a/src/crypto/fipsmodule/rand/getrandom_fillin.h b/src/crypto/fipsmodule/rand/getrandom_fillin.h
-index 0f290e963..669a9077c 100644
---- a/src/crypto/fipsmodule/rand/getrandom_fillin.h
-+++ b/src/crypto/fipsmodule/rand/getrandom_fillin.h
-@@ -30,6 +30,8 @@
- #define EXPECTED_NR_getrandom 278
- #elif defined(OPENSSL_ARM)
- #define EXPECTED_NR_getrandom 384
-+#elif defined(OPENSSL_LOONGARCH64)
-+#define EXPECTED_NR_getrandom 278
- #elif defined(OPENSSL_RISCV64)
- #define EXPECTED_NR_getrandom 278
- #endif
-diff --git a/src/include/openssl/base.h b/src/include/openssl/base.h
-index 67429c099..6ef32eeec 100644
---- a/src/include/openssl/base.h
-+++ b/src/include/openssl/base.h
-@@ -96,6 +96,11 @@ extern "C" {
- #elif defined(__ARMEL__) || defined(_M_ARM)
+diff --git a/include/openssl/target.h b/include/openssl/target.h
+index 147ab31..bc03e54 100644
+--- a/include/openssl/target.h
++++ b/include/openssl/target.h
+@@ -45,6 +45,9 @@
+ #define OPENSSL_RISCV64
+ #elif defined(__riscv) && __SIZEOF_POINTER__ == 4
  #define OPENSSL_32_BIT
- #define OPENSSL_ARM
-+#elif defined(__loongarch__) && __SIZEOF_POINTER__ == 8
++#elif defined(__loongarch64)
 +#define OPENSSL_64_BIT
 +#define OPENSSL_LOONGARCH64
-+#elif defined(__loongarch__) && __SIZEOF_POINTER__ == 4
-+#define OPENSSL_32_BIT
- #elif defined(__MIPSEL__) && !defined(__LP64__)
+ #elif defined(__pnacl__)
  #define OPENSSL_32_BIT
- #define OPENSSL_MIPS
--- 
-2.46.0
-
+ #define OPENSSL_PNACL
