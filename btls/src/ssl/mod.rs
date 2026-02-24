@@ -738,32 +738,32 @@ impl From<u16> for SslSignatureAlgorithm {
     }
 }
 
-/// A TLS Curve.
+/// A TLS key share group.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub struct SslCurve(u16);
+pub struct KeyShare(u16);
 
-impl SslCurve {
-    pub const SECP256R1: SslCurve = SslCurve(ffi::SSL_GROUP_SECP256R1 as _);
+impl KeyShare {
+    pub const SECP256R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP256R1 as _);
 
-    pub const SECP384R1: SslCurve = SslCurve(ffi::SSL_GROUP_SECP384R1 as _);
+    pub const SECP384R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP384R1 as _);
 
-    pub const SECP521R1: SslCurve = SslCurve(ffi::SSL_GROUP_SECP521R1 as _);
+    pub const SECP521R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP521R1 as _);
 
-    pub const X25519: SslCurve = SslCurve(ffi::SSL_GROUP_X25519 as _);
+    pub const X25519: KeyShare = KeyShare(ffi::SSL_GROUP_X25519 as _);
 
-    pub const X25519_MLKEM768: SslCurve = SslCurve(ffi::SSL_GROUP_X25519_MLKEM768 as _);
+    pub const X25519_MLKEM768: KeyShare = KeyShare(ffi::SSL_GROUP_X25519_MLKEM768 as _);
 
-    pub const X25519_KYBER768_DRAFT00: SslCurve =
-        SslCurve(ffi::SSL_GROUP_X25519_KYBER768_DRAFT00 as _);
+    pub const X25519_KYBER768_DRAFT00: KeyShare =
+        KeyShare(ffi::SSL_GROUP_X25519_KYBER768_DRAFT00 as _);
 
-    pub const P256_KYBER768_DRAFT00: SslCurve = SslCurve(ffi::SSL_GROUP_P256_KYBER768_DRAFT00 as _);
+    pub const P256_KYBER768_DRAFT00: KeyShare = KeyShare(ffi::SSL_GROUP_P256_KYBER768_DRAFT00 as _);
 
-    pub const MLKEM1024: SslCurve = SslCurve(ffi::SSL_GROUP_MLKEM1024 as _);
+    pub const MLKEM1024: KeyShare = KeyShare(ffi::SSL_GROUP_MLKEM1024 as _);
 
-    pub const FFDHE2048: SslCurve = SslCurve(ffi::SSL_GROUP_FFDHE2048 as _);
+    pub const FFDHE2048: KeyShare = KeyShare(ffi::SSL_GROUP_FFDHE2048 as _);
 
-    pub const FFDHE3072: SslCurve = SslCurve(ffi::SSL_GROUP_FFDHE3072 as _);
+    pub const FFDHE3072: KeyShare = KeyShare(ffi::SSL_GROUP_FFDHE3072 as _);
 }
 
 /// A compliance policy.

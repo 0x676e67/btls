@@ -7,7 +7,7 @@ use openssl_macros::corresponds;
 use crate::dh::Dh;
 use crate::error::ErrorStack;
 use crate::ssl::{
-    HandshakeError, Ssl, SslContext, SslContextBuilder, SslContextRef, SslCurve, SslMethod,
+    HandshakeError, KeyShare, Ssl, SslContext, SslContextBuilder, SslContextRef, SslMethod,
     SslMode, SslOptions, SslRef, SslStream, SslVerifyMode,
 };
 use crate::{cvt, version};
@@ -302,7 +302,7 @@ impl ConnectConfiguration {
 
     /// Sets the client key shares to be used in the TLS 1.3 handshake.
     #[corresponds(SSL_set1_client_key_shares)]
-    pub fn set_client_key_shares(&mut self, key_shares: &[SslCurve]) -> Result<(), ErrorStack> {
+    pub fn set_client_key_shares(&mut self, key_shares: &[KeyShare]) -> Result<(), ErrorStack> {
         unsafe {
             cvt(ffi::SSL_set1_client_key_shares(
                 self.as_ptr(),
