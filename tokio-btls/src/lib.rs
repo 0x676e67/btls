@@ -5,7 +5,7 @@
 //! blocking [`Read`] and [`Write`] traits.
 //!
 //! This file reimplements tokio-btls with the [overhauled](https://github.com/sfackler/tokio-openssl/commit/56f6618ab619f3e431fa8feec2d20913bf1473aa)
-//! tokio-openssl interface while the tokio APIs from official [btls] crate is not yet caught up
+//! tokio-openssl interface while the tokio APIs from official [boring](https://github.com/cloudflare/boring) crate is not yet caught up
 //! to it.
 
 use std::{
