@@ -766,13 +766,6 @@ impl KeyShare {
     pub const FFDHE3072: KeyShare = KeyShare(ffi::SSL_GROUP_FFDHE3072 as _);
 }
 
-impl From<u16> for KeyShare {
-    #[inline]
-    fn from(value: u16) -> Self {
-        Self(value)
-    }
-}
-
 /// A compliance policy.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct CompliancePolicy(ffi::ssl_compliance_policy_t);
