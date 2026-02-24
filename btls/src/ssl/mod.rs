@@ -744,11 +744,11 @@ impl From<u16> for SslSignatureAlgorithm {
 pub struct KeyShare(u16);
 
 impl KeyShare {
-    pub const SECP256R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP256R1 as _);
+    pub const P256: KeyShare = KeyShare(ffi::SSL_GROUP_SECP256R1 as _);
 
-    pub const SECP384R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP384R1 as _);
+    pub const P384: KeyShare = KeyShare(ffi::SSL_GROUP_SECP384R1 as _);
 
-    pub const SECP521R1: KeyShare = KeyShare(ffi::SSL_GROUP_SECP521R1 as _);
+    pub const P521: KeyShare = KeyShare(ffi::SSL_GROUP_SECP521R1 as _);
 
     pub const X25519: KeyShare = KeyShare(ffi::SSL_GROUP_X25519 as _);
 
