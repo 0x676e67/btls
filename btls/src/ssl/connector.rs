@@ -259,13 +259,6 @@ impl ConnectConfiguration {
 }
 
 impl ConnectConfiguration {
-    /// Enables or disables ECH grease.
-    #[cfg(not(feature = "fips"))]
-    #[corresponds(SSL_set_enable_ech_grease)]
-    pub fn set_enable_ech_grease(&mut self, enable: bool) {
-        unsafe { ffi::SSL_set_enable_ech_grease(self.as_ptr(), enable as _) }
-    }
-
     /// Sets whether the aes hardware override should be enabled.
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_set_aes_hw_override)]
