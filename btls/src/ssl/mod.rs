@@ -3919,7 +3919,7 @@ impl SslRef {
     #[corresponds(SSL_set_aes_hw_override)]
     pub fn set_aes_hw_override(&mut self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
-        unsafe { ffi::SSL_set_aes_hw_override(self.as_ptr(), enable as _) }
+        unsafe { ffi::SSL_set_aes_hw_override(self.as_ptr(), enable) }
     }
 }
 
