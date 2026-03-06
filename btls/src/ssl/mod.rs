@@ -3911,7 +3911,7 @@ impl SslRef {
     #[corresponds(SSL_set_alps_use_new_codepoint)]
     pub fn set_alps_use_new_codepoint(&mut self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
-        unsafe { ffi::SSL_set_alps_use_new_codepoint(self.as_ptr(), enable as _) }
+        unsafe { ffi::SSL_set_alps_use_new_codepoint(self.as_ptr(), enable) }
     }
 
     /// Sets whether the aes hardware override should be enabled.
