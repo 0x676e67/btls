@@ -3878,6 +3878,49 @@ impl SslRef {
     pub fn add_credential(&mut self, credential: &SslCredentialRef) -> Result<(), ErrorStack> {
         unsafe { cvt_0i(ffi::SSL_add1_credential(self.as_ptr(), credential.as_ptr())).map(|_| ()) }
     }
+
+    /// Sets the client key shares to be used in the TLS 1.3 handshake.
+    #[corresponds(SSL_set1_client_key_shares)]
+    pub fn set_client_key_shares(&mut self, key_shares: &[KeyShare]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_set1_client_key_shares(
+                self.as_ptr(),
+                key_shares.as_ptr() as *const _,
+                key_shares.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Sets application settings flag for ALPS (Application-Layer Protocol Negotiation).
+    #[corresponds(SSL_add_application_settings)]
+    pub fn add_application_settings(&mut self, alps: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_add_application_settings(
+                self.as_ptr(),
+                alps.as_ptr(),
+                alps.len(),
+                std::ptr::null(),
+                0,
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Sets the ALPS use new codepoint flag.
+    #[corresponds(SSL_set_alps_use_new_codepoint)]
+    pub fn set_alps_use_new_codepoint(&mut self, enable: bool) {
+        let enable = if enable { 1 } else { 0 };
+        unsafe { ffi::SSL_set_alps_use_new_codepoint(self.as_ptr(), enable as _) }
+    }
+
+    /// Sets whether the aes hardware override should be enabled.
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_set_aes_hw_override)]
+    pub fn set_aes_hw_override(&mut self, enable: bool) {
+        let enable = if enable { 1 } else { 0 };
+        unsafe { ffi::SSL_set_aes_hw_override(self.as_ptr(), enable as _) }
+    }
 }
 
 /// An SSL stream midway through the handshake process.

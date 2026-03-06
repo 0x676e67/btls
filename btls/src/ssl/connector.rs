@@ -1,16 +1,13 @@
 use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
 
-use foreign_types::ForeignTypeRef;
-use openssl_macros::corresponds;
-
 use crate::dh::Dh;
 use crate::error::ErrorStack;
 use crate::ssl::{
-    HandshakeError, KeyShare, Ssl, SslContext, SslContextBuilder, SslContextRef, SslMethod,
-    SslMode, SslOptions, SslRef, SslStream, SslVerifyMode,
+    HandshakeError, Ssl, SslContext, SslContextBuilder, SslContextRef, SslMethod, SslMode,
+    SslOptions, SslRef, SslStream, SslVerifyMode,
 };
-use crate::{cvt, version};
+use crate::version;
 use std::net::IpAddr;
 
 use super::MidHandshakeSslStream;
@@ -255,55 +252,6 @@ impl ConnectConfiguration {
         self.setup_connect(domain, stream)
             .map_err(HandshakeError::SetupFailure)?
             .handshake()
-    }
-}
-
-impl ConnectConfiguration {
-    /// Sets whether the aes hardware override should be enabled.
-    #[cfg(not(feature = "fips"))]
-    #[corresponds(SSL_set_aes_hw_override)]
-    pub fn set_aes_hw_override(&mut self, enable: bool) {
-        unsafe { ffi::SSL_set_aes_hw_override(self.as_ptr(), enable as _) }
-    }
-
-    /// Sets application settings flag for ALPS (Application-Layer Protocol Negotiation).
-    #[corresponds(SSL_add_application_settings)]
-    pub fn add_application_settings(&mut self, alps: &[u8]) -> Result<(), ErrorStack> {
-        unsafe {
-            cvt(ffi::SSL_add_application_settings(
-                self.as_ptr(),
-                alps.as_ptr(),
-                alps.len(),
-                std::ptr::null(),
-                0,
-            ))
-            .map(|_| ())
-        }
-    }
-
-    /// Sets the ALPS use new codepoint flag.
-    #[corresponds(SSL_set_alps_use_new_codepoint)]
-    pub fn set_alps_use_new_codepoint(&mut self, use_new: bool) {
-        unsafe { ffi::SSL_set_alps_use_new_codepoint(self.as_ptr(), use_new as _) }
-    }
-
-    /// Sets the SSL options.
-    #[corresponds(SSL_set_options)]
-    pub fn set_options(&mut self, options: SslOptions) -> Result<(), ErrorStack> {
-        unsafe { cvt(ffi::SSL_set_options(self.as_ptr(), options.bits()) as _).map(|_| ()) }
-    }
-
-    /// Sets the client key shares to be used in the TLS 1.3 handshake.
-    #[corresponds(SSL_set1_client_key_shares)]
-    pub fn set_client_key_shares(&mut self, key_shares: &[KeyShare]) -> Result<(), ErrorStack> {
-        unsafe {
-            cvt(ffi::SSL_set1_client_key_shares(
-                self.as_ptr(),
-                key_shares.as_ptr() as *const _,
-                key_shares.len(),
-            ))
-            .map(|_| ())
-        }
     }
 }
 
