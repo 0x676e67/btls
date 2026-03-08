@@ -1,6 +1,6 @@
 [package]
 name = "quinn-btls"
-version = { workspace = true }
+version = "0.1.0"
 authors = ["0x676e67 <gngppz@gmail.com>"]
 license = "MIT OR Apache-2.0"
 edition = { workspace = true }
