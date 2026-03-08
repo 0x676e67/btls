@@ -3,6 +3,12 @@ members = [
     "btls",
     "btls-sys",
     "tokio-btls",
+    "quinn-btls",
+]
+default-members = [
+    "btls",
+    "btls-sys",
+    "tokio-btls",
 ]
 resolver = "2"
 
