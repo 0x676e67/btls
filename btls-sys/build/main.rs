@@ -473,11 +473,12 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
 
     println!("cargo:warning=applying patch to boringssl");
     apply_patch(config, "boringssl.patch")?;
-    println!("cargo:warning=applying windows cross compile patch to boringssl");
-    apply_patch(config, "boringssl-windows.patch")?;
 
     println!("cargo:warning=applying loongarch patch to boringssl");
     apply_patch(config, "boringssl-loongarch.patch")?;
+
+    println!("cargo:warning=applying windows cross compile patch to boringssl");
+    apply_patch(config, "boringssl-windows.patch")?;
 
     if config.features.underscore_wildcards {
         println!("cargo:warning=applying underscore wildcards patch to boringssl");
