@@ -3,6 +3,7 @@ members = [
     "btls",
     "btls-sys",
     "tokio-btls",
+    "compio-btls",
     "quinn-btls",
 ]
 default-members = [

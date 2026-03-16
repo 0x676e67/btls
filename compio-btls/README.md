@@ -1,8 +1,8 @@
-# tokio-btls
+# compio-btls
 
-An implementation of SSL streams for Tokio built on top of the BoringSSL.
+An implementation of SSL streams for Compio built on top of the BoringSSL.
 
-[Documentation](https://docs.rs/tokio-btls)
+[Documentation](https://docs.rs/compio-btls)
 
 # License
 
@@ -20,7 +20,3 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this project by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
-
-## Accolades
-
-The project is based on a fork of [tokio-openssl](https://github.com/sfackler/tokio-openssl).
