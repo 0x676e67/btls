@@ -13,49 +13,11 @@ use btls::{
 use compio::buf::{IoBuf, IoBufMut};
 use compio::BufResult;
 use compio_io::{compat::SyncStream, AsyncRead, AsyncWrite};
-use std::io::{self, Read, Write};
+use std::io;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
+use std::task::Context;
 use std::task::Poll;
-use std::{fmt, task::Context};
-
-struct StreamWrapper<S> {
-    stream: SyncStream<S>,
-}
-
-impl<S> fmt::Debug for StreamWrapper<S>
-where
-    S: fmt::Debug,
-{
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.stream, fmt)
-    }
-}
-
-impl<S> Read for StreamWrapper<S>
-where
-    S: AsyncRead,
-{
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf)
-    }
-}
-
-impl<S> Write for StreamWrapper<S>
-where
-    S: AsyncWrite,
-{
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.write(buf)
-    }
-
-    #[inline]
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
-}
 
 fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
     match r {
@@ -69,19 +31,13 @@ fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
 
 /// An asynchronous version of [`btls::ssl::SslStream`].
 #[derive(Debug)]
-pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
+pub struct SslStream<S>(SslStreamCore<SyncStream<S>>);
 
 impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     #[inline]
     /// Like [`SslStream::new`](ssl::SslStream::new).
     pub fn new(ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
-        SslStreamCore::new(
-            ssl,
-            StreamWrapper {
-                stream: SyncStream::new(stream),
-            },
-        )
-        .map(SslStream)
+        SslStreamCore::new(ssl, SyncStream::new(stream)).map(SslStream)
     }
 
     #[inline]
@@ -128,7 +84,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
 
     async fn drive_handshake<F>(mut self: Pin<&mut Self>, mut f: F) -> Result<(), ssl::Error>
     where
-        F: FnMut(&mut SslStreamCore<StreamWrapper<S>>) -> Result<(), ssl::Error>,
+        F: FnMut(&mut SslStreamCore<SyncStream<S>>) -> Result<(), ssl::Error>,
     {
         loop {
             let res = {
@@ -168,12 +124,12 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
 impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     async fn fill_read_buf(mut self: Pin<&mut Self>) -> io::Result<usize> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
-        this.0.get_mut().stream.fill_read_buf().await
+        this.0.get_mut().fill_read_buf().await
     }
 
     async fn flush_write_buf(mut self: Pin<&mut Self>) -> io::Result<usize> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
-        this.0.get_mut().stream.flush_write_buf().await
+        this.0.get_mut().flush_write_buf().await
     }
 }
 
@@ -187,13 +143,13 @@ impl<S> SslStream<S> {
     #[inline]
     /// Returns a shared reference to the underlying stream.
     pub fn get_ref(&self) -> &S {
-        self.0.get_ref().stream.get_ref()
+        self.0.get_ref().get_ref()
     }
 
     #[inline]
     /// Returns a mutable reference to the underlying stream.
     pub fn get_mut(&mut self) -> &mut S {
-        self.0.get_mut().stream.get_mut()
+        self.0.get_mut().get_mut()
     }
 
     #[inline]
@@ -201,13 +157,13 @@ impl<S> SslStream<S> {
     pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut S> {
         unsafe {
             let this = self.get_unchecked_mut();
-            Pin::new_unchecked(this.0.get_mut().stream.get_mut())
+            Pin::new_unchecked(this.0.get_mut().get_mut())
         }
     }
 
     fn with_context<F, R>(self: Pin<&mut Self>, ctx: &mut Context<'_>, f: F) -> R
     where
-        F: FnOnce(&mut SslStreamCore<StreamWrapper<S>>) -> R,
+        F: FnOnce(&mut SslStreamCore<SyncStream<S>>) -> R,
     {
         let this = unsafe { self.get_unchecked_mut() };
         this.0.ssl_mut().set_task_waker(Some(ctx.waker().clone()));
@@ -239,7 +195,7 @@ where
                     return BufResult(Ok(res), buf);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    match self.0.get_mut().stream.fill_read_buf().await {
+                    match self.0.get_mut().fill_read_buf().await {
                         Ok(_) => continue,
                         Err(e) => return BufResult(Err(e), buf),
                     }
@@ -273,17 +229,17 @@ where
             match io::Write::flush(&mut self.0) {
                 Ok(()) => break,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.0.get_mut().stream.flush_write_buf().await?;
+                    self.0.get_mut().flush_write_buf().await?;
                 }
                 Err(e) => return Err(e),
             }
         }
-        self.0.get_mut().stream.flush_write_buf().await?;
+        self.0.get_mut().flush_write_buf().await?;
         Ok(())
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
         self.flush().await?;
-        self.0.get_mut().stream.get_mut().shutdown().await
+        self.0.get_mut().get_mut().shutdown().await
     }
 }
