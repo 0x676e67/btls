@@ -13,11 +13,11 @@ use btls::{
 use compio::buf::{IoBuf, IoBufMut};
 use compio::BufResult;
 use compio_io::{compat::SyncStream, AsyncRead, AsyncWrite};
-use std::io;
-use std::mem::MaybeUninit;
+use std::error::Error;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
+use std::{fmt, io};
 
 fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
     match r {
@@ -45,25 +45,30 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     pub fn poll_connect(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), ssl::Error>> {
+    ) -> Poll<Result<(), HandshakeError>> {
         self.with_context(cx, |s| cvt_ossl(s.connect()))
+            .map_err(HandshakeError::Ssl)
     }
 
     #[inline]
     /// A convenience method wrapping [`poll_connect`](Self::poll_connect).
-    pub async fn connect(self: Pin<&mut Self>) -> Result<(), ssl::Error> {
+    pub async fn connect(self: Pin<&mut Self>) -> Result<(), HandshakeError> {
         self.drive_handshake(|s| s.connect()).await
     }
 
     #[inline]
     /// Like [`SslStream::accept`](ssl::SslStream::accept).
-    pub fn poll_accept(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ssl::Error>> {
+    pub fn poll_accept(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), HandshakeError>> {
         self.with_context(cx, |s| cvt_ossl(s.accept()))
+            .map_err(HandshakeError::Ssl)
     }
 
     #[inline]
     /// A convenience method wrapping [`poll_accept`](Self::poll_accept).
-    pub async fn accept(self: Pin<&mut Self>) -> Result<(), ssl::Error> {
+    pub async fn accept(self: Pin<&mut Self>) -> Result<(), HandshakeError> {
         self.drive_handshake(|s| s.accept()).await
     }
 
@@ -72,17 +77,18 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     pub fn poll_do_handshake(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), ssl::Error>> {
+    ) -> Poll<Result<(), HandshakeError>> {
         self.with_context(cx, |s| cvt_ossl(s.do_handshake()))
+            .map_err(HandshakeError::Ssl)
     }
 
     #[inline]
     /// A convenience method wrapping [`poll_do_handshake`](Self::poll_do_handshake).
-    pub async fn do_handshake(self: Pin<&mut Self>) -> Result<(), ssl::Error> {
+    pub async fn do_handshake(self: Pin<&mut Self>) -> Result<(), HandshakeError> {
         self.drive_handshake(|s| s.do_handshake()).await
     }
 
-    async fn drive_handshake<F>(mut self: Pin<&mut Self>, mut f: F) -> Result<(), ssl::Error>
+    async fn drive_handshake<F>(mut self: Pin<&mut Self>, mut f: F) -> Result<(), HandshakeError>
     where
         F: FnMut(&mut SslStreamCore<SyncStream<S>>) -> Result<(), ssl::Error>,
     {
@@ -95,26 +101,32 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
             match res {
                 Ok(()) => {
                     // Ensure handshake records are pushed out before returning.
-                    if self.as_mut().flush_write_buf().await.is_err() {
-                        // Keep API compatibility: this method reports ssl::Error.
-                    }
+                    self.as_mut()
+                        .flush_write_buf()
+                        .await
+                        .map_err(HandshakeError::Io)?;
+
                     return Ok(());
                 }
                 Err(e) => match e.code() {
                     ErrorCode::WANT_WRITE => {
-                        if self.as_mut().flush_write_buf().await.is_err() {
-                            return Err(e);
-                        }
+                        self.as_mut()
+                            .flush_write_buf()
+                            .await
+                            .map_err(HandshakeError::Io)?;
                     }
                     ErrorCode::WANT_READ => {
-                        if self.as_mut().flush_write_buf().await.is_err() {
-                            return Err(e);
-                        }
-                        if self.as_mut().fill_read_buf().await.is_err() {
-                            return Err(e);
-                        }
+                        self.as_mut()
+                            .flush_write_buf()
+                            .await
+                            .map_err(HandshakeError::Io)?;
+
+                        self.as_mut()
+                            .fill_read_buf()
+                            .await
+                            .map_err(HandshakeError::Io)?;
                     }
-                    _ => return Err(e),
+                    _ => return Err(HandshakeError::Ssl(e)),
                 },
             }
         }
@@ -179,19 +191,12 @@ where
 {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         let slice = buf.as_uninit();
-
-        let mut f = {
-            slice.fill(MaybeUninit::new(0));
-            // SAFETY: The memory has been initialized.
-            let slice =
-                unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr().cast(), slice.len()) };
-            |s: &mut _| std::io::Read::read(s, slice)
-        };
-
         loop {
-            match f(&mut self.0) {
+            // SAFETY: read_uninit does not de-initialize the buffer.
+            match self.0.read_uninit(slice) {
                 Ok(res) => {
-                    unsafe { buf.set_len(res) };
+                    // SAFETY: read_uninit guarantees that nread bytes have been initialized.
+                    unsafe { buf.advance_to(res) };
                     return BufResult(Ok(res), buf);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -241,5 +246,60 @@ where
     async fn shutdown(&mut self) -> io::Result<()> {
         self.flush().await?;
         self.0.get_mut().get_mut().shutdown().await
+    }
+}
+
+/// The error type returned after a failed handshake.
+pub enum HandshakeError {
+    /// An error that occurred during the SSL handshake.
+    Ssl(ssl::Error),
+    /// An I/O error that occurred during the handshake.
+    Io(io::Error),
+}
+
+impl HandshakeError {
+    /// Returns the error code, if any.
+    #[must_use]
+    pub fn code(&self) -> Option<ErrorCode> {
+        match self {
+            HandshakeError::Ssl(e) => Some(e.code()),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner I/O error, if any.
+    #[must_use]
+    pub fn as_io_error(&self) -> Option<&io::Error> {
+        match self {
+            HandshakeError::Ssl(e) => e.io_error(),
+            HandshakeError::Io(e) => Some(e),
+        }
+    }
+}
+
+impl fmt::Debug for HandshakeError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HandshakeError::Ssl(e) => fmt::Debug::fmt(e, fmt),
+            HandshakeError::Io(e) => fmt::Debug::fmt(e, fmt),
+        }
+    }
+}
+
+impl fmt::Display for HandshakeError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HandshakeError::Ssl(e) => fmt::Display::fmt(e, fmt),
+            HandshakeError::Io(e) => fmt::Display::fmt(e, fmt),
+        }
+    }
+}
+
+impl Error for HandshakeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            HandshakeError::Ssl(e) => e.source(),
+            HandshakeError::Io(e) => Some(e),
+        }
     }
 }
