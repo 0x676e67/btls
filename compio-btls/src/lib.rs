@@ -1,8 +1,8 @@
 //! Async TLS streams backed by BoringSSL.
 //!
 //! This crate provides a wrapper around the [`btls`] crate's [`SslStream`](ssl::SslStream) type
-//! that works with [`compio-io`]'s [`AsyncRead`] and [`AsyncWrite`] traits rather than std's
-//! blocking [`Read`] and [`Write`] traits.
+//! that works with [`compio_io`]'s [`AsyncRead`] and [`AsyncWrite`] traits rather than std's
+//! blocking [`std::io::Read`] and [`std::io::Write`] traits.
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
