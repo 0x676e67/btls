@@ -1,0 +1,38 @@
+[package]
+name = "compio-btls"
+version = { workspace = true }
+authors = ["0x676e67 <gngppz@gmail.com>"]
+license = "MIT OR Apache-2.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+homepage = "https://github.com/0x676e67/btls"
+documentation = "https://docs.rs/compio-btls"
+description = """
+An implementation of SSL streams for Compio backed by BoringSSL
+"""
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["btls/default"]
+
+# Use a FIPS-validated version of boringssl.
+fips = ["btls/fips"]
+
+# Add a prefix to all symbols in libcrypto and libssl to prevent conflicts
+# with OpenSSL versions that might be linked in the same process.
+prefix-symbols = ["btls/prefix-symbols"]
+
+[dependencies]
+btls = { workspace = true }
+btls-sys = { workspace = true }
+compio = "0.18.0"
+compio-io = { version = "0.9.1", features = ["compat"] }
+
+[dev-dependencies]
+futures = { workspace = true }
+compio = { version = "0.18.0", features = [ "macros"] }
+compio-net = "0.11.1"
+anyhow = { workspace = true }

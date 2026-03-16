@@ -203,7 +203,7 @@ jobs:
               LIBRARY_PATH: "C:\\msys64\\usr\\lib"
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls --exclude compio-btls -Z checksum-freshness
           - thing: i686-mingw
             target: i686-pc-windows-gnu
             rust: stable
@@ -214,7 +214,7 @@ jobs:
               CMAKE_GENERATOR: "MinGW Makefiles"
               COLLECT_GCC: null
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls --exclude compio-btls -Z checksum-freshness
           - thing: i686-msvc
             target: i686-pc-windows-msvc
             rust: stable-x86_64-msvc
@@ -223,7 +223,7 @@ jobs:
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
               CXXFLAGS: -msse2
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls --exclude compio-btls -Z checksum-freshness
           - thing: x86_64-msvc
             target: x86_64-pc-windows-msvc
             rust: stable-x86_64-msvc
@@ -231,7 +231,7 @@ jobs:
             custom_env:
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls --exclude compio-btls -Z checksum-freshness
           - thing: x86_64-msvc-static
             target: x86_64-pc-windows-msvc
             rust: stable-x86_64-msvc
@@ -240,7 +240,7 @@ jobs:
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
               RUSTFLAGS: -Dwarnings -C target-feature=+crt-static
             # CI's Windows doesn't have required root certs
-            extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
+            extra_test_args: --workspace --exclude tokio-btls --exclude compio-btls -Z checksum-freshness
     env:
       CARGO_HOME: ${{ github.workspace }}/.cache/cargo
       CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/.cache/build-dir
