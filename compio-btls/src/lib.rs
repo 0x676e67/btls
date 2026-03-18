@@ -9,8 +9,8 @@ use btls::{
     ssl::{self, ErrorCode, Ssl, SslRef, SslStream as SslStreamCore},
 };
 use compio::buf::{IoBuf, IoBufMut};
+use compio::io::{compat::SyncStream, AsyncRead, AsyncWrite};
 use compio::BufResult;
-use compio_io::{compat::SyncStream, AsyncRead, AsyncWrite};
 use std::error::Error;
 use std::pin::Pin;
 use std::task::Context;

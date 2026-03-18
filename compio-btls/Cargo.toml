@@ -28,11 +28,9 @@ prefix-symbols = ["btls/prefix-symbols"]
 [dependencies]
 btls = { workspace = true }
 btls-sys = { workspace = true }
-compio = "0.18.0"
-compio-io = { version = "0.9.1", features = ["compat"] }
+compio = { workspace = true, features = ["io", "io-compat"]}
 
 [dev-dependencies]
 futures = { workspace = true }
-compio = { version = "0.18.0", features = [ "macros"] }
-compio-net = "0.11.1"
+compio = { workspace = true, features = [ "macros", "io", "net"] }
 anyhow = { workspace = true }

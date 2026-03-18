@@ -1,10 +1,8 @@
 use btls::ssl::{Ssl, SslAcceptor, SslFiletype};
 use btls::ssl::{SslConnector, SslMethod};
+use compio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use compio::net::{TcpListener, TcpStream};
 use compio_btls::SslStream;
-use compio_io::AsyncWrite;
-use compio_io::{AsyncReadExt, AsyncWriteExt};
-use compio_net::TcpListener;
-use compio_net::TcpStream;
 use futures::future;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
