@@ -336,6 +336,8 @@ impl crypto::Session for Session {
             self.on_zero_rtt_rejected();
         }
 
+        let mut keys_updated = self.state.keys_updated;
+
         // Only indicate that handshake data is available once.
         // On the client side there is no ALPN callback, so we need to manually check
         // if the ALPN protocol has been selected.
@@ -346,11 +348,11 @@ impl crypto::Session for Session {
 
             if self.handshake_data_available {
                 self.handshake_data_sent = true;
-                return Ok(true);
+                keys_updated = true;
             }
         }
 
-        Ok(false)
+        Ok(keys_updated)
     }
 
     fn transport_parameters(&self) -> StdResult<Option<TransportParameters>, TransportError> {

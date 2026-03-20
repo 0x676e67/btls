@@ -271,13 +271,15 @@ impl crypto::Session for Session {
     fn read_handshake(&mut self, plaintext: &[u8]) -> StdResult<bool, TransportError> {
         self.state.read_handshake(plaintext)?;
 
+        let mut keys_updated = self.state.keys_updated;
+
         // Only indicate that handshake data is available once.
         if !self.handshake_data_sent && self.handshake_data_available {
             self.handshake_data_sent = true;
-            return Ok(true);
+            keys_updated = true;
         }
 
-        Ok(false)
+        Ok(keys_updated)
     }
 
     fn transport_parameters(&self) -> StdResult<Option<TransportParameters>, TransportError> {

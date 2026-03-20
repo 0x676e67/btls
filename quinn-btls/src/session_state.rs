@@ -41,7 +41,7 @@ pub(crate) struct SessionState {
     side: Side,
     alert: Option<TransportError>,
     next_secrets: Option<Secrets>,
-    keys_updated: bool,
+    pub(crate) keys_updated: bool,
     read_level: Level,
     write_level: Level,
     levels: [LevelState; Level::NUM_LEVELS],
@@ -186,13 +186,15 @@ impl SessionState {
                 let is_app = self.write_level == Level::Application;
 
                 // Build the secrets.
-                let secrets = self
-                    .level_state(self.write_level)
-                    .builder
-                    .build()
-                    .unwrap_or_else(|| {
-                        panic!("failed building secrets for level {:?}", self.write_level)
-                    });
+                let secrets = match self.level_state(self.write_level).builder.build() {
+                    Some(s) => s,
+                    None => {
+                        // Secrets are not buildable yet (likely one side of the secret is missing).
+                        // Keep keys_updated as true so that the next call to write_handshake will try again.
+                        self.keys_updated = true;
+                        return None;
+                    }
+                };
 
                 if is_app {
                     // We've transitioned to the application level, we need to set the
