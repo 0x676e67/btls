@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write as _};
+use std::io::{self, Write as _};
 
 use super::server::Server;
 use crate::ssl::CertificateCompressor;
@@ -26,23 +26,7 @@ impl CertificateCompressor for BrotliCompressor {
 
     fn decompress(&self, input: &[u8], output: &mut dyn std::io::Write) -> std::io::Result<()> {
         let mut reader = brotli::Decompressor::new(input, 4096);
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf[..]) {
-                Err(e) => {
-                    if let io::ErrorKind::Interrupted = e.kind() {
-                        continue;
-                    }
-                    return Err(e);
-                }
-                Ok(size) => {
-                    if size == 0 {
-                        break;
-                    }
-                    output.write_all(&buf[..size])?;
-                }
-            }
-        }
+        io::copy(&mut reader, output)?;
         Ok(())
     }
 
