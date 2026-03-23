@@ -1694,27 +1694,12 @@ impl SslContextBuilder {
     where
         C: CertificateCompressor,
     {
-        const {
-            assert!(C::CAN_COMPRESS || C::CAN_DECOMPRESS, "Either compression or decompression must be supported for algorithm to be registered");
-        };
         let success = unsafe {
             ffi::SSL_CTX_add_cert_compression_alg(
                 self.as_ptr(),
-                C::ALGORITHM.0,
-                const {
-                    if C::CAN_COMPRESS {
-                        Some(callbacks::raw_ssl_cert_compress::<C>)
-                    } else {
-                        None
-                    }
-                },
-                const {
-                    if C::CAN_DECOMPRESS {
-                        Some(callbacks::raw_ssl_cert_decompress::<C>)
-                    } else {
-                        None
-                    }
-                },
+                compressor.algorithm().0,
+                Some(callbacks::raw_ssl_cert_compress::<C>),
+                Some(callbacks::raw_ssl_cert_decompress::<C>),
             ) == 1
         };
         if !success {
@@ -4556,33 +4541,15 @@ impl PrivateKeyMethodError {
 }
 
 /// Describes certificate compression algorithm. Implementation MUST implement transformation at least in one direction.
-pub trait CertificateCompressor: Send + Sync + 'static {
-    /// An IANA assigned identifier of compression algorithm
-    const ALGORITHM: CertificateCompressionAlgorithm;
-
-    /// Indicates if compressor support compression
-    const CAN_COMPRESS: bool;
-
-    /// Indicates if compressor support decompression
-    const CAN_DECOMPRESS: bool;
-
+pub trait CertificateCompressor: fmt::Debug + Send + Sync + 'static {
     /// Perform compression of `input` buffer and write compressed data to `output`.
-    #[allow(unused_variables)]
-    fn compress<W>(&self, input: &[u8], output: &mut W) -> std::io::Result<()>
-    where
-        W: std::io::Write,
-    {
-        Err(std::io::Error::other("not implemented"))
-    }
+    fn compress(&self, input: &[u8], output: &mut dyn std::io::Write) -> std::io::Result<()>;
 
     /// Perform decompression of `input` buffer and write compressed data to `output`.
-    #[allow(unused_variables)]
-    fn decompress<W>(&self, input: &[u8], output: &mut W) -> std::io::Result<()>
-    where
-        W: std::io::Write,
-    {
-        Err(std::io::Error::other("not implemented"))
-    }
+    fn decompress(&self, input: &[u8], output: &mut dyn std::io::Write) -> std::io::Result<()>;
+
+    /// An IANA assigned identifier of compression algorithm
+    fn algorithm(&self) -> CertificateCompressionAlgorithm;
 }
 
 use crate::ffi::{SSL_CTX_up_ref, SSL_SESSION_get_master_key, SSL_SESSION_up_ref, SSL_is_server};
