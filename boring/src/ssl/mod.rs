@@ -2969,6 +2969,11 @@ impl SslRef {
         }
     }
 
+    /// Returns whether the TLS 1.3 HelloRetryRequest was used
+    pub fn used_hello_retry_request(&self) -> bool {
+        unsafe { ffi::SSL_used_hello_retry_request(self.as_ptr()) == 1 }
+    }
+
     /// Returns an `ErrorCode` value for the most recent operation on this `SslRef`.
     #[corresponds(SSL_get_error)]
     #[must_use]
