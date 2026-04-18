@@ -424,7 +424,7 @@ jobs:
           bash +x scripts/publish.sh
 
       - name: Upload binaries to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           prerelease: ${{  contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
