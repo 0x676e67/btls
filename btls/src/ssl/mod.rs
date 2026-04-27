@@ -621,8 +621,8 @@ impl From<u16> for ExtensionType {
     }
 }
 
-/// An SSL/TLS protocol version.
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+/// An SSL/TLS/DTLS protocol version.
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct SslVersion(u16);
 
 impl SslVersion {
@@ -640,6 +640,15 @@ impl SslVersion {
 
     /// TLSv1.3
     pub const TLS1_3: SslVersion = SslVersion(ffi::TLS1_3_VERSION as _);
+
+    /// DTLSv1.0
+    pub const DTLS1: SslVersion = SslVersion(ffi::DTLS1_VERSION as _);
+
+    /// DTLSv1.2
+    pub const DTLS1_2: SslVersion = SslVersion(ffi::DTLS1_2_VERSION as _);
+
+    /// DTLSv1.3
+    pub const DTLS1_3: SslVersion = SslVersion(ffi::DTLS1_3_VERSION as _);
 }
 
 impl TryFrom<u16> for SslVersion {
@@ -651,7 +660,10 @@ impl TryFrom<u16> for SslVersion {
             | ffi::TLS1_VERSION
             | ffi::TLS1_1_VERSION
             | ffi::TLS1_2_VERSION
-            | ffi::TLS1_3_VERSION => Ok(Self(value)),
+            | ffi::TLS1_3_VERSION
+            | ffi::DTLS1_VERSION
+            | ffi::DTLS1_2_VERSION
+            | ffi::DTLS1_3_VERSION => Ok(Self(value)),
             _ => Err("Unknown SslVersion"),
         }
     }
@@ -665,6 +677,9 @@ impl fmt::Debug for SslVersion {
             Self::TLS1_1 => "TLS1_1",
             Self::TLS1_2 => "TLS1_2",
             Self::TLS1_3 => "TLS1_3",
+            Self::DTLS1 => "DTLS1",
+            Self::DTLS1_2 => "DTLS1_2",
+            Self::DTLS1_3 => "DTLS1_3",
             _ => return write!(f, "{:#06x}", self.0),
         })
     }
@@ -678,6 +693,9 @@ impl fmt::Display for SslVersion {
             Self::TLS1_1 => "TLSv1.1",
             Self::TLS1_2 => "TLSv1.2",
             Self::TLS1_3 => "TLSv1.3",
+            Self::DTLS1 => "DTLSv1.0",
+            Self::DTLS1_2 => "DTLSv1.2",
+            Self::DTLS1_3 => "DTLSv1.3",
             _ => return write!(f, "unknown ({:#06x})", self.0),
         })
     }
