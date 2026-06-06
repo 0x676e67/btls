@@ -14,7 +14,7 @@ To use BoringSSL from Rust, prefer the [higher-level safe API](https://docs.rs/b
 Compiling BoringSSL from source is by far the most expensive part of building
 this crate. The build script applies two accelerations automatically:
        
-- **Ninja generator.** When [`ninja`](https://ninja-build.org/) is found on 
+- **Ninja generator.** When [`ninja`](https://ninja-build.org/) is found on the PATH, 
   it is used instead of the default `make` generator. Ninja has lower
   configure overhead and schedules the compile better. An explicit
   `CMAKE_GENERATOR` is always respected, and Windows generator selection is left

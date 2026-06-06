@@ -555,6 +555,7 @@ fn configure_build_acceleration(config: &Config, cfg: &mut cmake::Config) {
         );
         cfg.define("CMAKE_C_COMPILER_LAUNCHER", &launcher);
         cfg.define("CMAKE_CXX_COMPILER_LAUNCHER", &launcher);
+        cfg.define("CMAKE_ASM_COMPILER_LAUNCHER", &launcher);
     }
 }
 
