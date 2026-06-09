@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use crate::config::Config;
 use crate::prefix::{prefix_symbols, PrefixCallback};
 
+mod cache;
 mod config;
 mod prefix;
 
@@ -542,73 +543,6 @@ fn run_command(command: &mut Command) -> io::Result<Output> {
     Ok(out)
 }
 
-fn configure_build_acceleration(config: &Config, cfg: &mut cmake::Config) {
-    if let Some(generator) = preferred_cmake_generator(config) {
-        println!("cargo:warning=building BoringSSL with the {generator} generator");
-        cfg.generator(generator);
-    }
-
-    if let Some(launcher) = compiler_launcher() {
-        println!(
-            "cargo:warning=caching the BoringSSL C/C++ build with compiler launcher `{}`",
-            launcher.to_string_lossy()
-        );
-        cfg.define("CMAKE_C_COMPILER_LAUNCHER", &launcher);
-        cfg.define("CMAKE_CXX_COMPILER_LAUNCHER", &launcher);
-        cfg.define("CMAKE_ASM_COMPILER_LAUNCHER", &launcher);
-    }
-}
-
-fn compiler_launcher() -> Option<OsString> {
-    println!("cargo:rerun-if-env-changed=BORING_BSSL_COMPILER_LAUNCHER");
-    if let Some(launcher) =
-        std::env::var_os("BORING_BSSL_COMPILER_LAUNCHER").filter(|v| !v.is_empty())
-    {
-        return Some(launcher);
-    }
-
-    for var in ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"] {
-        println!("cargo:rerun-if-env-changed={var}");
-        let Some(wrapper) = std::env::var_os(var).filter(|v| !v.is_empty()) else {
-            continue;
-        };
-        let is_compiler_cache = Path::new(&wrapper)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| {
-                stem.eq_ignore_ascii_case("sccache") || stem.eq_ignore_ascii_case("ccache")
-            });
-        if is_compiler_cache {
-            return Some(wrapper);
-        }
-    }
-    None
-}
-
-fn preferred_cmake_generator(config: &Config) -> Option<&'static str> {
-    println!("cargo:rerun-if-env-changed=CMAKE_GENERATOR");
-
-    if std::env::var_os("CMAKE_GENERATOR").is_some() {
-        return None;
-    }
-
-    if config.target_os == "windows" {
-        return None;
-    }
-
-    is_program_available("ninja").then_some("Ninja")
-}
-
-fn is_program_available(program: &str) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
 fn build_boringssl_or_get_prebuilt(config: &Config) -> &Path {
     static BUILD_SOURCE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
@@ -642,9 +576,10 @@ fn build_boringssl_or_get_prebuilt(config: &Config) -> &Path {
             cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
         }
 
-        configure_build_acceleration(config, &mut cfg);
+        cache::apply(config, &mut cfg);
 
         cfg.build_target("ssl").build();
+        // skip re-running cmake configure for the next target
         cfg.always_configure(false);
         let path = cfg.build_target("crypto").build();
         let build_dir = path.join("build");
