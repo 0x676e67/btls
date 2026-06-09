@@ -3,13 +3,13 @@ use std::{ffi::OsString, path::Path};
 use crate::config::Config;
 
 pub fn apply(_config: &Config, cfg: &mut cmake::Config) {
-    try_enable_ccache(cfg);
+    try_enable_compiler_launcher(cfg);
 }
 
-fn try_enable_ccache(cfg: &mut cmake::Config) {
+fn try_enable_compiler_launcher(cfg: &mut cmake::Config) {
     if let Some(launcher) = compiler_launcher() {
         println!(
-            "cargo:warning=caching the BoringSSL C/C++ build with compiler launcher `{}`",
+            "cargo:warning=using compiler launcher `{}` for the BoringSSL C/C++ build",
             launcher.to_string_lossy()
         );
         cfg.define("CMAKE_C_COMPILER_LAUNCHER", &launcher);
