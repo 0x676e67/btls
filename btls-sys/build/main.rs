@@ -579,8 +579,6 @@ fn build_boringssl_or_get_prebuilt(config: &Config) -> &Path {
         cache::apply(config, &mut cfg);
 
         cfg.build_target("ssl").build();
-        // skip re-running cmake configure for the next target
-        cfg.always_configure(false);
         let path = cfg.build_target("crypto").build();
         let build_dir = path.join("build");
         if build_dir.exists() {
