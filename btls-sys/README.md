@@ -9,6 +9,27 @@ and [Raw Public Key](https://docs.rs/btls/latest/btls/ssl/struct.SslRef.html#met
 
 To use BoringSSL from Rust, prefer the [higher-level safe API](https://docs.rs/btls).
 
+## Speeding up the build
+
+Compiling BoringSSL from source is by far the most expensive part of building
+this crate. The build script applies accelerations automatically:
+
+- **Compiler caching.** `RUSTC_WRAPPER` only caches `rustc`, so the ~370
+  BoringSSL translation units are recompiled on every clean build even when
+  [`sccache`](https://github.com/mozilla/sccache) or
+  [`ccache`](https://ccache.dev/) is configured.  
+  If `RUSTC_WRAPPER`/`RUSTC_WORKSPACE_WRAPPER` points at `sccache` or
+  `ccache` it is reused as-is; otherwise set `BORING_BSSL_COMPILER_LAUNCHER`
+  explicitly:
+
+  ```sh
+  # Reuse an existing sccache automatically:
+  export RUSTC_WRAPPER=sccache
+
+  # ...or point the BoringSSL build at a cache explicitly:
+  export BORING_BSSL_COMPILER_LAUNCHER=sccache
+  ```
+
 ## Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally

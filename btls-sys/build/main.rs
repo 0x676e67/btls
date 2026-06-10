@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use crate::config::Config;
 use crate::prefix::{prefix_symbols, PrefixCallback};
 
+mod cache;
 mod config;
 mod prefix;
 
@@ -574,6 +575,8 @@ fn build_boringssl_or_get_prebuilt(config: &Config) -> &Path {
         if config.features.prefix_symbols {
             cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
         }
+
+        cache::apply(config, &mut cfg);
 
         cfg.build_target("ssl").build();
         let path = cfg.build_target("crypto").build();
