@@ -83,6 +83,8 @@ use crate::error::ErrorStack;
 use crate::ex_data::Index;
 use crate::hmac::HmacCtxRef;
 use crate::nid::Nid;
+#[cfg(feature = "rpk")]
+use crate::pkey::Public;
 use crate::pkey::{HasPrivate, PKeyRef, Params, Private};
 use crate::srtp::{SrtpProtectionProfile, SrtpProtectionProfileRef};
 use crate::ssl::bio::BioMethod;
@@ -748,6 +750,43 @@ impl SslSignatureAlgorithm {
         SslSignatureAlgorithm(ffi::SSL_SIGN_RSA_PSS_RSAE_SHA512 as _);
 
     pub const ED25519: SslSignatureAlgorithm = SslSignatureAlgorithm(ffi::SSL_SIGN_ED25519 as _);
+
+    // ML-DSA codepoints are hardcoded from the IANA TLS Signature Scheme
+    // registry so that this crate continues to compile against older
+    // BoringSSL versions that predate the SSL_SIGN_ML_DSA_* defines.
+    pub const ML_DSA_44: SslSignatureAlgorithm = SslSignatureAlgorithm(0x0904);
+
+    pub const ML_DSA_65: SslSignatureAlgorithm = SslSignatureAlgorithm(0x0905);
+
+    pub const ML_DSA_87: SslSignatureAlgorithm = SslSignatureAlgorithm(0x0906);
+
+    /// Returns the name of this signature algorithm, or `None` if unknown.
+    ///
+    /// For ECDSA algorithms the TLS 1.3 form is returned
+    /// (e.g. `ecdsa_secp256r1_sha256`), not the TLS 1.2 form (`ecdsa_sha256`).
+    #[corresponds(SSL_get_signature_algorithm_name)]
+    #[must_use]
+    pub fn name(&self) -> Option<&'static str> {
+        unsafe {
+            // Pass `include_curve = 1` to get the TLS 1.3 form for ECDSA algorithms
+            // (e.g. `ecdsa_secp256r1_sha256` rather than the TLS 1.2 `ecdsa_sha256`).
+            let ptr = ffi::SSL_get_signature_algorithm_name(self.0, 1);
+            if ptr.is_null() {
+                None
+            } else {
+                CStr::from_ptr(ptr).to_str().ok()
+            }
+        }
+    }
+}
+
+impl fmt::Display for SslSignatureAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => f.write_str(name),
+            None => write!(f, "unknown ({:#06x})", self.0),
+        }
+    }
 }
 
 impl From<u16> for SslSignatureAlgorithm {
@@ -2003,6 +2042,12 @@ impl SslContextBuilder {
     }
 
     /// Sets the context's supported signature algorithms.
+    ///
+    /// Prefer [`set_verify_algorithm_prefs`](Self::set_verify_algorithm_prefs),
+    /// which takes raw IANA codepoints rather than an OpenSSL-style colon-separated
+    /// string. Note that unlike `set_sigalgs_list`, `set_verify_algorithm_prefs`
+    /// only configures the verify preference list and does not also set the
+    /// signing algorithm prefs.
     #[corresponds(SSL_CTX_set1_sigalgs_list)]
     pub fn set_sigalgs_list(&mut self, sigalgs: &str) -> Result<(), ErrorStack> {
         let sigalgs = CString::new(sigalgs).map_err(ErrorStack::internal_error)?;
@@ -2169,6 +2214,24 @@ impl SslContextBuilder {
             cvt_0i(ffi::SSL_CTX_add1_credential(
                 self.as_ptr(),
                 credential.as_ptr(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Sets the list of server certificate types that clients attached to this context
+    /// can process.
+    #[corresponds(SSL_CTX_set1_accepted_peer_cert_types)]
+    #[cfg(feature = "rpk")]
+    pub fn set_server_certificate_types(
+        &mut self,
+        types: &[CertificateType],
+    ) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set1_accepted_peer_cert_types(
+                self.as_ptr(),
+                types.as_ptr() as *const u8,
+                types.len(),
             ))
             .map(|_| ())
         }
@@ -2458,6 +2521,27 @@ impl SslContextRef {
     #[corresponds(SSL_CTX_set1_ech_keys)]
     pub fn set_ech_keys(&self, keys: &SslEchKeys) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::SSL_CTX_set1_ech_keys(self.as_ptr(), keys.as_ptr())) }
+    }
+
+    /// Returns the list of server certificate types.
+    #[corresponds(SSL_CTX_get0_server_certificate_types)]
+    #[cfg(feature = "rpk")]
+    #[must_use]
+    pub fn server_certificate_types(&self) -> Option<&[CertificateType]> {
+        let mut types = ptr::null();
+        let mut types_len = 0;
+        unsafe {
+            ffi::SSL_CTX_get0_accepted_peer_cert_types(self.as_ptr(), &mut types, &mut types_len);
+
+            if types_len == 0 {
+                return None;
+            }
+
+            Some(slice::from_raw_parts(
+                types as *const CertificateType,
+                types_len,
+            ))
+        }
     }
 }
 
@@ -2985,6 +3069,21 @@ impl SslRef {
         unsafe { cvt_0i(ffi::SSL_set1_curves_list(self.as_ptr(), curves.as_ptr())).map(|_| ()) }
     }
 
+    #[corresponds(SSL_set_verify_algorithm_prefs)]
+    pub fn set_verify_algorithm_prefs(
+        &mut self,
+        prefs: &[SslSignatureAlgorithm],
+    ) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_set_verify_algorithm_prefs(
+                self.as_ptr(),
+                prefs.as_ptr().cast(),
+                prefs.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Returns the curve ID (aka group ID) used for this `SslRef`.
     #[corresponds(SSL_get_curve_id)]
     #[must_use]
@@ -3190,6 +3289,36 @@ impl SslRef {
             } else {
                 Some(SslCipherRef::from_ptr(ptr.cast_mut()))
             }
+        }
+    }
+
+    /// Returns the signature algorithm used by the peer in the most recent TLS handshake,
+    /// or `None` if no signature was produced (e.g. session resumption).
+    #[corresponds(SSL_get_peer_signature_algorithm)]
+    #[must_use]
+    pub fn peer_signature_algorithm(&self) -> Option<SslSignatureAlgorithm> {
+        let sigalg = unsafe { ffi::SSL_get_peer_signature_algorithm(self.as_ptr()) };
+        if sigalg == 0 {
+            None
+        } else {
+            Some(SslSignatureAlgorithm(sigalg))
+        }
+    }
+
+    /// Returns the signature algorithm this side used to sign the current TLS handshake,
+    /// or `None` if not applicable.
+    ///
+    /// BoringSSL only retains this value during the handshake; to observe it post-handshake,
+    /// capture it from an [`SslContextBuilder::set_info_callback`] handler at
+    /// [`SslInfoCallbackMode::HANDSHAKE_DONE`].
+    #[corresponds(SSL_get_signature_algorithm_used)]
+    #[must_use]
+    pub fn signature_algorithm_used(&self) -> Option<SslSignatureAlgorithm> {
+        let sigalg = unsafe { ffi::SSL_get_signature_algorithm_used(self.as_ptr()) };
+        if sigalg == 0 {
+            None
+        } else {
+            Some(SslSignatureAlgorithm(sigalg))
         }
     }
 
@@ -3912,6 +4041,95 @@ impl SslRef {
         unsafe { cvt_0i(ffi::SSL_add1_credential(self.as_ptr(), credential.as_ptr())).map(|_| ()) }
     }
 
+    /// Returns the public key sent by the other peer, `None` if there is no ongoing handshake.
+    #[corresponds(SSL_get0_peer_pubkey)]
+    #[cfg(feature = "rpk")]
+    pub fn peer_pubkey(&self) -> Option<&PKeyRef<Public>> {
+        unsafe {
+            let pubkey = ffi::SSL_get0_peer_pubkey(self.as_ptr());
+
+            if pubkey.is_null() {
+                return None;
+            }
+
+            Some(PKeyRef::from_ptr(pubkey as *mut _))
+        }
+    }
+
+    /// Sets the list of server certificate types that this client will accept
+    /// from the server.
+    ///
+    /// Only valid on a client-side `Ssl`; returns an error on server-side SSLs.
+    #[corresponds(SSL_set1_accepted_peer_cert_types)]
+    #[cfg(feature = "rpk")]
+    pub fn set_server_certificate_types(
+        &mut self,
+        types: &[CertificateType],
+    ) -> Result<(), ErrorStack> {
+        if self.is_server() {
+            return Err(ErrorStack::internal_error_str(
+                "called set_server_certificate_types as server",
+            ));
+        }
+
+        unsafe {
+            cvt_0i(ffi::SSL_set1_accepted_peer_cert_types(
+                self.as_ptr(),
+                types.as_ptr() as *const u8,
+                types.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Returns the list of server certificate types that this client will
+    /// accept from the server, or `None` if none are configured.
+    ///
+    /// Only valid on a client-side `Ssl`; returns `None` on server-side SSLs.
+    #[corresponds(SSL_get0_accepted_peer_cert_types)]
+    #[must_use]
+    #[cfg(feature = "rpk")]
+    pub fn server_certificate_types(&self) -> Option<&[CertificateType]> {
+        if self.is_server() {
+            return None;
+        }
+
+        let mut types = ptr::null();
+        let mut types_len = 0;
+        unsafe {
+            ffi::SSL_get0_accepted_peer_cert_types(self.as_ptr(), &mut types, &mut types_len);
+
+            if types_len == 0 {
+                return None;
+            }
+
+            Some(slice::from_raw_parts(
+                types as *const CertificateType,
+                types_len,
+            ))
+        }
+    }
+
+    /// Returns the server certificate type selected by the server during the
+    /// handshake.
+    ///
+    /// Only valid on a client-side `Ssl`; returns `None` on server-side SSLs
+    /// (a server knows its own selected credential type by other means).
+    #[corresponds(SSL_get_peer_cert_type)]
+    #[must_use]
+    #[cfg(feature = "rpk")]
+    pub fn selected_server_certificate_type(&self) -> Option<CertificateType> {
+        if self.is_server() {
+            return None;
+        }
+
+        unsafe {
+            Some(CertificateType(
+                ffi::SSL_get_peer_cert_type(self.as_ptr()) as u8
+            ))
+        }
+    }
+
     /// Sets the client key shares to be used in the TLS 1.3 handshake.
     #[corresponds(SSL_set1_client_key_shares)]
     pub fn set_client_key_shares(&mut self, key_shares: &[KeyShare]) -> Result<(), ErrorStack> {
@@ -4494,6 +4712,21 @@ impl<S> SslStreamBuilder<S> {
             bio::set_dtls_mtu_size::<S>(bio, mtu_size);
         }
     }
+}
+
+/// A certificate type.
+#[cfg(feature = "rpk")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct CertificateType(u8);
+
+#[cfg(feature = "rpk")]
+impl CertificateType {
+    /// A X.509 certificate.
+    pub const X509: Self = Self(ffi::TLSEXT_cert_type_x509 as u8);
+
+    /// A raw public key.
+    pub const RAW_PUBLIC_KEY: Self = Self(ffi::TLSEXT_cert_type_rpk as u8);
 }
 
 /// The result of a shutdown request.
