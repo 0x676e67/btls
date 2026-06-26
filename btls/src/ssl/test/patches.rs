@@ -1,3 +1,5 @@
+#![cfg(not(feature = "fips"))]
+
 use std::ffi::CStr;
 use std::sync::{Arc, Mutex};
 
@@ -159,7 +161,6 @@ fn boring_pq_p256_kyber_group_can_negotiate() {
 }
 
 #[test]
-#[cfg(not(feature = "fips"))]
 fn boringssl_patch_ffdhe_named_groups_are_advertised() {
     let supported_groups = Arc::new(Mutex::new(None));
 
@@ -224,7 +225,6 @@ fn boringssl_patch_ffdhe_named_groups_are_advertised() {
 }
 
 #[test]
-#[cfg(not(feature = "fips"))]
 fn boringssl_patch_added_cipher_rules_are_advertised_individually() {
     // Each entry here is a cipher-suite compatibility name restored by
     // boringssl.patch, not an assertion that upstream BoringSSL natively
@@ -281,7 +281,6 @@ fn boringssl_patch_added_cipher_rules_are_advertised_individually() {
 }
 
 #[test]
-#[cfg(not(feature = "fips"))]
 fn boringssl_patch_added_cipher_list_is_complete_and_advertised() {
     let client_ciphers = Arc::new(Mutex::new(None));
     let mut advertised_cipher_list = BORINGSSL_PATCH_ADDED_CIPHERS
@@ -366,7 +365,6 @@ fn boringssl_patch_added_cipher_list_is_complete_and_advertised() {
 }
 
 #[test]
-#[cfg(not(feature = "fips"))]
 fn boringssl_patch_clienthello_extensions_are_sent() {
     let record_size_limit = Arc::new(Mutex::new(None));
     let delegated_credential = Arc::new(Mutex::new(None));
@@ -418,7 +416,6 @@ fn boringssl_patch_clienthello_extensions_are_sent() {
 }
 
 #[test]
-#[cfg(not(feature = "fips"))]
 fn boringssl_patch_allows_duplicate_signature_algorithms() {
     let signature_algorithms = Arc::new(Mutex::new(None));
 
@@ -468,7 +465,6 @@ fn boringssl_patch_allows_duplicate_signature_algorithms() {
 }
 
 #[test]
-#[cfg(not(feature = "fips"))]
 fn boringssl_patch_preserves_tls13_cipher_order_in_clienthello() {
     let client_ciphers = Arc::new(Mutex::new(None));
 
