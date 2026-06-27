@@ -752,14 +752,14 @@ impl SslSignatureAlgorithm {
 
     pub const ED25519: SslSignatureAlgorithm = SslSignatureAlgorithm(ffi::SSL_SIGN_ED25519 as _);
 
-    // ML-DSA codepoints are hardcoded from the IANA TLS Signature Scheme
-    // registry so that this crate continues to compile against older
-    // BoringSSL versions that predate the SSL_SIGN_ML_DSA_* defines.
-    pub const ML_DSA_44: SslSignatureAlgorithm = SslSignatureAlgorithm(0x0904);
+    pub const ML_DSA_44: SslSignatureAlgorithm =
+        SslSignatureAlgorithm(ffi::SSL_SIGN_ML_DSA_44 as _);
 
-    pub const ML_DSA_65: SslSignatureAlgorithm = SslSignatureAlgorithm(0x0905);
+    pub const ML_DSA_65: SslSignatureAlgorithm =
+        SslSignatureAlgorithm(ffi::SSL_SIGN_ML_DSA_65 as _);
 
-    pub const ML_DSA_87: SslSignatureAlgorithm = SslSignatureAlgorithm(0x0906);
+    pub const ML_DSA_87: SslSignatureAlgorithm =
+        SslSignatureAlgorithm(ffi::SSL_SIGN_ML_DSA_87 as _);
 
     /// Returns the name of this signature algorithm, or `None` if unknown.
     ///
