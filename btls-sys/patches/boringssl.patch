@@ -162,18 +162,9 @@ index 384b25753..4df384560 100644
  # See draft-irtf-cfrg-concrete-hybrid-kems.
   : X-Wing
 diff --git a/include/openssl/aead.h b/include/openssl/aead.h
-index 82523f135..8a293feaa 100644
+index 6b8ad575a..3ff2a5328 100644
 --- a/include/openssl/aead.h
 +++ b/include/openssl/aead.h
-@@ -15,7 +15,7 @@
- #ifndef OPENSSL_HEADER_AEAD_H
- #define OPENSSL_HEADER_AEAD_H
- 
--#include <openssl/base.h>   // IWYU pragma: export
-+#include <openssl/base.h>  // IWYU pragma: export
- 
- #if defined(__cplusplus)
- extern "C" {
 @@ -579,6 +579,8 @@ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_128_cbc_sha1_tls_implicit_iv(void);
  OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_128_cbc_sha256_tls(void);
  OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_256_cbc_sha1_tls(void);
@@ -201,7 +192,7 @@ index 09af03d11..d68290da3 100644
  #if defined(__cplusplus)
  } /* extern C */
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 0385fabfb..e4741622c 100644
+index 7a527396d..9b5749c80 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -631,6 +631,12 @@ OPENSSL_EXPORT int SSL_version(const SSL *ssl);
@@ -280,7 +271,7 @@ index 0385fabfb..e4741622c 100644
  // SSL_get_cipher_by_value returns the structure representing a TLS cipher
  // suite based on its assigned number, or NULL if unknown. See
  // https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml#tls-parameters-4.
-@@ -2598,6 +2634,9 @@ OPENSSL_EXPORT size_t SSL_CTX_get_num_tickets(const SSL_CTX *ctx);
+@@ -2617,6 +2653,9 @@ OPENSSL_EXPORT size_t SSL_CTX_get_num_tickets(const SSL_CTX *ctx);
  #define SSL_GROUP_MLKEM1024 0x0202
  #define SSL_GROUP_P256_KYBER768_DRAFT00 0xfe32
  
@@ -290,7 +281,7 @@ index 0385fabfb..e4741622c 100644
  // SSL_CTX_set1_group_ids sets the preferred groups for `ctx` to `group_ids`.
  // Each element of `group_ids` should be a unique one of the `SSL_GROUP_*`
  // constants. If `group_ids` is empty, a default list will be set instead. It
-@@ -5523,6 +5562,56 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
+@@ -5524,6 +5563,56 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  
@@ -347,7 +338,7 @@ index 0385fabfb..e4741622c 100644
  // SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
  // record with `ssl`.
  OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
-@@ -5900,7 +5989,7 @@ DEFINE_STACK_OF(SSL_COMP)
+@@ -5901,7 +5990,7 @@ DEFINE_STACK_OF(SSL_COMP)
  #define SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG 0
  #define SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG 0
  #define SSL_OP_NO_COMPRESSION 0
@@ -356,7 +347,7 @@ index 0385fabfb..e4741622c 100644
  #define SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION 0
  #define SSL_OP_NO_SSLv2 0
  #define SSL_OP_NO_SSLv3 0
-@@ -6835,7 +6924,6 @@ OPENSSL_EXPORT void SSL_CTX_set_aes_hw_override_for_testing(
+@@ -6836,7 +6925,6 @@ OPENSSL_EXPORT void SSL_CTX_set_aes_hw_override_for_testing(
  // `SSL_CTX_set_aes_override_for_testing` but only configures a single `SSL*`.
  OPENSSL_EXPORT void SSL_set_aes_hw_override_for_testing(SSL *ssl,
                                                          bool override_value);
@@ -454,7 +445,7 @@ index f4b348481..66484b786 100644
  }  // extern C
  #endif
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 8ea075644..177efd465 100644
+index be4bdfc30..8b986ee50 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -704,7 +704,8 @@ static bool ext_ri_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
@@ -640,7 +631,7 @@ index 8ea075644..177efd465 100644
    if (!hs->config->permute_extensions) {
      return true;
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index ff9ace810..cedb19fd2 100644
+index af70197d5..42ba2c380 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
 @@ -23,9 +23,11 @@
@@ -774,7 +765,7 @@ index ff9ace810..cedb19fd2 100644
      // Parse the server parameters.
      uint8_t group_type;
      uint16_t group_id;
-@@ -1484,6 +1522,62 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
+@@ -1474,6 +1512,62 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
          !CBB_flush(&body)) {
        return ssl_hs_error;
      }
@@ -838,7 +829,7 @@ index ff9ace810..cedb19fd2 100644
      CBB child;
      if (!CBB_add_u8_length_prefixed(&body, &child)) {
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 66ac3ef12..e3162ec24 100644
+index 4653cb4a9..75f7e60e2 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -216,10 +216,11 @@ BSSL_NAMESPACE_BEGIN
@@ -889,7 +880,7 @@ index 66ac3ef12..e3162ec24 100644
  
  // DefaultSupportedGroupIds returns the list of IDs for the default groups that
  // are supported when the caller hasn't explicitly configured supported groups.
-@@ -2134,6 +2142,12 @@ struct SSL_HANDSHAKE {
+@@ -2132,6 +2140,12 @@ struct SSL_HANDSHAKE {
    // pake_verifier is the PAKE context for a server.
    UniquePtr<spake2plus::Verifier> pake_verifier;
  
@@ -902,7 +893,7 @@ index 66ac3ef12..e3162ec24 100644
    // offered_client_cert_types, for a client, is a list of client certificate
    // types (`TLSEXT_cert_type_*` values) that were sent in the
    // client_certificate_type extension in the ClientHello.
-@@ -2217,6 +2231,10 @@ bool tls13_add_finished(SSL_HANDSHAKE *hs);
+@@ -2215,6 +2229,10 @@ bool tls13_add_finished(SSL_HANDSHAKE *hs);
  bool tls13_process_new_session_ticket(SSL *ssl, const SSLMessage &msg);
  UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSL *ssl, CBS *body);
  
@@ -913,7 +904,7 @@ index 66ac3ef12..e3162ec24 100644
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3372,6 +3390,10 @@ struct SSL_CONFIG {
+@@ -3365,6 +3383,10 @@ struct SSL_CONFIG {
    // crypto
    UniquePtr<SSLCipherPreferenceList> cipher_list;
  
@@ -924,7 +915,7 @@ index 66ac3ef12..e3162ec24 100644
    // This is used to hold the local certificate used (i.e. the server
    // certificate for a server or the client certificate for a client).
    UniquePtr<CERT> cert;
-@@ -3550,6 +3572,18 @@ struct SSL_CONFIG {
+@@ -3538,6 +3560,18 @@ struct SSL_CONFIG {
    // to negotiate and convey application settings.
    bool alps_use_new_codepoint : 1;
  
@@ -943,7 +934,7 @@ index 66ac3ef12..e3162ec24 100644
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
-@@ -4214,6 +4248,25 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4202,6 +4236,25 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // signal its sessions may be resumed across names in the server certificate.
    bool resumption_across_names_enabled : 1;
  
@@ -1355,7 +1346,7 @@ index a6fec6ae8..28ff51a36 100644
  
  static_assert(std::size(kNamedGroups) == kNumNamedGroups,
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index 9d70b99aa..e364c4061 100644
+index c2c426d66..05832ea5f 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -396,7 +396,8 @@ bssl::SSLContext::SSLContext(const SSL_METHOD *ssl_method)
@@ -1402,7 +1393,7 @@ index 9d70b99aa..e364c4061 100644
  
    if (!ssl->method->ssl_new(ssl.get()) ||
        !ssl->ctx->x509_method->ssl_new(ssl->s3->hs.get())) {
-@@ -592,6 +606,7 @@ SSL_CONFIG::SSL_CONFIG(SSL *ssl_arg)
+@@ -591,6 +605,7 @@ SSL_CONFIG::SSL_CONFIG(SSL *ssl_arg)
        permute_extensions(false),
        disable_second_keyshare(false),
        alps_use_new_codepoint(true),
@@ -1410,7 +1401,7 @@ index 9d70b99aa..e364c4061 100644
        server_padding_enabled(false) {
    assert(ssl);
  }
-@@ -2165,6 +2180,11 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
+@@ -2164,6 +2179,11 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
    const bool has_aes_hw = ctx_impl->aes_hw_override
                                ? ctx_impl->aes_hw_override_value
                                : EVP_has_aes_hardware();
@@ -1422,7 +1413,7 @@ index 9d70b99aa..e364c4061 100644
    return ssl_create_cipher_list(&ctx_impl->cipher_list, has_aes_hw, str,
                                  false /* not strict */);
  }
-@@ -2174,6 +2194,11 @@ int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
+@@ -2173,6 +2193,11 @@ int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
    const bool has_aes_hw = ctx_impl->aes_hw_override
                                ? ctx_impl->aes_hw_override_value
                                : EVP_has_aes_hardware();
@@ -1434,7 +1425,7 @@ index 9d70b99aa..e364c4061 100644
    return ssl_create_cipher_list(&ctx_impl->cipher_list, has_aes_hw, str,
                                  true /* strict */);
  }
-@@ -2185,6 +2210,11 @@ int SSL_set_cipher_list(SSL *ssl, const char *str) {
+@@ -2184,6 +2209,11 @@ int SSL_set_cipher_list(SSL *ssl, const char *str) {
    const bool has_aes_hw = ssl->config->aes_hw_override
                                ? ssl->config->aes_hw_override_value
                                : EVP_has_aes_hardware();
@@ -1446,7 +1437,7 @@ index 9d70b99aa..e364c4061 100644
    return ssl_create_cipher_list(&ssl->config->cipher_list, has_aes_hw, str,
                                  false /* not strict */);
  }
-@@ -2196,6 +2226,11 @@ int SSL_set_strict_cipher_list(SSL *ssl, const char *str) {
+@@ -2195,6 +2225,11 @@ int SSL_set_strict_cipher_list(SSL *ssl, const char *str) {
    const bool has_aes_hw = ssl->config->aes_hw_override
                                ? ssl->config->aes_hw_override_value
                                : EVP_has_aes_hardware();
@@ -1458,7 +1449,7 @@ index 9d70b99aa..e364c4061 100644
    return ssl_create_cipher_list(&ssl->config->cipher_list, has_aes_hw, str,
                                  true /* strict */);
  }
-@@ -2261,6 +2296,54 @@ void SSL_enable_ocsp_stapling(SSL *ssl) {
+@@ -2260,6 +2295,54 @@ void SSL_enable_ocsp_stapling(SSL *ssl) {
    ssl->config->ocsp_stapling_enabled = true;
  }
  
@@ -1513,7 +1504,7 @@ index 9d70b99aa..e364c4061 100644
  void SSL_get0_signed_cert_timestamp_list(const SSL *ssl, const uint8_t **out,
                                           size_t *out_len) {
    SSL_SESSION *session = SSL_get_session(ssl);
-@@ -3197,6 +3280,20 @@ void SSL_set_permute_extensions(SSL *ssl, int enabled) {
+@@ -3185,6 +3268,20 @@ void SSL_set_permute_extensions(SSL *ssl, int enabled) {
    ssl->config->permute_extensions = !!enabled;
  }
  
@@ -1534,7 +1525,7 @@ index 9d70b99aa..e364c4061 100644
  int32_t SSL_get_ticket_age_skew(const SSL *ssl) {
    return ssl->s3->ticket_age_skew;
  }
-@@ -3431,7 +3528,7 @@ void SSL_use_second_keyshare(SSL *ssl, int enabled) {
+@@ -3419,7 +3516,7 @@ void SSL_use_second_keyshare(SSL *ssl, int enabled) {
  }
  
  void SSL_CTX_use_second_keyshare(SSL_CTX *ctx, int enabled) {
@@ -1543,7 +1534,7 @@ index 9d70b99aa..e364c4061 100644
  }
  
  
-@@ -3446,9 +3543,8 @@ namespace fips202205 {
+@@ -3434,9 +3531,8 @@ namespace fips202205 {
  // Section 3.3.1
  // "The server shall be configured to only use cipher suites that are
  // composed entirely of NIST approved algorithms"
@@ -1556,10 +1547,10 @@ index 9d70b99aa..e364c4061 100644
  static const uint16_t kSigAlgs[] = {
      SSL_SIGN_RSA_PKCS1_SHA256,
 diff --git a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
-index 8c52d7ce9..1ca2c3a40 100644
+index 4e43717ee..1c24e00fb 100644
 --- a/ssl/ssl_privkey.cc
 +++ b/ssl/ssl_privkey.cc
-@@ -574,25 +574,10 @@ int SSL_is_signature_algorithm_rsa_pss(uint16_t sigalg) {
+@@ -571,24 +571,9 @@ int SSL_is_signature_algorithm_rsa_pss(uint16_t sigalg) {
    return alg != nullptr && alg->is_rsa_pss;
  }
  
@@ -1587,8 +1578,7 @@ index 8c52d7ce9..1ca2c3a40 100644
    return true;
  }
  
- static bool set_sigalg_prefs(Array<uint16_t> *out, Span<const uint16_t> prefs) {
-@@ -960,3 +960,18 @@ int SSL_set_verify_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
+@@ -960,3 +945,18 @@ int SSL_set_verify_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
  
    return set_sigalg_prefs(&ssl->config->verify_sigalgs, Span(prefs, num_prefs));
  }
@@ -1608,7 +1598,7 @@ index 8c52d7ce9..1ca2c3a40 100644
 +                          MakeConstSpan(sigalgs.data(), sigalgs.size()));
 +}
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
-index ce24af789..ee16c831d 100644
+index 05da7e436..9a744a6db 100644
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
 @@ -215,6 +215,7 @@ static const CipherTest kCipherTests[] = {
@@ -1787,7 +1777,7 @@ index ce24af789..ee16c831d 100644
        {{NID_sha256, EVP_PKEY_ML_DSA_44}, false, {}},
  
        {{NID_sha256, EVP_PKEY_RSA}, true, {SSL_SIGN_RSA_PKCS1_SHA256}},
-@@ -7087,8 +7105,13 @@ TEST(SSLTest, SigAlgsList) {
+@@ -7087,8 +7107,13 @@ TEST(SSLTest, SigAlgsList) {
        {":RSA+SHA256+:", false, {}},
        {"!", false, {}},
        {"\x01", false, {}},
@@ -1803,7 +1793,7 @@ index ce24af789..ee16c831d 100644
  
        {"RSA+SHA256", true, {SSL_SIGN_RSA_PKCS1_SHA256}},
        {"RSA+SHA256:ed25519",
-@@ -7205,11 +7223,11 @@ TEST(SSLTest, ApplyHandoffRemovesUnsupportedCurves) {
+@@ -7205,11 +7230,11 @@ TEST(SSLTest, ApplyHandoffRemovesUnsupportedCurves) {
    };
  
    // The default list of groups is used before applying the handoff.
@@ -1820,7 +1810,7 @@ index ce24af789..ee16c831d 100644
    ASSERT_TRUE(SSL_apply_handoff(server.get(), handoff));
    EXPECT_EQ(1u, server->config->supported_group_list.size());
    EXPECT_EQ(SSL_GROUP_SECP256R1, server->config->supported_group_list[0]);
-@@ -10782,10 +10800,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
+@@ -10782,10 +10807,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
  
    static const uint16_t kDuplicatePrefs[] = {SSL_SIGN_RSA_PKCS1_SHA256,
                                               SSL_SIGN_RSA_PKCS1_SHA256};
@@ -1834,26 +1824,6 @@ index ce24af789..ee16c831d 100644
  }
  
  TEST(SSLTest, InvalidGroups) {
-@@ -11806,10 +11824,10 @@ TEST(SSLTest, SignatureAlgorithmUsed) {
-   // algorithm used.
-   const uint16_t kPref = SSL_SIGN_RSA_PSS_RSAE_SHA384;
-   static const uint16_t kPrefs[] = {kPref};
--  ASSERT_TRUE(SSL_CTX_set_signing_algorithm_prefs(
--      server_ctx.get(), kPrefs, std::size(kPrefs)));
--  ASSERT_TRUE(SSL_CTX_set_signing_algorithm_prefs(
--      client_ctx.get(), kPrefs, std::size(kPrefs)));
-+  ASSERT_TRUE(SSL_CTX_set_signing_algorithm_prefs(server_ctx.get(), kPrefs,
-+                                                  std::size(kPrefs)));
-+  ASSERT_TRUE(SSL_CTX_set_signing_algorithm_prefs(client_ctx.get(), kPrefs,
-+                                                  std::size(kPrefs)));
- 
-   SSL_CTX_set_info_callback(client_ctx.get(),
-                             SignatureAlgorithmUsedInfoCallback);
-@@ -11832,4 +11850,3 @@ TEST(SSLTest, SignatureAlgorithmUsed) {
- 
- }  // namespace
- BSSL_NAMESPACE_END
--
 diff --git a/third_party/benchmark/src/string_util.cc b/third_party/benchmark/src/string_util.cc
 index 9c5df3ba2..395cdc2f4 100644
 --- a/third_party/benchmark/src/string_util.cc
