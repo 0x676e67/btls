@@ -614,6 +614,7 @@ impl ExtensionType {
     pub const CERTIFICATE_TIMESTAMP: Self = Self(ffi::TLSEXT_TYPE_certificate_timestamp as u16);
     pub const NEXT_PROTO_NEG: Self = Self(ffi::TLSEXT_TYPE_next_proto_neg as u16);
     pub const CHANNEL_ID: Self = Self(ffi::TLSEXT_TYPE_channel_id as u16);
+    #[cfg(not(feature = "fips"))]
     pub const RECORD_SIZE_LIMIT: Self = Self(ffi::TLSEXT_TYPE_record_size_limit as u16);
 }
 
@@ -2079,15 +2080,17 @@ impl SslContextBuilder {
     }
 
     /// Sets whether the context should enable record size limit.
+    #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_record_size_limit)]
     pub fn set_record_size_limit(&mut self, limit: u16) {
         unsafe { ffi::SSL_CTX_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
     /// Sets whether the context should enable delegated credentials.
+    #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_delegated_credentials)]
     pub fn set_delegated_credentials(&mut self, sigalgs: &str) -> Result<(), ErrorStack> {
-        let sigalgs = CString::new(sigalgs).unwrap();
+        let sigalgs = CString::new(sigalgs).map_err(ErrorStack::internal_error)?;
         unsafe {
             cvt(ffi::SSL_CTX_set_delegated_credentials(self.as_ptr(), sigalgs.as_ptr()) as c_int)
                 .map(|_| ())
@@ -2128,6 +2131,7 @@ impl SslContextBuilder {
     }
 
     /// Sets the indices of the extensions to be permuted.
+    #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_extension_order)]
     pub fn set_extension_permutation(
         &mut self,

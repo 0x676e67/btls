@@ -488,8 +488,10 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         apply_patch(config, "rpk.patch")?;
     }
 
-    println!("cargo:warning=applying patch to boringssl");
-    apply_patch(config, "boringssl.patch")?;
+    if !config.features.fips {
+        println!("cargo:warning=applying patch to boringssl");
+        apply_patch(config, "boringssl.patch")?;
+    }
 
     println!("cargo:warning=applying loongarch patch to boringssl");
     apply_patch(config, "boringssl-loongarch.patch")?;
