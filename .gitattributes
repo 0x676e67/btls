@@ -1,2 +1,2 @@
 *.toml text eol=lf
-*.patch whitespace=-blank-at-eol
+*.patch text eol=lf whitespace=-blank-at-eol

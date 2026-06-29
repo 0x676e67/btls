@@ -73,8 +73,8 @@ index e72d9ca9b..6dba691c3 100644
 +// X509_CHECK_FLAG_UNDERSCORE_WILDCARDS allows underscores in DNS wildcard matches.
 +#define X509_CHECK_FLAG_UNDERSCORE_WILDCARDS 0x40
 +
- // X509_VERIFY_PARAM_set_hostflags sets the name-checking flags on |param| to
- // |flags|. |flags| should be a combination of |X509_CHECK_FLAG_*| constants.
+ // X509_VERIFY_PARAM_set_hostflags sets the name-checking flags on `param` to
+ // `flags`. `flags` should be a combination of `X509_CHECK_FLAG_*` constants.
  OPENSSL_EXPORT void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM *param,
 -- 
 2.50.1 (Apple Git-155)
