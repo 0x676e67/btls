@@ -1,13 +1,18 @@
 #![cfg(not(feature = "fips"))]
 
 use std::ffi::CStr;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use foreign_types::ForeignTypeRef;
 
 use super::server::Server;
 use crate::ffi;
-use crate::ssl::{ExtensionType, SslCipher, SslSignatureAlgorithm, SslVersion};
+use crate::ssl::{
+    ExtensionType, SslCipher, SslConnector, SslMethod, SslSignatureAlgorithm, SslVersion,
+};
 
 struct AddedCipher {
     id: u16,
@@ -122,6 +127,70 @@ fn supported_group_ids(extension: &[u8]) -> Vec<u16> {
 
 fn signature_algorithm_ids(extension: &[u8]) -> Vec<u16> {
     length_prefixed_u16_list(extension)
+}
+
+fn badssl_addr(host: &str) -> Option<TcpStream> {
+    let addrs = match (host, 443).to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => return None,
+    };
+
+    for addr in addrs {
+        if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            return Some(stream);
+        }
+    }
+
+    None
+}
+
+fn connect_badssl_with_ciphers(host: &str, cipher_list: &str, expected_ciphers: &[&str]) {
+    let Some(stream) = badssl_addr(host) else {
+        return;
+    };
+
+    // These public badssl endpoints intentionally require legacy ciphers that
+    // boringssl.patch restores for compatibility. Keep the cipher lists fixed:
+    // future patch migrations should fail here if any listed suite disappears.
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    connector
+        .set_max_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    connector.set_cipher_list(cipher_list).unwrap();
+    // Windows CI images can fail to load the system trust roots for these
+    // public endpoints. This test is about the legacy ciphers restored by our
+    // patch, so only Windows skips certificate verification.
+    #[cfg(windows)]
+    connector.set_verify(crate::ssl::SslVerifyMode::NONE);
+    let connector = connector.build();
+
+    let mut stream = connector
+        .connect(host, stream)
+        .unwrap_or_else(|err| panic!("{host} TLS handshake failed: {err:?}"));
+    let cipher = stream.ssl().current_cipher().unwrap();
+    let standard_name = cipher.standard_name().unwrap();
+    assert!(
+        expected_ciphers.contains(&standard_name),
+        "{host} negotiated unexpected cipher {standard_name}",
+    );
+
+    let request = format!("GET / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1."),
+        "{host} did not return an HTTP response",
+    );
 }
 
 #[test]
@@ -362,6 +431,32 @@ fn boringssl_patch_added_cipher_list_is_complete_and_advertised() {
             cipher.id,
         );
     }
+}
+
+#[test]
+fn boringssl_patch_3des_badssl_ciphers_negotiate() {
+    connect_badssl_with_ciphers(
+        "3des.badssl.com",
+        "TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA:TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+        &[
+            "TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA",
+            "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+        ],
+    );
+}
+
+#[test]
+fn boringssl_patch_dh2048_badssl_ciphers_negotiate() {
+    connect_badssl_with_ciphers(
+        "dh2048.badssl.com",
+        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA:TLS_DHE_RSA_WITH_AES_256_CBC_SHA:TLS_DHE_RSA_WITH_AES_128_CBC_SHA256:TLS_DHE_RSA_WITH_AES_256_CBC_SHA256",
+        &[
+            "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
+            "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
+            "TLS_DHE_RSA_WITH_AES_128_CBC_SHA256",
+            "TLS_DHE_RSA_WITH_AES_256_CBC_SHA256",
+        ],
+    );
 }
 
 #[test]

@@ -371,24 +371,24 @@ jobs:
         go-version: '>=1.22.0'
     - name: Install build tools (ninja, cmake)
       run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
-    - name: Apply boring-sys patches
-      working-directory: boring-sys/deps/boringssl
+    - name: Apply btls-sys patches
+      working-directory: btls-sys/deps/boringssl
       run: |
-        for p in boring-pq.patch rpk.patch underscore-wildcards.patch; do
+        for p in boring-pq.patch rpk.patch boringssl.patch underscore-wildcards.patch; do
           echo "Applying $p"
           patch -p1 < "../../patches/$p"
         done
     - name: Configure BoringSSL build
-      working-directory: boring-sys/deps/boringssl
+      working-directory: btls-sys/deps/boringssl
       run: cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release
     - name: Build BoringSSL
-      working-directory: boring-sys/deps/boringssl
+      working-directory: btls-sys/deps/boringssl
       run: ninja -C build
     - name: Run BoringSSL C/C++ test suite
-      working-directory: boring-sys/deps/boringssl
+      working-directory: btls-sys/deps/boringssl
       run: go run util/all_tests.go
     - name: Run BoringSSL SSL runner tests
-      working-directory: boring-sys/deps/boringssl/ssl/test/runner
+      working-directory: btls-sys/deps/boringssl/ssl/test/runner
       run: go test
 
   cross-build:
