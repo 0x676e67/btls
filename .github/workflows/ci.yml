@@ -379,6 +379,7 @@ jobs:
       - name: Install ${{ matrix.target }} toolchain
         run: |
           brew tap messense/macos-cross-toolchains
+          brew untap aws/tap || true
           brew trust messense/macos-cross-toolchains
           brew install ${{ matrix.target }}
         shell: bash
