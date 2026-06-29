@@ -28,6 +28,7 @@ mod cert_compressor;
 mod cert_verify;
 mod custom_verify;
 mod ech;
+mod patches;
 mod private_key_method;
 mod server;
 mod session;
