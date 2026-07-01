@@ -706,17 +706,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn emit_rerun_if_changed(config: &Config) {
-    for path in [
-        "deps/boringssl",
-        "patches/bad-cert-verification.patch",
-        "patches/boring-pq.patch",
-        "patches/boringssl-loongarch.patch",
-        "patches/boringssl.patch",
-        "patches/rpk.patch",
-        "patches/underscore-wildcards.patch",
-    ] {
-        println!("cargo:rerun-if-changed={path}");
-    }
+    println!("cargo:rerun-if-changed=patches");
 
     if let Some(source_path) = &config.env.source_path {
         println!("cargo:rerun-if-changed={}", source_path.display());
