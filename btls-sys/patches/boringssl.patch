@@ -213,9 +213,9 @@ index 7a527396d..246e6784d 100644
                                                     size_t num_prefs);
  
 +// SSL_CTX_set_sigalgs_unique configures whether `ctx` rejects duplicate
-+// signature algorithm preferences. This fork allows duplicates by default for
-+// compatibility with older clients. Enabling this restores BoringSSL's
-+// uniqueness check for later signature algorithm configuration.
++// signature algorithm preferences. This fork keeps BoringSSL's uniqueness
++// check enabled by default. Disabling it allows duplicate preferences for
++// legacy client compatibility.
 +//
 +// This must be called before configuring any signature algorithm list to affect
 +// that list.
@@ -223,9 +223,9 @@ index 7a527396d..246e6784d 100644
 +                                               int sigalgs_unique);
 +
 +// SSL_set_sigalgs_unique configures whether `ssl` rejects duplicate signature
-+// algorithm preferences. This fork allows duplicates by default for
-+// compatibility with older clients. Enabling this restores BoringSSL's
-+// uniqueness check for later signature algorithm configuration.
++// algorithm preferences. This fork keeps BoringSSL's uniqueness check enabled
++// by default. Disabling it allows duplicate preferences for legacy client
++// compatibility.
 +//
 +// This must be called before configuring any signature algorithm list to affect
 +// that list.
@@ -1382,7 +1382,7 @@ index c2c426d66..3c3796431 100644
        aes_hw_override_value(false),
 -      resumption_across_names_enabled(false) {
 +      resumption_across_names_enabled(false),
-+      sigalgs_unique(false),
++      sigalgs_unique(true),
 +      preserve_tls13_cipher_list(false) {
    CRYPTO_new_ex_data(&ex_data);
  }
@@ -1426,7 +1426,7 @@ index c2c426d66..3c3796431 100644
        permute_extensions(false),
        disable_second_keyshare(false),
        alps_use_new_codepoint(true),
-+      sigalgs_unique(false),
++      sigalgs_unique(true),
 +      preserve_tls13_cipher_list(false),
        server_padding_enabled(false) {
    assert(ssl);
@@ -1588,9 +1588,9 @@ index 4e43717ee..3632766a0 100644
 -  if (!sigalgs_unique(prefs)) {
 +static bool set_sigalg_prefs(Array<uint16_t> *out, Span<const uint16_t> prefs,
 +                             bool require_unique) {
-+  // boringssl.patch allows duplicate signature algorithms by default for
-+  // compatibility with older clients. The optional sigalgs_unique switch
-+  // restores BoringSSL's uniqueness check when requested before configuration.
++  // boringssl.patch keeps BoringSSL's uniqueness check by default. The optional
++  // sigalgs_unique switch can disable it for legacy client compatibility when
++  // requested before configuration.
 +  if (require_unique && !sigalgs_unique(prefs)) {
      return false;
    }
@@ -1911,26 +1911,25 @@ index 05da7e436..e4d749f19 100644
    ASSERT_TRUE(SSL_apply_handoff(server.get(), handoff));
    EXPECT_EQ(1u, server->config->supported_group_list.size());
    EXPECT_EQ(SSL_GROUP_SECP256R1, server->config->supported_group_list[0]);
-@@ -10782,10 +10807,22 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
+@@ -10782,10 +10807,21 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
  
    static const uint16_t kDuplicatePrefs[] = {SSL_SIGN_RSA_PKCS1_SHA256,
                                               SSL_SIGN_RSA_PKCS1_SHA256};
-+  // boringssl.patch allows duplicate signature algorithms by default for
-+  // compatibility with older clients.
-+  EXPECT_TRUE(SSL_CTX_set_signing_algorithm_prefs(ctx.get(), kDuplicatePrefs,
-+                                                  std::size(kDuplicatePrefs)));
-+  EXPECT_TRUE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
-+                                                 std::size(kDuplicatePrefs)));
-+
-+  // The optional sigalgs_unique switch must be set before later signature
-+  // algorithm configuration and restores BoringSSL's uniqueness check.
-+  SSL_CTX_set_sigalgs_unique(ctx.get(), 1);
++  // boringssl.patch keeps BoringSSL's uniqueness check enabled by default.
    EXPECT_FALSE(SSL_CTX_set_signing_algorithm_prefs(ctx.get(), kDuplicatePrefs,
                                                     std::size(kDuplicatePrefs)));
    EXPECT_FALSE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
                                                    std::size(kDuplicatePrefs)));
 +  EXPECT_FALSE(SSL_CTX_set_delegated_credentials(
 +      ctx.get(), "rsa_pss_rsae_sha256:rsa_pss_rsae_sha256"));
++
++  // The optional sigalgs_unique switch must be set before later signature
++  // algorithm configuration and disables the uniqueness check for compatibility.
++  SSL_CTX_set_sigalgs_unique(ctx.get(), 0);
++  EXPECT_TRUE(SSL_CTX_set_signing_algorithm_prefs(ctx.get(), kDuplicatePrefs,
++                                                  std::size(kDuplicatePrefs)));
++  EXPECT_TRUE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
++                                                 std::size(kDuplicatePrefs)));
  }
  
  TEST(SSLTest, InvalidGroups) {

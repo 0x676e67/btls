@@ -2062,9 +2062,9 @@ impl SslContextBuilder {
 
     /// Sets whether duplicate signature algorithm preferences should be rejected.
     ///
-    /// Our BoringSSL patch allows duplicate signature algorithms by default for compatibility with
-    /// older clients. Enabling this restores BoringSSL's uniqueness check for later signature
-    /// algorithm configuration.
+    /// Our BoringSSL patch keeps duplicate signature algorithm rejection enabled by default,
+    /// matching upstream BoringSSL. Disabling this allows duplicate preferences for legacy client
+    /// compatibility in later signature algorithm configuration.
     ///
     /// This method must be called **before** any signature algorithm setter to take effect.
     #[cfg(not(feature = "fips"))]
