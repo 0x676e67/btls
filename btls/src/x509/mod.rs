@@ -804,7 +804,9 @@ impl X509 {
                 if r.is_null() {
                     let err = ffi::ERR_peek_last_error();
 
-                    if ffi::ERR_GET_LIB(err) == ffi::ERR_LIB_PEM.0
+                    #[allow(clippy::useless_conversion)]
+                    let pem_lib = ffi::ERR_LIB_PEM.0.try_into().unwrap();
+                    if ffi::ERR_GET_LIB(err) == pem_lib
                         && ffi::ERR_GET_REASON(err) == ffi::PEM_R_NO_START_LINE
                     {
                         ErrorStack::clear();
