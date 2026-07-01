@@ -64,7 +64,7 @@ jobs:
           path: target
           key: clippy-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
       - name: Run clippy
-        run: cargo clippy --all --all-targets --features mlkem,prf
+        run: cargo clippy --all --all-targets --features mlkem,prf -- -D warnings
       - name: Check docs
         run: cargo doc --no-deps -p btls -p btls-sys --features underscore-wildcards
         env:

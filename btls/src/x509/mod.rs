@@ -377,6 +377,7 @@ impl X509Builder {
     /// Note that the version is zero-indexed; that is, a certificate corresponding to version 3 of
     /// the X.509 standard should pass `2` to this method.
     #[corresponds(X509_set_version)]
+    #[allow(clippy::useless_conversion)]
     pub fn set_version(&mut self, version: i32) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::X509_set_version(self.0.as_ptr(), version.into())) }
     }
@@ -803,6 +804,7 @@ impl X509 {
                 if r.is_null() {
                     let err = ffi::ERR_peek_last_error();
 
+                    #[allow(clippy::useless_conversion)]
                     if ffi::ERR_GET_LIB(err) == ffi::ERR_LIB_PEM.0.try_into().unwrap()
                         && ffi::ERR_GET_REASON(err) == ffi::PEM_R_NO_START_LINE
                     {
@@ -1276,6 +1278,7 @@ impl X509ReqBuilder {
 
     /// Set the numerical value of the version field.
     #[corresponds(X509_REQ_set_version)]
+    #[allow(clippy::useless_conversion)]
     pub fn set_version(&mut self, version: i32) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::X509_REQ_set_version(self.0.as_ptr(), version.into())) }
     }
