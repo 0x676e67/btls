@@ -658,7 +658,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    emit_rerun_if_changed(&config);
+    emit_rerun_if_changed();
     ensure_patches_applied(&config)?;
     if !config.env.docs_rs {
         emit_link_directives(&config);
@@ -689,12 +689,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn emit_rerun_if_changed(config: &Config) {
+fn emit_rerun_if_changed() {
     println!("cargo:rerun-if-changed=patches");
-
-    if let Some(source_path) = &config.env.source_path {
-        println!("cargo:rerun-if-changed={}", source_path.display());
-    }
 }
 
 fn emit_link_directives(config: &Config) {
