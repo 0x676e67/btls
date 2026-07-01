@@ -525,13 +525,13 @@ fn boringssl_patch_clienthello_extensions_are_sent() {
 }
 
 #[test]
-fn boringssl_patch_can_disable_sigalgs_unique_for_duplicate_signature_algorithms() {
+fn boringssl_patch_can_allow_duplicate_signature_algorithms() {
     let signature_algorithms = Arc::new(Mutex::new(None));
 
-    // boringssl.patch keeps BoringSSL's sigalgs_unique rejection enabled by
-    // default. Disabling it is our compatibility behavior for legacy clients.
+    // boringssl.patch keeps BoringSSL's duplicate signature algorithm rejection
+    // enabled by default. This opt-in keeps compatibility with legacy clients.
     let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
-    ctx.set_sigalgs_unique(false);
+    ctx.set_sigalgs_allow_duplicates(true);
     ctx.set_sigalgs_list("RSA+SHA256:RSA+SHA256")
         .expect("boringssl.patch should allow duplicate signing algorithm prefs");
 
@@ -552,7 +552,7 @@ fn boringssl_patch_can_disable_sigalgs_unique_for_duplicate_signature_algorithms
         .ctx()
         .set_max_proto_version(Some(SslVersion::TLS1_2))
         .unwrap();
-    client.ctx().set_sigalgs_unique(false);
+    client.ctx().set_sigalgs_allow_duplicates(true);
     client
         .ctx()
         .set_verify_algorithm_prefs(&[
@@ -579,7 +579,7 @@ fn boringssl_patch_rejects_duplicate_signature_algorithms_by_default() {
     let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
     assert!(
         ctx.set_sigalgs_list("RSA+SHA256:RSA+SHA256").is_err(),
-        "sigalgs_unique should reject duplicate signing algorithm prefs",
+        "duplicate signing algorithm prefs should be rejected by default",
     );
 
     let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
@@ -589,14 +589,14 @@ fn boringssl_patch_rejects_duplicate_signature_algorithms_by_default() {
             SslSignatureAlgorithm::RSA_PKCS1_SHA256,
         ])
         .is_err(),
-        "sigalgs_unique should reject duplicate verify algorithm prefs",
+        "duplicate verify algorithm prefs should be rejected by default",
     );
 
     let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
     assert!(
         ctx.set_delegated_credentials("rsa_pss_rsae_sha256:rsa_pss_rsae_sha256")
             .is_err(),
-        "sigalgs_unique should reject duplicate delegated credential prefs",
+        "duplicate delegated credential prefs should be rejected by default",
     );
 }
 

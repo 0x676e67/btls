@@ -208,28 +208,29 @@ index 7a527396d..246e6784d 100644
  // SSL_CTX_set_options enables all options set in `options` (which should be one
  // or more of the `SSL_OP_*` values, ORed together) in `ctx`. It returns a
  // bitmask representing the resulting enabled options.
-@@ -1245,6 +1251,31 @@ OPENSSL_EXPORT int SSL_set_signing_algorithm_prefs(SSL *ssl,
+@@ -1245,6 +1251,32 @@ OPENSSL_EXPORT int SSL_set_signing_algorithm_prefs(SSL *ssl,
                                                     const uint16_t *prefs,
                                                     size_t num_prefs);
  
-+// SSL_CTX_set_sigalgs_unique configures whether `ctx` rejects duplicate
-+// signature algorithm preferences. This fork keeps BoringSSL's uniqueness
-+// check enabled by default. Disabling it allows duplicate preferences for
-+// legacy client compatibility.
++// SSL_CTX_set_sigalgs_allow_duplicates configures whether `ctx` accepts
++// duplicate signature algorithm preferences. This fork keeps BoringSSL's
++// uniqueness check enabled by default. Enabling this allows duplicate
++// preferences for legacy client compatibility.
 +//
 +// This must be called before configuring any signature algorithm list to affect
 +// that list.
-+OPENSSL_EXPORT void SSL_CTX_set_sigalgs_unique(SSL_CTX *ctx,
-+                                               int sigalgs_unique);
++OPENSSL_EXPORT void SSL_CTX_set_sigalgs_allow_duplicates(
++    SSL_CTX *ctx, int sigalgs_allow_duplicates);
 +
-+// SSL_set_sigalgs_unique configures whether `ssl` rejects duplicate signature
-+// algorithm preferences. This fork keeps BoringSSL's uniqueness check enabled
-+// by default. Disabling it allows duplicate preferences for legacy client
-+// compatibility.
++// SSL_set_sigalgs_allow_duplicates configures whether `ssl` accepts duplicate
++// signature algorithm preferences. This fork keeps BoringSSL's uniqueness check
++// enabled by default. Enabling this allows duplicate preferences for legacy
++// client compatibility.
 +//
 +// This must be called before configuring any signature algorithm list to affect
 +// that list.
-+OPENSSL_EXPORT void SSL_set_sigalgs_unique(SSL *ssl, int sigalgs_unique);
++OPENSSL_EXPORT void SSL_set_sigalgs_allow_duplicates(
++    SSL *ssl, int sigalgs_allow_duplicates);
 +
 +
 +// SSL_CTX_set_delegated_credentials sets the set of signature algorithms
@@ -934,7 +935,7 @@ index 4653cb4a9..2d6a62fed 100644
    // This is used to hold the local certificate used (i.e. the server
    // certificate for a server or the client certificate for a client).
    UniquePtr<CERT> cert;
-@@ -3538,6 +3560,22 @@ struct SSL_CONFIG {
+@@ -3538,6 +3560,23 @@ struct SSL_CONFIG {
    // to negotiate and convey application settings.
    bool alps_use_new_codepoint : 1;
  
@@ -945,9 +946,10 @@ index 4653cb4a9..2d6a62fed 100644
 +  // supported by the client.
 +  Array<uint16_t> delegated_credentials;
 +
-+  // sigalgs_unique indicates that duplicate signature algorithm preferences
-+  // should be rejected when configuring later signature algorithm lists.
-+  bool sigalgs_unique : 1;
++  // sigalgs_allow_duplicates indicates that duplicate signature algorithm
++  // preferences should be allowed when configuring later signature algorithm
++  // lists.
++  bool sigalgs_allow_duplicates : 1;
 +
 +  // preserve_tls13_cipher_list indicates that the TLS 1.3 cipher list order
 +  // should be preserved, potentially preferring ChaCha20-Poly1305 over AES-GCM
@@ -957,7 +959,7 @@ index 4653cb4a9..2d6a62fed 100644
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
-@@ -4202,6 +4240,29 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4202,6 +4240,30 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // signal its sessions may be resumed across names in the server certificate.
    bool resumption_across_names_enabled : 1;
  
@@ -968,9 +970,10 @@ index 4653cb4a9..2d6a62fed 100644
 +  // supported by the client.
 +  bssl::Array<uint16_t> delegated_credentials;
 +
-+  // sigalgs_unique indicates that duplicate signature algorithm preferences
-+  // should be rejected when configuring later signature algorithm lists.
-+  bool sigalgs_unique : 1;
++  // sigalgs_allow_duplicates indicates that duplicate signature algorithm
++  // preferences should be allowed when configuring later signature algorithm
++  // lists.
++  bool sigalgs_allow_duplicates : 1;
 +
 +  // ssl_extension_order, if not empty, will use this actions
 +  // as the order to be used to write the ssl extensions.
@@ -1382,7 +1385,7 @@ index c2c426d66..3c3796431 100644
        aes_hw_override_value(false),
 -      resumption_across_names_enabled(false) {
 +      resumption_across_names_enabled(false),
-+      sigalgs_unique(true),
++      sigalgs_allow_duplicates(false),
 +      preserve_tls13_cipher_list(false) {
    CRYPTO_new_ex_data(&ex_data);
  }
@@ -1416,7 +1419,7 @@ index c2c426d66..3c3796431 100644
    ssl->config->handoff = ctx_impl->handoff;
    ssl->quic_method = ctx_impl->quic_method;
 +  ssl->config->record_size_limit = ctx_impl->record_size_limit;
-+  ssl->config->sigalgs_unique = ctx_impl->sigalgs_unique;
++  ssl->config->sigalgs_allow_duplicates = ctx_impl->sigalgs_allow_duplicates;
 +  ssl->config->preserve_tls13_cipher_list =
 +      ctx_impl->preserve_tls13_cipher_list;
  
@@ -1426,7 +1429,7 @@ index c2c426d66..3c3796431 100644
        permute_extensions(false),
        disable_second_keyshare(false),
        alps_use_new_codepoint(true),
-+      sigalgs_unique(true),
++      sigalgs_allow_duplicates(false),
 +      preserve_tls13_cipher_list(false),
        server_padding_enabled(false) {
    assert(ssl);
@@ -1587,11 +1590,11 @@ index 4e43717ee..3632766a0 100644
 -static bool set_sigalg_prefs(Array<uint16_t> *out, Span<const uint16_t> prefs) {
 -  if (!sigalgs_unique(prefs)) {
 +static bool set_sigalg_prefs(Array<uint16_t> *out, Span<const uint16_t> prefs,
-+                             bool require_unique) {
++                             bool sigalgs_allow_duplicates) {
 +  // boringssl.patch keeps BoringSSL's uniqueness check by default. The optional
-+  // sigalgs_unique switch can disable it for legacy client compatibility when
++  // sigalgs_allow_duplicates switch allows legacy duplicate preferences when
 +  // requested before configuration.
-+  if (require_unique && !sigalgs_unique(prefs)) {
++  if (!sigalgs_allow_duplicates && !sigalgs_unique(prefs)) {
      return false;
    }
  
@@ -1605,7 +1608,7 @@ index 4e43717ee..3632766a0 100644
 +static int credential_set1_signing_algorithm_prefs(SSL_CREDENTIAL *cred,
 +                                                   const uint16_t *prefs,
 +                                                   size_t num_prefs,
-+                                                   bool require_unique) {
++                                                   bool sigalgs_allow_duplicates) {
    auto *cred_impl = FromOpaque(cred);
    if (!cred_impl->UsesPrivateKey()) {
      OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
@@ -1615,7 +1618,7 @@ index 4e43717ee..3632766a0 100644
  
 -  return set_sigalg_prefs(&cred_impl->sigalgs, Span(prefs, num_prefs));
 +  return set_sigalg_prefs(&cred_impl->sigalgs, Span(prefs, num_prefs),
-+                          require_unique);
++                          sigalgs_allow_duplicates);
 +}
 +
 +int SSL_CREDENTIAL_set1_signing_algorithm_prefs(SSL_CREDENTIAL *cred,
@@ -1632,7 +1635,7 @@ index 4e43717ee..3632766a0 100644
 +  auto *ctx_impl = FromOpaque(ctx);
 +  return credential_set1_signing_algorithm_prefs(
 +      ctx_impl->cert->legacy_credential.get(), prefs, num_prefs,
-+      ctx_impl->sigalgs_unique);
++      ctx_impl->sigalgs_allow_duplicates);
  }
  
  int SSL_set_signing_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
@@ -1644,7 +1647,7 @@ index 4e43717ee..3632766a0 100644
 -      ssl->config->cert->legacy_credential.get(), prefs, num_prefs);
 +  return credential_set1_signing_algorithm_prefs(
 +      ssl->config->cert->legacy_credential.get(), prefs, num_prefs,
-+      ssl->config->sigalgs_unique);
++      ssl->config->sigalgs_allow_duplicates);
  }
  
  static constexpr struct {
@@ -1654,17 +1657,17 @@ index 4e43717ee..3632766a0 100644
    return set_sigalg_prefs(&FromOpaque(ctx)->verify_sigalgs,
 -                          Span(prefs, num_prefs));
 +                          Span(prefs, num_prefs),
-+                          FromOpaque(ctx)->sigalgs_unique);
++                          FromOpaque(ctx)->sigalgs_allow_duplicates);
  }
  
  int SSL_set_verify_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
-@@ -958,5 +975,38 @@ int SSL_set_verify_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
+@@ -958,5 +975,40 @@ int SSL_set_verify_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
      return 0;
    }
  
 -  return set_sigalg_prefs(&ssl->config->verify_sigalgs, Span(prefs, num_prefs));
 +  return set_sigalg_prefs(&ssl->config->verify_sigalgs, Span(prefs, num_prefs),
-+                          ssl->config->sigalgs_unique);
++                          ssl->config->sigalgs_allow_duplicates);
 +}
 +
 +int SSL_CTX_set_delegated_credentials(SSL_CTX *ctx, const char *str) {
@@ -1680,23 +1683,25 @@ index 4e43717ee..3632766a0 100644
 +
 +  return set_sigalg_prefs(&FromOpaque(ctx)->delegated_credentials,
 +                          MakeConstSpan(sigalgs.data(), sigalgs.size()),
-+                          FromOpaque(ctx)->sigalgs_unique);
++                          FromOpaque(ctx)->sigalgs_allow_duplicates);
 +}
 +
-+void SSL_CTX_set_sigalgs_unique(SSL_CTX *ctx, int sigalgs_unique) {
++void SSL_CTX_set_sigalgs_allow_duplicates(
++    SSL_CTX *ctx, int sigalgs_allow_duplicates) {
 +  if (!ctx) {
 +    return;
 +  }
 +
-+  FromOpaque(ctx)->sigalgs_unique = !!sigalgs_unique;
++  FromOpaque(ctx)->sigalgs_allow_duplicates = !!sigalgs_allow_duplicates;
 +}
 +
-+void SSL_set_sigalgs_unique(SSL *ssl, int sigalgs_unique) {
++void SSL_set_sigalgs_allow_duplicates(SSL *ssl,
++                                      int sigalgs_allow_duplicates) {
 +  if (!ssl->config) {
 +    return;
 +  }
 +
-+  ssl->config->sigalgs_unique = !!sigalgs_unique;
++  ssl->config->sigalgs_allow_duplicates = !!sigalgs_allow_duplicates;
  }
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
 index 05da7e436..e4d749f19 100644
@@ -1867,33 +1872,6 @@ index 05da7e436..e4d749f19 100644
        // TODO(davidben): Add a change detector for TLS 1.3 once the spec and our
        // implementation has settled enough that it won't change.
    };
-@@ -7032,7 +7050,9 @@ TEST(SSLTest, SigAlgs) {
-       {{1}, false, {}},
-       {{1, 2, 3}, false, {}},
-       {{NID_sha256, EVP_PKEY_ED25519}, false, {}},
--      {{NID_sha256, EVP_PKEY_RSA, NID_sha256, EVP_PKEY_RSA}, false, {}},
-+      {{NID_sha256, EVP_PKEY_RSA, NID_sha256, EVP_PKEY_RSA},
-+       true,
-+       {SSL_SIGN_RSA_PKCS1_SHA256, SSL_SIGN_RSA_PKCS1_SHA256}},
-       {{NID_sha256, EVP_PKEY_ML_DSA_44}, false, {}},
- 
-       {{NID_sha256, EVP_PKEY_RSA}, true, {SSL_SIGN_RSA_PKCS1_SHA256}},
-@@ -7087,8 +7107,13 @@ TEST(SSLTest, SigAlgsList) {
-       {":RSA+SHA256+:", false, {}},
-       {"!", false, {}},
-       {"\x01", false, {}},
--      {"RSA+SHA256:RSA+SHA384:RSA+SHA256", false, {}},
--      {"RSA-PSS+SHA256:rsa_pss_rsae_sha256", false, {}},
-+      {"RSA+SHA256:RSA+SHA384:RSA+SHA256",
-+       true,
-+       {SSL_SIGN_RSA_PKCS1_SHA256, SSL_SIGN_RSA_PKCS1_SHA384,
-+        SSL_SIGN_RSA_PKCS1_SHA256}},
-+      {"RSA-PSS+SHA256:rsa_pss_rsae_sha256",
-+       true,
-+       {SSL_SIGN_RSA_PSS_RSAE_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256}},
- 
-       {"RSA+SHA256", true, {SSL_SIGN_RSA_PKCS1_SHA256}},
-       {"RSA+SHA256:ed25519",
 @@ -7205,11 +7230,11 @@ TEST(SSLTest, ApplyHandoffRemovesUnsupportedCurves) {
    };
  
@@ -1923,9 +1901,9 @@ index 05da7e436..e4d749f19 100644
 +  EXPECT_FALSE(SSL_CTX_set_delegated_credentials(
 +      ctx.get(), "rsa_pss_rsae_sha256:rsa_pss_rsae_sha256"));
 +
-+  // The optional sigalgs_unique switch must be set before later signature
-+  // algorithm configuration and disables the uniqueness check for compatibility.
-+  SSL_CTX_set_sigalgs_unique(ctx.get(), 0);
++  // The optional sigalgs_allow_duplicates switch must be set before later
++  // signature algorithm configuration and enables legacy duplicate preferences.
++  SSL_CTX_set_sigalgs_allow_duplicates(ctx.get(), 1);
 +  EXPECT_TRUE(SSL_CTX_set_signing_algorithm_prefs(ctx.get(), kDuplicatePrefs,
 +                                                  std::size(kDuplicatePrefs)));
 +  EXPECT_TRUE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
