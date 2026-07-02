@@ -22,6 +22,7 @@ pub(crate) struct Features {
     pub(crate) rpk: bool,
     pub(crate) underscore_wildcards: bool,
     pub(crate) prefix_symbols: bool,
+    pub(crate) allow_crl_extensions_bad_version: bool,
 }
 
 pub(crate) struct Env {
@@ -71,6 +72,12 @@ impl Config {
             .source_path
             .as_ref()
             .is_some_and(|path| path.join("src").exists());
+
+        // DEP_BORINGSSL_VERSION_MAJOR
+        println!(
+            "cargo:version_major={}",
+            env::var("CARGO_PKG_VERSION_MAJOR").unwrap_or_default()
+        );
 
         let config = Self {
             manifest_dir,
@@ -127,16 +134,12 @@ impl Config {
 
 impl Features {
     fn from_env() -> Self {
-        let fips = env::var_os("CARGO_FEATURE_FIPS").is_some();
-        let rpk = env::var_os("CARGO_FEATURE_RPK").is_some();
-        let underscore_wildcards = env::var_os("CARGO_FEATURE_UNDERSCORE_WILDCARDS").is_some();
-        let prefix_symbols = env::var_os("CARGO_FEATURE_PREFIX_SYMBOLS").is_some();
-
         Self {
-            fips,
-            rpk,
-            underscore_wildcards,
-            prefix_symbols,
+            fips: cfg!(feature = "fips"),
+            rpk: cfg!(feature = "rpk"),
+            underscore_wildcards: cfg!(feature = "underscore-wildcards"),
+            prefix_symbols: cfg!(feature = "prefix-symbols"),
+            allow_crl_extensions_bad_version: cfg!(feature = "allow-crl-extensions-bad-version"),
         }
     }
 
