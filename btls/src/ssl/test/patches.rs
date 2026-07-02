@@ -11,7 +11,8 @@ use foreign_types::ForeignTypeRef;
 use super::server::Server;
 use crate::ffi;
 use crate::ssl::{
-    ExtensionType, SslCipher, SslConnector, SslMethod, SslSignatureAlgorithm, SslVersion,
+    ErrorCode, ExtensionType, HandshakeError, SslCipher, SslConnector, SslMethod,
+    SslSignatureAlgorithm, SslVersion,
 };
 
 struct AddedCipher {
@@ -173,9 +174,22 @@ fn connect_badssl_with_ciphers(host: &str, cipher_list: &str, expected_ciphers: 
     connector.set_verify(crate::ssl::SslVerifyMode::NONE);
     let connector = connector.build();
 
-    let mut stream = connector
-        .connect(host, stream)
-        .unwrap_or_else(|err| panic!("{host} TLS handshake failed: {err:?}"));
+    let mut stream = match connector.connect(host, stream) {
+        Ok(stream) => stream,
+        Err(err) => {
+            if let HandshakeError::Failure(mid) = &err {
+                if mid.error().code() == ErrorCode::SYSCALL
+                    && matches!(
+                        mid.error().io_error().map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::TimedOut)
+                    )
+                {
+                    return;
+                }
+            }
+            panic!("{host} TLS handshake failed: {err:?}");
+        }
+    };
     let cipher = stream.ssl().current_cipher().unwrap();
     let standard_name = cipher.standard_name().unwrap();
     assert!(
@@ -511,13 +525,13 @@ fn boringssl_patch_clienthello_extensions_are_sent() {
 }
 
 #[test]
-fn boringssl_patch_allows_duplicate_signature_algorithms() {
+fn boringssl_patch_can_allow_duplicate_signature_algorithms() {
     let signature_algorithms = Arc::new(Mutex::new(None));
 
-    // boringssl.patch removes BoringSSL's sigalgs_unique rejection. Duplicate
-    // signature algorithms are a compatibility behavior from our patch, not a
-    // guarantee from upstream BoringSSL's native policy.
+    // boringssl.patch keeps BoringSSL's duplicate signature algorithm rejection
+    // enabled by default. This opt-in keeps compatibility with legacy clients.
     let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
+    ctx.set_sigalgs_allow_duplicates(true);
     ctx.set_sigalgs_list("RSA+SHA256:RSA+SHA256")
         .expect("boringssl.patch should allow duplicate signing algorithm prefs");
 
@@ -538,6 +552,7 @@ fn boringssl_patch_allows_duplicate_signature_algorithms() {
         .ctx()
         .set_max_proto_version(Some(SslVersion::TLS1_2))
         .unwrap();
+    client.ctx().set_sigalgs_allow_duplicates(true);
     client
         .ctx()
         .set_verify_algorithm_prefs(&[
@@ -556,6 +571,32 @@ fn boringssl_patch_allows_duplicate_signature_algorithms() {
             .count(),
         2,
         "ClientHello did not preserve the duplicated boringssl.patch signature algorithm",
+    );
+}
+
+#[test]
+fn boringssl_patch_rejects_duplicate_signature_algorithms_by_default() {
+    let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
+    assert!(
+        ctx.set_sigalgs_list("RSA+SHA256:RSA+SHA256").is_err(),
+        "duplicate signing algorithm prefs should be rejected by default",
+    );
+
+    let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
+    assert!(
+        ctx.set_verify_algorithm_prefs(&[
+            SslSignatureAlgorithm::RSA_PKCS1_SHA256,
+            SslSignatureAlgorithm::RSA_PKCS1_SHA256,
+        ])
+        .is_err(),
+        "duplicate verify algorithm prefs should be rejected by default",
+    );
+
+    let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
+    assert!(
+        ctx.set_delegated_credentials("rsa_pss_rsae_sha256:rsa_pss_rsae_sha256")
+            .is_err(),
+        "duplicate delegated credential prefs should be rejected by default",
     );
 }
 

@@ -2060,6 +2060,19 @@ impl SslContextBuilder {
         }
     }
 
+    /// Sets whether duplicate signature algorithm preferences should be allowed.
+    ///
+    /// Our BoringSSL patch keeps duplicate signature algorithm rejection enabled by default,
+    /// matching upstream BoringSSL. Enabling this allows duplicate preferences for legacy client
+    /// compatibility in later signature algorithm configuration.
+    ///
+    /// This method must be called **before** any signature algorithm setter to take effect.
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_CTX_set_sigalgs_allow_duplicates)]
+    pub fn set_sigalgs_allow_duplicates(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_CTX_set_sigalgs_allow_duplicates(self.as_ptr(), enabled as _) }
+    }
+
     /// Set's whether the context should enable GREASE.
     #[corresponds(SSL_CTX_set_grease_enabled)]
     pub fn set_grease_enabled(&mut self, enabled: bool) {
