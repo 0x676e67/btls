@@ -625,7 +625,7 @@ impl From<u16> for ExtensionType {
 }
 
 /// An SSL/TLS/DTLS protocol version.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct SslVersion(u16);
 
 impl SslVersion {
