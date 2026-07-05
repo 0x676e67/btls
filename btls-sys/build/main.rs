@@ -230,6 +230,9 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     }
 
     if config.host == config.target {
+        if config.target_os == "windows" && config.target_arch == "aarch64" {
+            boringssl_cmake.define("CMAKE_ASM_COMPILER", "clang.exe");
+        }
         return boringssl_cmake;
     }
 
