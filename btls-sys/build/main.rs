@@ -710,7 +710,9 @@ fn emit_link_directives(config: &Config) {
             .map(|s| dir.join(s))
             .filter(|d| d.exists())
             .unwrap_or(dir);
-        println!("cargo:rustc-link-search=native={}", dir.display());
+        if dir.is_dir() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
     }
 
     if let Some(cpp_lib) = get_cpp_runtime_lib(config) {
