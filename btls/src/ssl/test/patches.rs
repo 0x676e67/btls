@@ -511,6 +511,37 @@ fn boringssl_patch_clienthello_extensions_are_sent() {
 }
 
 #[test]
+fn boringssl_patch_partial_extension_order_can_handshake() {
+    // boringssl.patch adds explicit ClientHello extension ordering. Unknown
+    // and duplicate entries are ignored, and the unlisted extensions are
+    // shuffled after the configured prefix.
+    let server = Server::builder().build();
+    let mut client = server.client_with_root_ca();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_extension_permutation(&[
+            ExtensionType::SUPPORTED_VERSIONS,
+            ExtensionType::from(0xffff),
+            ExtensionType::SUPPORTED_VERSIONS,
+            ExtensionType::KEY_SHARE,
+            ExtensionType::SUPPORTED_GROUPS,
+            ExtensionType::PSK_KEY_EXCHANGE_MODES,
+            ExtensionType::SIGNATURE_ALGORITHMS,
+        ])
+        .unwrap();
+
+    client.connect();
+}
+
+#[test]
 fn boringssl_patch_allows_duplicate_signature_algorithms() {
     let signature_algorithms = Arc::new(Mutex::new(None));
 

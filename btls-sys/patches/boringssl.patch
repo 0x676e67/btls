@@ -285,10 +285,10 @@ index 49972b7f2..8291dc3f8 100644
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  
-+// SSL_CTX_set_extension_order configures whether sockets on |ctx|
-+// should make use of the provided extensions to define the order,
-+// which is similar to SSL_CTX_set_permute_extensions but in a defined
-+// order instead of a random one.
++// SSL_CTX_set_extension_order sets the ClientHello extension order for
++// connections created from |ctx|. Known IDs keep their given order. Unknown
++// and duplicate IDs are ignored, and unlisted extensions are appended in
++// random order. Passing an empty list clears the configured order.
 +OPENSSL_EXPORT int SSL_CTX_set_extension_order(SSL_CTX *ctx,
 +                                               const uint16_t *ids, int num);
 +
@@ -552,27 +552,62 @@ index 56de76e37..032490ad4 100644
      {
          TLSEXT_TYPE_client_cert_type,
          ext_client_cert_type_add_clienthello,
-@@ -4353,6 +4418,77 @@ static_assert(kNumExtensions <=
+@@ -4353,6 +4418,105 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
 +
++// Shuffle only the part that was not configured. This is the same Fisher-Yates
++// loop used by ssl_setup_extension_permutation: for a suffix of length L,
++// iteration i reads seeds[i - 1] and swaps with an entry from 0 through i.
++// Every index here is relative to suffix, so no offset adjustment is needed.
++static bool ssl_shuffle_extension_order_suffix(Span<uint8_t> suffix) {
++  if (suffix.size() < 2) {
++    return true;
++  }
++
++  static_assert(kNumExtensions <= UINT8_MAX,
++                "extensions_permutation type is too small");
++  // suffix should come from a kNumExtensions-sized permutation. Check it here
++  // too, because seeds has room for only kNumExtensions - 1 values.
++  if (suffix.size() > kNumExtensions) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++
++  uint32_t seeds[kNumExtensions - 1];
++  // A suffix of L entries needs L - 1 swaps and therefore L - 1 seeds.
++  const size_t seeds_num = suffix.size() - 1;
++  if (!RAND_bytes(reinterpret_cast<uint8_t *>(seeds),
++                  seeds_num * sizeof(seeds[0]))) {
++    return false;
++  }
++
++  for (size_t i = suffix.size() - 1; i > 0; i--) {
++    std::swap(suffix[i], suffix[seeds[i - 1] % (i + 1)]);
++  }
++  return true;
++}
++
++// Put configured extensions first, then append every extension not listed in
++// the configuration. Unknown IDs and duplicates do not take a slot. The first
++// part stays in order; ssl_shuffle_extension_order_suffix randomizes the rest.
 +bool ssl_setup_extension_order(SSL_HANDSHAKE *hs) {
 +  SSLImpl *const ssl = hs->ssl;
 +  if (ssl->ctx->extension_order.empty()) {
 +    return ssl_setup_extension_permutation(hs);
 +  }
 +
-+  static_assert(kNumExtensions <= UINT8_MAX,
-+                "extensions_permutation type is too small");
 +  Array<uint8_t> permutation;
-+  if (!permutation.Init(kNumExtensions)) {
++  if (!permutation.InitForOverwrite(kNumExtensions)) {
 +    return false;
 +  }
 +
 +  bool seen[kNumExtensions] = {0};
-+  int permIndex = 0;
++  size_t permutation_len = 0;
 +
++  // extension_order contains wire IDs, but the ClientHello writer reads
++  // indexes into kExtensions. Add each known index once.
 +  for (uint16_t id : ssl->ctx->extension_order) {
 +    size_t j;
 +    for (j = 0; j < kNumExtensions; j++) {
@@ -581,46 +616,39 @@ index 56de76e37..032490ad4 100644
 +      }
 +    }
 +    if (j == kNumExtensions || seen[j]) {
-+      continue;  // Skip unknown or duplicate entries
++      continue;
++    }
++    if (permutation_len >= permutation.size()) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
 +    }
 +    seen[j] = true;
-+    permutation[permIndex++] = j;
++    permutation[permutation_len++] = static_cast<uint8_t>(j);
 +  }
 +
-+  size_t rem = kNumExtensions - permIndex;
-+  if (rem == 0) {
-+    hs->extension_permutation = std::move(permutation);
-+    return true;
-+  }
-+
-+  size_t offset = permIndex;
++  // Everything appended after this point belongs to the random suffix. The
++  // helper receives a subspan, so its indexes start at zero.
++  const size_t suffix_offset = permutation_len;
 +  for (size_t i = 0; i < kNumExtensions; i++) {
 +    if (seen[i]) {
-+      continue;  // skip duplicate entries
++      continue;
 +    }
-+    seen[i] = true;
-+    permutation[permIndex++] = i;
++    if (permutation_len >= permutation.size()) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
++    }
++    permutation[permutation_len++] = static_cast<uint8_t>(i);
 +  }
 +
-+  if (rem > 1) {
-+    size_t seeds_num = rem - 1;
-+    uint32_t *seeds =
-+        static_cast<uint32_t *>(OPENSSL_malloc(seeds_num * sizeof(uint32_t)));
-+    if (!seeds) {
-+      permutation.Reset();
-+      return false;
-+    }
-+    if (!RAND_bytes(reinterpret_cast<uint8_t *>(seeds),
-+                    seeds_num * sizeof(uint32_t))) {
-+      permutation.Reset();
-+      OPENSSL_free(seeds);
-+      return false;
-+    }
-+    for (size_t i = kNumExtensions - 1; i > offset; i--) {
-+      size_t swap_idx = offset + (seeds[i - offset] % (i - offset));
-+      std::swap(permutation[i], permutation[swap_idx]);
-+    }
-+    OPENSSL_free(seeds);
++  // Every kExtensions index must have been written once before the
++  // ClientHello writer uses the permutation.
++  if (permutation_len != permutation.size()) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  if (!ssl_shuffle_extension_order_suffix(
++          Span(permutation).subspan(suffix_offset))) {
++    return false;
 +  }
 +
 +  hs->extension_permutation = std::move(permutation);
@@ -893,18 +921,19 @@ index a8643452f..b631c016a 100644
    // offered_client_cert_types, for a client, is a list of client certificate
    // types (`TLSEXT_cert_type_*` values) that were sent in the
    // client_certificate_type extension in the ClientHello.
-@@ -2234,6 +2248,10 @@ bool tls13_process_new_session_ticket(SSLImpl *ssl, const SSLMessage &msg);
+@@ -2234,6 +2248,11 @@ bool tls13_process_new_session_ticket(SSLImpl *ssl, const SSLMessage &msg);
  UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSLImpl *ssl,
                                                          CBS *body);
  
-+// ssl_setup_extension_order computes a ClientHello extension order from the
-+// configured extension list, or falls back to random permutation.
++// ssl_setup_extension_order builds the configured extension prefix and
++// shuffles the remaining extensions. With no configured order, it uses the
++// normal permutation setting.
 +bool ssl_setup_extension_order(SSL_HANDSHAKE *hs);
 +
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3386,6 +3404,10 @@ struct SSL_CONFIG {
+@@ -3386,6 +3405,10 @@ struct SSL_CONFIG {
    // crypto
    UniquePtr<SSLCipherPreferenceList> cipher_list;
  
@@ -915,7 +944,7 @@ index a8643452f..b631c016a 100644
    // This is used to hold the local certificate used (i.e. the server
    // certificate for a server or the client certificate for a client).
    UniquePtr<CERT> cert;
-@@ -3559,6 +3581,18 @@ struct SSL_CONFIG {
+@@ -3559,6 +3582,18 @@ struct SSL_CONFIG {
    // to negotiate and convey application settings.
    bool alps_use_new_codepoint : 1;
  
@@ -934,7 +963,7 @@ index a8643452f..b631c016a 100644
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
-@@ -4231,6 +4265,25 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4231,6 +4266,25 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // signal its sessions may be resumed across names in the server certificate.
    bool resumption_across_names_enabled : 1;
  
@@ -945,8 +974,8 @@ index a8643452f..b631c016a 100644
 +  // supported by the client.
 +  bssl::Array<uint16_t> delegated_credentials;
 +
-+  // ssl_extension_order, if not empty, will use this actions
-+  // as the order to be used to write the ssl extensions.
++  // extension_order stores wire extension IDs in the order requested by
++  // SSL_CTX_set_extension_order. An empty array leaves the order unset.
 +  bssl::Array<uint16_t> extension_order;
 +
 +  // preserve_tls13_cipher_list indicates that the TLS 1.3 cipher list order
@@ -1774,7 +1803,63 @@ index a8e308398..5a73a8d02 100644
  
        {"RSA+SHA256", true, {SSL_SIGN_RSA_PKCS1_SHA256}},
        {"RSA+SHA256:ed25519",
-@@ -10866,10 +10891,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
+@@ -10165,6 +10190,55 @@ TEST(SSLTest, PermuteExtensions) {
+   }
+ }
+ 
++TEST(SSLTest, ExtensionOrderPreservesPrefixAndShufflesRemainder) {
++  bssl::UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++  ASSERT_TRUE(ctx);
++
++  // boringssl.patch adds explicit extension ordering. Unknown and duplicate
++  // entries are ignored, while supported unlisted extensions are shuffled.
++  static const uint16_t kExtensionOrder[] = {
++      TLSEXT_TYPE_supported_versions,
++      0xffff,
++      TLSEXT_TYPE_supported_versions,
++      TLSEXT_TYPE_key_share,
++  };
++  static const uint16_t kExpectedPrefix[] = {
++      TLSEXT_TYPE_supported_versions,
++      TLSEXT_TYPE_key_share,
++  };
++  ASSERT_TRUE(SSL_CTX_set_extension_order(
++      ctx.get(), kExtensionOrder,
++      static_cast<int>(std::size(kExtensionOrder))));
++
++  const auto has_expected_prefix = [](const std::vector<uint16_t> &order) {
++    return order.size() >= std::size(kExpectedPrefix) &&
++           std::equal(std::begin(kExpectedPrefix), std::end(kExpectedPrefix),
++                      order.begin());
++  };
++
++  std::vector<uint16_t> first_order;
++  ASSERT_TRUE(GetExtensionOrder(ctx.get(), &first_order, /*ech_keys=*/nullptr,
++                                /*decrypt_ech=*/false));
++  ASSERT_TRUE(has_expected_prefix(first_order));
++  ASSERT_GE(first_order.size(), 5u);
++
++  // As in the upstream permutation test, repeat enough times to make an
++  // unchanged randomized suffix vanishingly unlikely.
++  static const int kNumIterations = 14;
++  bool suffix_changed = false;
++  for (int i = 0; i < kNumIterations; i++) {
++    std::vector<uint16_t> order;
++    ASSERT_TRUE(GetExtensionOrder(ctx.get(), &order, /*ech_keys=*/nullptr,
++                                  /*decrypt_ech=*/false));
++    ASSERT_TRUE(has_expected_prefix(order));
++    if (order != first_order) {
++      suffix_changed = true;
++      break;
++    }
++  }
++  EXPECT_TRUE(suffix_changed) << "Unlisted extensions were not shuffled";
++}
++
+ TEST(SSLTest, HostMatching) {
+   static const char kCertPEM[] = R"(
+ -----BEGIN CERTIFICATE-----
+@@ -10866,10 +10940,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
  
    static const uint16_t kDuplicatePrefs[] = {SSL_SIGN_RSA_PKCS1_SHA256,
                                               SSL_SIGN_RSA_PKCS1_SHA256};

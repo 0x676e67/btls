@@ -369,8 +369,10 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: '>=1.22.0'
-    - name: Install build tools (ninja, cmake)
-      run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+    - name: Install build tools (clang, ninja, cmake)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang libclang-rt-dev ninja-build cmake
     - name: Apply btls-sys patches
       working-directory: btls-sys/deps/boringssl
       run: |
@@ -378,9 +380,14 @@ jobs:
           echo "Applying $p"
           patch -p1 < "../../patches/$p"
         done
-    - name: Configure BoringSSL build
+    - name: Configure BoringSSL ASan build
       working-directory: btls-sys/deps/boringssl
-      run: cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release
+      run: >-
+        cmake -GNinja -B build
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        -DCMAKE_C_COMPILER=clang
+        -DCMAKE_CXX_COMPILER=clang++
+        -DASAN=1
     - name: Build BoringSSL
       working-directory: btls-sys/deps/boringssl
       run: ninja -C build
