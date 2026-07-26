@@ -2117,7 +2117,10 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_preserve_tls13_cipher_list(self.as_ptr(), enable as _) }
     }
 
-    /// Sets the indices of the extensions to be permuted.
+    /// Sets the ClientHello extension order.
+    ///
+    /// Known extensions stay in the configured order. Unlisted extensions are
+    /// appended in random order.
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_extension_order)]
     pub fn set_extension_permutation(
