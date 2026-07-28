@@ -2201,6 +2201,31 @@ impl SslContextBuilder {
         unsafe { cvt_0i(ffi::SSL_CTX_set_compliance_policy(self.as_ptr(), policy.0)).map(|_| ()) }
     }
 
+    /// Configures the context to request a certificate issued by one of the trust anchors in
+    /// `ids`.
+    ///
+    /// `ids` must be a list of trust anchor IDs in wire-format (a series of non-empty,
+    /// 8-bit length-prefixed strings). The list may describe the application's full list of
+    /// supported trust anchors, or a, possibly empty, subset.
+    ///
+    /// If `ids` is empty, the `trust_anchors` extension will still be sent in ClientHello. This
+    /// may be used by a client application to signal support for the retry flow without
+    /// requesting specific trust anchors.
+    ///
+    /// This does not directly impact certificate verification, only the list of trust anchors
+    /// sent to the peer.
+    #[corresponds(SSL_CTX_set1_requested_trust_anchors)]
+    pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Sets the context's info callback.
     #[corresponds(SSL_CTX_set_info_callback)]
     pub fn set_info_callback<F>(&mut self, callback: F)
@@ -4154,6 +4179,21 @@ impl SslRef {
                 self.as_ptr(),
                 key_shares.as_ptr() as *const _,
                 key_shares.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Like [`SslContextBuilder::set_requested_trust_anchors`].
+    ///
+    /// [`SslContextBuilder::set_requested_trust_anchors`]: struct.SslContextBuilder.html#method.set_requested_trust_anchors
+    #[corresponds(SSL_set1_requested_trust_anchors)]
+    pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
             ))
             .map(|_| ())
         }
