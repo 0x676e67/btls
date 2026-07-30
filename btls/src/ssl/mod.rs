@@ -89,7 +89,6 @@ use crate::pkey::{HasPrivate, PKeyRef, Params, Private};
 use crate::srtp::{SrtpProtectionProfile, SrtpProtectionProfileRef};
 use crate::ssl::bio::BioMethod;
 use crate::ssl::callbacks::*;
-#[cfg(not(feature = "fips"))]
 use crate::ssl::ech::SslEchKeys;
 use crate::ssl::error::InnerError;
 use crate::stack::{Stack, StackRef, Stackable};
@@ -197,9 +196,11 @@ bitflags! {
         const NO_DTLSV1_2 = ffi::SSL_OP_NO_DTLSv1_2 as _;
 
         /// Disallow all renegotiation in TLSv1.2 and earlier.
+        #[cfg(not(feature = "fips"))]
         const NO_RENEGOTIATION = ffi::SSL_OP_NO_RENEGOTIATION as _;
 
         /// Disables PSK with DHE.
+        #[cfg(not(feature = "fips"))]
         const NO_PSK_DHE_KE = ffi::SSL_OP_NO_PSK_DHE_KE as _;
     }
 }
@@ -819,8 +820,10 @@ impl KeyShare {
 
     pub const MLKEM1024: KeyShare = KeyShare(ffi::SSL_GROUP_MLKEM1024 as _);
 
+    #[cfg(not(feature = "fips"))]
     pub const FFDHE2048: KeyShare = KeyShare(ffi::SSL_GROUP_FFDHE2048 as _);
 
+    #[cfg(not(feature = "fips"))]
     pub const FFDHE3072: KeyShare = KeyShare(ffi::SSL_GROUP_FFDHE3072 as _);
 }
 
@@ -854,6 +857,7 @@ impl CertificateCompressionAlgorithm {
 
     pub const BROTLI: Self = Self(ffi::TLSEXT_cert_compression_brotli as u16);
 
+    #[cfg(not(feature = "fips"))]
     pub const ZSTD: Self = Self(ffi::TLSEXT_cert_compression_zstd as u16);
 }
 
