@@ -64,9 +64,9 @@ jobs:
           path: target
           key: clippy-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
       - name: Run clippy
-        run: cargo clippy --all --all-targets --features mlkem,prf -- -D warnings
+        run: cargo clippy --all --all-targets --features mlkem,prf,rpk,underscore-wildcards -- -D warnings
       - name: Check docs
-        run: cargo doc --no-deps -p btls -p btls-sys --features underscore-wildcards
+        run: cargo doc --no-deps -p btls -p btls-sys --features rpk,underscore-wildcards,mlkem
         env:
           CARGO_BUILD_RUSTDOCFLAGS: "--cfg=docsrs"
           RUSTC_BOOTSTRAP: 1
@@ -376,7 +376,13 @@ jobs:
     - name: Apply btls-sys patches
       working-directory: btls-sys/deps/boringssl
       run: |
-        for p in boring-pq.patch rpk.patch boringssl.patch underscore-wildcards.patch; do
+        for p in \
+          bad-cert-verification.patch \
+          boring-pq.patch \
+          rpk.patch \
+          boringssl.patch \
+          boringssl-loongarch.patch \
+          underscore-wildcards.patch; do
           echo "Applying $p"
           patch -p1 < "../../patches/$p"
         done
@@ -445,8 +451,15 @@ jobs:
           submodules: "recursive"
       - name: Install Rust (rustup)
         run: rustup update stable --no-self-update && rustup default stable
-      - name: Run `underscore-wildcards` tests
-        run: cargo test --features underscore-wildcards
+      - name: Run `rpk` and `underscore-wildcards` tests
+        run: cargo test --features rpk,underscore-wildcards -- --skip badssl_ciphers_negotiate
+      - name: Run `allow-crl-extensions-bad-version` tests
+        run: cargo test -p btls-sys --features allow-crl-extensions-bad-version
+      - name: Check `fips` Rust bindings
+        run: cargo check -p btls --features fips
+        env:
+          DOCS_RS: 1
+          CARGO_TARGET_DIR: target/fips-check
 
   crates:
     name: crates
