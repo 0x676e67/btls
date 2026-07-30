@@ -86,12 +86,6 @@ const BORINGSSL_PATCH_ADDED_CIPHERS: &[AddedCipher] = &[
         standard_name: "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
     },
     AddedCipher {
-        id: ffi::SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 as u16,
-        rule_name: "ECDHE-ECDSA-AES128-SHA256",
-        name: "ECDHE-ECDSA-AES128-SHA256",
-        standard_name: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-    },
-    AddedCipher {
         id: ffi::SSL_CIPHER_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 as u16,
         rule_name: "ECDHE-ECDSA-AES256-SHA384",
         name: "ECDHE-ECDSA-AES256-SHA384",

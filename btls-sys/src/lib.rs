@@ -16,10 +16,12 @@ use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
 #[allow(
-    clippy::useless_transmute,
     clippy::derive_partial_eq_without_eq,
     clippy::ptr_offset_with_cast,
-    dead_code
+    clippy::useless_transmute,
+    dead_code,
+    unknown_lints,
+    unnecessary_transmutes
 )]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
@@ -93,3 +95,6 @@ pub mod internal {
         ) -> c_int;
     }
 }
+
+#[cfg(test)]
+mod test;

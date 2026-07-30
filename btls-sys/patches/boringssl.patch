@@ -2,22 +2,14 @@ diff --git a/crypto/cipher/e_tls.cc b/crypto/cipher/e_tls.cc
 index 0edf61a24..f7d472a71 100644
 --- a/crypto/cipher/e_tls.cc
 +++ b/crypto/cipher/e_tls.cc
-@@ -336,8 +336,9 @@ static int aead_tls_openv(const EVP_AEAD_CTX *ctx,
-   iovecs_without_trailer.CopyFrom(iovecs);
-   uint8_t trailer_buf[EVP_MAX_MD_SIZE + 256];
-   const size_t trailer_len = std::min(in_len, mac_len + 256);
--  std::optional<Span<const uint8_t>> trailer = bssl::iovec::GetAndRemoveOutSuffix(
--      Span(trailer_buf).first(trailer_len), Span(iovecs_without_trailer));
-+  std::optional<Span<const uint8_t>> trailer =
-+      bssl::iovec::GetAndRemoveOutSuffix(Span(trailer_buf).first(trailer_len),
-+                                         Span(iovecs_without_trailer));
-   BSSL_CHECK(trailer.has_value());
- 
-   // Remove CBC padding. Code from here on is timing-sensitive with respect to
-@@ -442,6 +443,21 @@ static int aead_aes_256_cbc_sha1_tls_implicit_iv_init(
+@@ -442,6 +442,26 @@ static int aead_aes_256_cbc_sha1_tls_implicit_iv_init(
                         EVP_sha1(), 1);
  }
  
++// BoringSSL removed these SHA-2 CBC AEADs in
++// https://github.com/google/boringssl/commit/6e678eeb6e76171712ae00d467321b6fe196152d.
++// This restores the implementation immediately before that commit on the
++// current AEAD interface.
 +static int aead_aes_256_cbc_sha256_tls_init(EVP_AEAD_CTX *ctx,
 +                                            const uint8_t *key, size_t key_len,
 +                                            size_t tag_len,
@@ -25,6 +17,7 @@ index 0edf61a24..f7d472a71 100644
 +  return aead_tls_init(ctx, key, key_len, tag_len, dir, EVP_aes_256_cbc(),
 +                       EVP_sha256(), 0);
 +}
++
 +static int aead_aes_256_cbc_sha384_tls_init(EVP_AEAD_CTX *ctx,
 +                                            const uint8_t *key, size_t key_len,
 +                                            size_t tag_len,
@@ -36,11 +29,10 @@ index 0edf61a24..f7d472a71 100644
  static int aead_des_ede3_cbc_sha1_tls_init(EVP_AEAD_CTX *ctx,
                                             const uint8_t *key, size_t key_len,
                                             size_t tag_len,
-@@ -551,6 +567,39 @@ static const EVP_AEAD aead_aes_256_cbc_sha1_tls_implicit_iv = {
+@@ -551,6 +571,38 @@ static const EVP_AEAD aead_aes_256_cbc_sha1_tls_implicit_iv = {
      aead_tls_tag_len,
  };
  
-+
 +static const EVP_AEAD aead_aes_256_cbc_sha256_tls = {
 +    SHA256_DIGEST_LENGTH + 32,  // key len (SHA256 + AES256)
 +    16,                         // nonce len (IV)
@@ -76,7 +68,7 @@ index 0edf61a24..f7d472a71 100644
  static const EVP_AEAD aead_des_ede3_cbc_sha1_tls = {
      SHA_DIGEST_LENGTH + 24,  // key len (SHA1 + 3DES)
      8,                       // nonce len (IV)
-@@ -603,6 +652,14 @@ const EVP_AEAD *EVP_aead_aes_256_cbc_sha1_tls_implicit_iv() {
+@@ -603,6 +655,14 @@ const EVP_AEAD *EVP_aead_aes_256_cbc_sha1_tls_implicit_iv() {
    return &aead_aes_256_cbc_sha1_tls_implicit_iv;
  }
  
@@ -95,23 +87,40 @@ diff --git a/crypto/cipher/tls_cbc.cc b/crypto/cipher/tls_cbc.cc
 index dc7058e5b..fd184a076 100644
 --- a/crypto/cipher/tls_cbc.cc
 +++ b/crypto/cipher/tls_cbc.cc
-@@ -327,10 +327,89 @@ int bssl::EVP_sha256_final_with_secret_suffix(SHA256_CTX *ctx,
+@@ -327,10 +327,108 @@ int bssl::EVP_sha256_final_with_secret_suffix(SHA256_CTX *ctx,
    return 1;
  }
  
++// BoringSSL removed generic SHA-384 CBC verification in
++// https://github.com/google/boringssl/commit/c31fb79cfe35f8b14731bb2598d091b2e1394577.
++// This specialization follows the current SHA-256 secret-suffix design while
++// retaining SHA-384's 128-byte block and 16-byte length field. That design was
++// introduced in
++// https://github.com/google/boringssl/commit/b1c6f45f1fe6d808555d04a41bb44b322e4f4c1d.
++// The earlier SHA-384 variable-block correction is recorded in
++// https://github.com/google/boringssl/commit/144d924e0b3c3a5ceb7083a408ba69b7cca1a25c.
++// Its fixed variance count is replaced by the public max_len loop below.
 +static int sha384_final_with_secret_suffix(
 +    SHA512_CTX *ctx, uint8_t out[SHA384_DIGEST_LENGTH], const uint8_t *in,
 +    size_t len, size_t max_len) {
++  constexpr size_t kBlockSize = SHA384_CBLOCK;
++  constexpr size_t kLengthFieldSize = 2 * sizeof(uint64_t);
++  static_assert(SHA384_DIGEST_LENGTH == 48);
++  static_assert(kBlockSize == 128);
++  static_assert(kLengthFieldSize == 16);
++  static_assert(kBlockSize == SHA512_CBLOCK);
++
 +  // TLS records are much smaller than this bound. Keeping the total byte count
 +  // below 2^61 lets the SHA-384 bit length fit in the low half of its 128-bit
 +  // length field and also bounds the block-count arithmetic below.
 +  constexpr uint64_t kMaxBytes = UINT64_MAX >> 3;
 +  if (len > max_len || ctx->md_len != SHA384_DIGEST_LENGTH ||
++      ctx->num >= kBlockSize ||
 +      ctx->bytes_so_far_high != 0 ||
 +      ctx->bytes_so_far_low > kMaxBytes ||
 +      max_len > kMaxBytes - ctx->bytes_so_far_low ||
 +      max_len >
-+          SIZE_MAX - ctx->num - 1 - 16 - (SHA512_CBLOCK - 1)) {
++          SIZE_MAX - ctx->num - 1 - kLengthFieldSize - (kBlockSize - 1)) {
 +    return 0;
 +  }
 +
@@ -119,16 +128,18 @@ index dc7058e5b..fd184a076 100644
 +  // length field. See FIPS 180-4, sections 5.1.2 and 5.3.4.
 +  // https://doi.org/10.6028/NIST.FIPS.180-4
 +  size_t num_blocks =
-+      (ctx->num + len + 1 + 16 + SHA512_CBLOCK - 1) >> 7;
++      (ctx->num + len + 1 + kLengthFieldSize + kBlockSize - 1) / kBlockSize;
 +  size_t last_block = num_blocks - 1;
 +  size_t max_blocks =
-+      (ctx->num + max_len + 1 + 16 + SHA512_CBLOCK - 1) >> 7;
++      (ctx->num + max_len + 1 + kLengthFieldSize + kBlockSize - 1) /
++      kBlockSize;
 +
 +  uint64_t total_bits = (ctx->bytes_so_far_low + len) << 3;
-+  uint8_t length_bytes[8];
-+  CRYPTO_store_u64_be(length_bytes, total_bits);
++  uint8_t length_bytes[kLengthFieldSize] = {0};
++  CRYPTO_store_u64_be(
++      length_bytes + kLengthFieldSize - sizeof(total_bits), total_bits);
 +
-+  uint8_t block[SHA512_CBLOCK] = {0};
++  uint8_t block[kBlockSize] = {0};
 +  uint8_t result[SHA384_DIGEST_LENGTH] = {0};
 +  size_t input_idx = 0;
 +  for (size_t i = 0; i < max_blocks; i++) {
@@ -138,14 +149,14 @@ index dc7058e5b..fd184a076 100644
 +      block_start = ctx->num;
 +    }
 +    if (input_idx < max_len) {
-+      size_t to_copy = SHA512_CBLOCK - block_start;
++      size_t to_copy = kBlockSize - block_start;
 +      if (to_copy > max_len - input_idx) {
 +        to_copy = max_len - input_idx;
 +      }
 +      OPENSSL_memcpy(block + block_start, in + input_idx, to_copy);
 +    }
 +
-+    for (size_t j = block_start; j < SHA512_CBLOCK; j++) {
++    for (size_t j = block_start; j < kBlockSize; j++) {
 +      size_t idx = input_idx + j - block_start;
 +      uint8_t is_in_bounds =
 +          constant_time_lt_8(idx, value_barrier_w(len));
@@ -155,12 +166,12 @@ index dc7058e5b..fd184a076 100644
 +      block[j] |= 0x80 & is_padding_byte;
 +    }
 +
-+    input_idx += SHA512_CBLOCK - block_start;
++    input_idx += kBlockSize - block_start;
 +
 +    crypto_word_t is_last_block =
 +        value_barrier_w(constant_time_eq_w(i, last_block));
 +    for (size_t j = 0; j < sizeof(length_bytes); j++) {
-+      block[SHA512_CBLOCK - sizeof(length_bytes) + j] |=
++      block[kBlockSize - sizeof(length_bytes) + j] |=
 +          is_last_block & length_bytes[j];
 +    }
 +
@@ -185,7 +196,7 @@ index dc7058e5b..fd184a076 100644
        return 1;
      default:
        return 0;
-@@ -449,6 +528,57 @@ static int tls_cbc_digest_record_sha256(
+@@ -449,6 +547,57 @@ static int tls_cbc_digest_record_sha256(
    return 1;
  }
  
@@ -243,7 +254,7 @@ index dc7058e5b..fd184a076 100644
  int bssl::EVP_tls_cbc_digest_record(
      const EVP_MD *md, uint8_t *md_out, size_t *md_out_size,
      const uint8_t len_header[2], Span<const CRYPTO_IVEC> aadvecs,
-@@ -466,6 +596,11 @@ int bssl::EVP_tls_cbc_digest_record(
+@@ -466,6 +615,11 @@ int bssl::EVP_tls_cbc_digest_record(
            md_out, md_out_size, len_header, aadvecs, iovecs_without_trailer,
            trailer, data_in_trailer_size, mac_secret, mac_secret_length);
  
@@ -924,11 +935,14 @@ index a4a53cda6..49411378d 100644
        !ssl_encrypt_client_hello(hs, Span(ech_enc, ech_enc_len)) ||
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
-@@ -1051,7 +1070,26 @@ static enum ssl_hs_wait_t do_read_server_key_exchange(SSL_HANDSHAKE *hs) {
+@@ -1051,7 +1070,29 @@ static enum ssl_hs_wait_t do_read_server_key_exchange(SSL_HANDSHAKE *hs) {
      hs->peer_psk_identity_hint.reset(raw);
    }
  
 -  if (alg_k & SSL_kECDHE) {
++  // BoringSSL removed finite-field DHE client handling in
++  // https://github.com/google/boringssl/commit/7e06de5d2d1b53c57c0c81e8d6ba4122b64cf626.
++  // Keep this branch aligned with the implementation before that removal.
 +  if (alg_k & SSL_kDHE) {
 +    CBS dh_p, dh_g, dh_Ys;
 +    if (!CBS_get_u16_length_prefixed(&server_key_exchange, &dh_p) ||
@@ -952,7 +966,7 @@ index a4a53cda6..49411378d 100644
      // Parse the server parameters.
      uint8_t group_type;
      uint16_t group_id;
-@@ -1474,6 +1512,62 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
+@@ -1474,6 +1515,62 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
          !CBB_flush(&body)) {
        return ssl_hs_error;
      }
@@ -1189,9 +1203,9 @@ index 7799d79f9..de5159049 100644
 +
 +    // Ciphers 3C, 3D were removed in
 +    // https://boringssl-review.googlesource.com/c/boringssl/+/27944/
-+    // but restored here to impersonate browsers with older ciphers. They are
-+    // not expected to actually work; but just to be included in the TLS
-+    // Client Hello.
++    // and restored here for older browser profiles. The AEAD and constant-time
++    // record verifier are kept in this patch so both suites can negotiate and
++    // carry TLS 1.2 application data.
 +
 +    // TLS v1.2 ciphersuites
 +
@@ -1358,8 +1372,8 @@ index 7799d79f9..de5159049 100644
      {"HIGH", ~0u, ~0u, ~0u, ~0u, 0},
      {"FIPS", ~0u, ~0u, ~0u, ~0u, 0},
 +
-+    // Temporary no-op aliases corresponding to removed SHA-2 legacy CBC
-+    // ciphers. These should be removed after 2018-05-14.
++    // Legacy aliases corresponding to restored SHA-2 CBC cipher rules.
++    // Keep these aligned with the patch-owned cipher inventory.
 +    {"SHA256", ~0u, ~0u, ~0u, SSL_SHA256, 0},
 +    {"SHA384", ~0u, ~0u, ~0u, SSL_SHA384, 0},
  };
