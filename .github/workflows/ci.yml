@@ -358,6 +358,35 @@ jobs:
         shell: bash
         env: ${{ matrix.custom_env }}
 
+  test-fips:
+    name: Test FIPS integration
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+    - name: Install Rust (rustup)
+      run: rustup update stable --no-self-update && rustup default stable
+      shell: bash
+    - name: Install golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: '>=1.22.0'
+    - name: Run tests
+      run: cargo test --features fips
+    - name: Test btls-sys cargo publish (FIPS)
+      # Running `cargo publish --dry-run` tests two things:
+      #
+      # 1. That `btls-sys` can build BoringSSL with just the files included
+      #    in the crates.io package (as determined by the `include` field in
+      #    the `Cargo.toml`).
+      # 2. That the final `btls-sys` package size, including the BoringSSL
+      #    submodules, is not too large to be published to `crates.io`.
+      #
+      # Both of these may no longer be the case after updating the BoringSSL
+      # submodules to a new revision, so it's important to test this on CI.
+      run: cargo publish --dry-run -p btls-sys --features fips
+
   test-boringssl:
     name: Test BoringSSL upstream test suite
     runs-on: ubuntu-latest
@@ -455,11 +484,6 @@ jobs:
         run: cargo test --features rpk,underscore-wildcards -- --skip badssl_ciphers_negotiate
       - name: Run `allow-crl-extensions-bad-version` tests
         run: cargo test -p btls-sys --features allow-crl-extensions-bad-version
-      - name: Check `fips` Rust bindings
-        run: cargo check -p btls --features fips
-        env:
-          DOCS_RS: 1
-          CARGO_TARGET_DIR: target/fips-check
 
   crates:
     name: crates
