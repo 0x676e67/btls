@@ -2135,7 +2135,7 @@ impl SslContextBuilder {
             cvt(ffi::SSL_CTX_set_extension_order(
                 self.as_ptr(),
                 indices.as_ptr() as *const _,
-                indices.len() as _,
+                try_int(indices.len())?,
             ))
             .map(|_| ())
         }
