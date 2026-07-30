@@ -95,6 +95,3 @@ pub mod internal {
         ) -> c_int;
     }
 }
-
-#[cfg(test)]
-mod test;

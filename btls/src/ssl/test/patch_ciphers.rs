@@ -1,3 +1,5 @@
+#![cfg(not(feature = "fips"))]
+
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
@@ -13,7 +15,7 @@ use std::thread;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use std::time::{Duration, Instant};
 
-use crate as ffi;
+use crate::ffi;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CipherPeer {
@@ -125,14 +127,14 @@ enum Identity {
 impl Identity {
     fn certificate(self) -> &'static str {
         match self {
-            Self::Rsa => "rsa-cert.pem",
+            Self::Rsa => "cert.pem",
             Self::Ecdsa => "ecdsa-cert.pem",
         }
     }
 
     fn private_key(self) -> &'static str {
         match self {
-            Self::Rsa => "rsa-key.pem",
+            Self::Rsa => "key.pem",
             Self::Ecdsa => "ecdsa-key.pem",
         }
     }
@@ -363,9 +365,7 @@ impl SslPair {
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
         .join("test")
-        .join("data")
         .join(name)
 }
 
@@ -498,9 +498,9 @@ impl OpenSslServer {
             .arg("-accept")
             .arg(addr.to_string())
             .arg("-cert")
-            .arg(fixture_path("rsa-cert.pem"))
+            .arg(fixture_path("cert.pem"))
             .arg("-key")
-            .arg(fixture_path("rsa-key.pem"))
+            .arg(fixture_path("key.pem"))
             .arg("-dhparam")
             .arg(fixture_path("dhparams.pem"))
             .arg("-cipher")
