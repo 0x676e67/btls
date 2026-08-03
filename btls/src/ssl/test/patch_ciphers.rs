@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use std::{
-    net::{TcpListener, TcpStream},
-    os::fd::AsRawFd,
-    process::{Child, Command, Output, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+use std::net::{TcpListener, TcpStream};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::os::fd::AsRawFd;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::process::{Child, Command, Output, Stdio};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::thread;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::time::{Duration, Instant};
 
 use crate::ffi;
 
