@@ -21,9 +21,6 @@ default = ["btls/default"]
 # Use a FIPS-validated version of boringssl.
 fips = ["btls/fips"]
 
-# Enables Raw public key API (https://datatracker.ietf.org/doc/html/rfc7250)
-rpk = ["btls/rpk"]
-
 # Add a prefix to all symbols in libcrypto and libssl to prevent conflicts
 # with OpenSSL versions that might be linked in the same process.
 prefix-symbols = ["btls/prefix-symbols"]

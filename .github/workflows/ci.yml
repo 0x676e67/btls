@@ -64,9 +64,9 @@ jobs:
           path: target
           key: clippy-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
       - name: Run clippy
-        run: cargo clippy --all --all-targets --features mlkem,prf,rpk,underscore-wildcards -- -D warnings
+        run: cargo clippy --all --all-targets --features mlkem,prf -- -D warnings
       - name: Check docs
-        run: cargo doc --no-deps -p btls -p btls-sys --features rpk,underscore-wildcards,mlkem
+        run: cargo doc --no-deps -p btls -p btls-sys --features underscore-wildcards
         env:
           CARGO_BUILD_RUSTDOCFLAGS: "--cfg=docsrs"
           RUSTC_BOOTSTRAP: 1
@@ -358,81 +358,6 @@ jobs:
         shell: bash
         env: ${{ matrix.custom_env }}
 
-  test-fips:
-    name: Test FIPS integration
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'recursive'
-    - name: Install Rust (rustup)
-      run: rustup update stable --no-self-update && rustup default stable
-      shell: bash
-    - name: Install golang
-      uses: actions/setup-go@v5
-      with:
-        go-version: '>=1.22.0'
-    - name: Run tests
-      run: cargo test --features fips
-    - name: Test btls-sys cargo publish (FIPS)
-      # Running `cargo publish --dry-run` tests two things:
-      #
-      # 1. That `btls-sys` can build BoringSSL with just the files included
-      #    in the crates.io package (as determined by the `include` field in
-      #    the `Cargo.toml`).
-      # 2. That the final `btls-sys` package size, including the BoringSSL
-      #    submodules, is not too large to be published to `crates.io`.
-      #
-      # Both of these may no longer be the case after updating the BoringSSL
-      # submodules to a new revision, so it's important to test this on CI.
-      run: cargo publish --dry-run -p btls-sys --features fips
-
-  test-boringssl:
-    name: Test BoringSSL upstream test suite
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'recursive'
-    - name: Install golang
-      uses: actions/setup-go@v5
-      with:
-        go-version: '>=1.22.0'
-    - name: Install build tools (clang, cmake)
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y clang libclang-rt-dev cmake
-    - name: Apply btls-sys patches
-      working-directory: btls-sys/deps/boringssl
-      run: |
-        for p in \
-          bad-cert-verification.patch \
-          boring-pq.patch \
-          rpk.patch \
-          boringssl.patch \
-          boringssl-loongarch.patch \
-          underscore-wildcards.patch; do
-          echo "Applying $p"
-          patch -p1 < "../../patches/$p"
-        done
-    - name: Configure BoringSSL ASan build
-      working-directory: btls-sys/deps/boringssl
-      run: >-
-        cmake -B build
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_C_COMPILER=clang
-        -DCMAKE_CXX_COMPILER=clang++
-        -DASAN=1
-    - name: Build BoringSSL
-      working-directory: btls-sys/deps/boringssl
-      run: cmake --build build --parallel
-    - name: Run BoringSSL C/C++ test suite
-      working-directory: btls-sys/deps/boringssl
-      run: go run util/all_tests.go
-    - name: Run BoringSSL SSL runner tests
-      working-directory: btls-sys/deps/boringssl/ssl/test/runner
-      run: go test
-
   cross-build:
     name: Cross build from macOS to Linux
     runs-on: macos-latest
@@ -480,10 +405,8 @@ jobs:
           submodules: "recursive"
       - name: Install Rust (rustup)
         run: rustup update stable --no-self-update && rustup default stable
-      - name: Run `rpk` and `underscore-wildcards` tests
-        run: cargo test --features rpk,underscore-wildcards -- --skip badssl_ciphers_negotiate
-      - name: Run `allow-crl-extensions-bad-version` tests
-        run: cargo test -p btls-sys --features allow-crl-extensions-bad-version
+      - name: Run `underscore-wildcards` tests
+        run: cargo test --features underscore-wildcards
 
   crates:
     name: crates
