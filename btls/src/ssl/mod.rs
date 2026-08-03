@@ -199,7 +199,12 @@ bitflags! {
         #[cfg(not(feature = "fips"))]
         const NO_RENEGOTIATION = ffi::SSL_OP_NO_RENEGOTIATION as _;
 
-        /// Disables PSK with DHE.
+        /// Disables TLS 1.3 PSK resumption and 0-RTT by omitting PSK-DHE-KE.
+        ///
+        /// BoringSSL does not implement PSK-KE, so disabling PSK-DHE-KE also prevents the client
+        /// from offering a pre-shared key. See [RFC 8446 section 4.2.9].
+        ///
+        /// [RFC 8446 section 4.2.9]: https://www.rfc-editor.org/rfc/rfc8446#section-4.2.9
         #[cfg(not(feature = "fips"))]
         const NO_PSK_DHE_KE = ffi::SSL_OP_NO_PSK_DHE_KE as _;
     }
