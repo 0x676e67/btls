@@ -213,6 +213,10 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     let src_path = get_boringssl_source_path(config);
     let mut boringssl_cmake = cmake::Config::new(src_path);
 
+    // google/benchmark runs feature checks during BoringSSL configuration. Keep
+    // dependency builds from treating MSVC STL warnings as fatal in those probes.
+    boringssl_cmake.define("BENCHMARK_ENABLE_WERROR", "OFF");
+
     if config.env.cmake_toolchain_file.is_some() {
         return boringssl_cmake;
     }
@@ -468,17 +472,29 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         run_command(Command::new("git").arg("init").current_dir(src_path))?;
     }
 
+    if config.features.allow_crl_extensions_bad_version {
+        println!(
+            "cargo:warning=applying the patch for disabling cert version \
+            validation for extensions"
+        );
+        apply_patch(config, "bad-cert-verification.patch")?;
+    }
+
     println!("cargo:warning=applying post quantum crypto patch to boringssl");
     apply_patch(config, "boring-pq.patch")?;
 
-    println!("cargo:warning=applying patch to boringssl");
-    apply_patch(config, "boringssl.patch")?;
+    if config.features.rpk {
+        println!("cargo:warning=applying RPK patch to boringssl");
+        apply_patch(config, "rpk.patch")?;
+    }
+
+    if !config.features.fips {
+        println!("cargo:warning=applying patch to boringssl");
+        apply_patch(config, "boringssl.patch")?;
+    }
 
     println!("cargo:warning=applying loongarch patch to boringssl");
     apply_patch(config, "boringssl-loongarch.patch")?;
-
-    println!("cargo:warning=applying windows cross compile patch to boringssl");
-    apply_patch(config, "boringssl-windows.patch")?;
 
     if config.features.underscore_wildcards {
         println!("cargo:warning=applying underscore wildcards patch to boringssl");

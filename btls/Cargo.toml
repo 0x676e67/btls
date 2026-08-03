@@ -13,7 +13,7 @@ edition = { workspace = true }
 rust-version = { workspace = true }
 
 [package.metadata.docs.rs]
-features = ["underscore-wildcards"]
+features = ["rpk", "underscore-wildcards"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
@@ -33,6 +33,13 @@ prf = []
 
 # SslCredential API
 credential = []
+
+# Enables Raw public key API (https://datatracker.ietf.org/doc/html/rfc7250)
+# This feature is necessary in order to compile the bindings for the
+# default branch of BoringSSL. Alternatively, a version of BoringSSL that
+# implements the same feature set can be provided by setting
+# `BORING_BSSL{,_FIPS}_SOURCE_PATH` and `BORING_BSSL{,_FIPS}_ASSUME_PATCHED`.
+rpk = ["credential", "btls-sys/rpk"]
 
 # Applies a patch to enable `ffi::X509_CHECK_FLAG_UNDERSCORE_WILDCARDS`. This
 # feature is necessary in order to compile the bindings for the default branch
