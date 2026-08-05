@@ -267,7 +267,7 @@ index dc7058e5b..41ae5ea30 100644
        // EVP_tls_cbc_record_digest_supported should have been called first to
        // check that the hash function is supported.
 diff --git a/crypto/obj/obj_dat.h b/crypto/obj/obj_dat.h
-index 40b5278fc..b0033f6d8 100644
+index 40b5278fc..238e8c1be 100644
 --- a/crypto/obj/obj_dat.h
 +++ b/crypto/obj/obj_dat.h
 @@ -16,7 +16,7 @@
@@ -275,20 +275,29 @@ index 40b5278fc..b0033f6d8 100644
  
  BSSL_NAMESPACE_BEGIN
 -#define NUM_NID 973
-+#define NUM_NID 975
++#define NUM_NID 976
  
  static const uint8_t kObjectData[] = {
      /* NID_rsadsi */
-@@ -8803,6 +8803,8 @@ static const ASN1_OBJECT kObjects[NUM_NID] = {
+@@ -8803,6 +8803,9 @@ static const ASN1_OBJECT kObjects[NUM_NID] = {
      {"P256Kyber768Draft00", "P256Kyber768Draft00", NID_P256Kyber768Draft00, 0,
       NULL, 0},
      {"X-Wing", "X-Wing", NID_X_Wing, 0, NULL, 0},
 +    {"ffdhe2048", "ffdhe2048", NID_ffdhe2048, 0, NULL, 0},
 +    {"ffdhe3072", "ffdhe3072", NID_ffdhe3072, 0, NULL, 0},
++    {"KxDHE", "kx-dhe", NID_kx_dhe, 0, NULL, 0},
  };
  
  static const uint16_t kNIDsInShortNameOrder[] = {
-@@ -9149,6 +9151,8 @@ static const uint16_t kNIDsInShortNameOrder[] = {
+@@ -8914,6 +8917,7 @@ static const uint16_t kNIDsInShortNameOrder[] = {
+     646 /* JOINT-ISO-ITU-T */,
+     773 /* KISA */,
+     957 /* KxANY */,
++    975 /* KxDHE */,
+     952 /* KxECDHE */,
+     953 /* KxPSK */,
+     951 /* KxRSA */,
+@@ -9149,6 +9153,8 @@ static const uint16_t kNIDsInShortNameOrder[] = {
      372 /* extendedStatus */,
      867 /* facsimileTelephoneNumber */,
      462 /* favouriteDrink */,
@@ -297,7 +306,7 @@ index 40b5278fc..b0033f6d8 100644
      857 /* freshestCRL */,
      453 /* friendlyCountry */,
      490 /* friendlyCountryName */,
-@@ -10126,6 +10130,8 @@ static const uint16_t kNIDsInLongNameOrder[] = {
+@@ -10126,6 +10132,8 @@ static const uint16_t kNIDsInLongNameOrder[] = {
      56 /* extendedCertificateAttributes */,
      867 /* facsimileTelephoneNumber */,
      462 /* favouriteDrink */,
@@ -306,18 +315,27 @@ index 40b5278fc..b0033f6d8 100644
      453 /* friendlyCountry */,
      490 /* friendlyCountryName */,
      156 /* friendlyName */,
+@@ -10380,6 +10388,7 @@ static const uint16_t kNIDsInLongNameOrder[] = {
+     150 /* keyBag */,
+     773 /* kisa */,
+     957 /* kx-any */,
++    975 /* kx-dhe */,
+     952 /* kx-ecdhe */,
+     953 /* kx-psk */,
+     951 /* kx-rsa */,
 diff --git a/crypto/obj/obj_mac.num b/crypto/obj/obj_mac.num
-index 25eac5075..88028c1d5 100644
+index 25eac5075..a926c44cd 100644
 --- a/crypto/obj/obj_mac.num
 +++ b/crypto/obj/obj_mac.num
-@@ -960,3 +960,5 @@ ML_DSA_87		969
+@@ -960,3 +960,6 @@ ML_DSA_87		969
  ML_KEM_768		970
  P256Kyber768Draft00		971
  X_Wing		972
 +ffdhe2048		973
 +ffdhe3072		974
++kx_dhe		975
 diff --git a/crypto/obj/objects.txt b/crypto/obj/objects.txt
-index 384b25753..4df384560 100644
+index 384b25753..19e444f33 100644
 --- a/crypto/obj/objects.txt
 +++ b/crypto/obj/objects.txt
 @@ -1343,6 +1343,10 @@ secg-scheme 14 3 : dhSinglePass-cofactorDH-sha512kdf-scheme
@@ -331,6 +349,14 @@ index 384b25753..4df384560 100644
  # NIDs for PQ/T hybrid KEMs (no corresponding OIDs).
  # See draft-irtf-cfrg-concrete-hybrid-kems.
   : X-Wing
+@@ -1358,6 +1362,7 @@ secg-scheme 14 3 : dhSinglePass-cofactorDH-sha512kdf-scheme
+ # NIDs for TLS 1.2 cipher suite key exchanges.
+  : KxRSA : kx-rsa
+  : KxECDHE : kx-ecdhe
++ : KxDHE : kx-dhe
+  : KxPSK : kx-psk
+ 
+ # NIDs for TLS 1.2 cipher suite authentication types.
 diff --git a/include/openssl/aead.h b/include/openssl/aead.h
 index 6b8ad575a..3ff2a5328 100644
 --- a/include/openssl/aead.h
@@ -345,10 +371,10 @@ index 6b8ad575a..3ff2a5328 100644
  OPENSSL_EXPORT const EVP_AEAD *EVP_aead_des_ede3_cbc_sha1_tls_implicit_iv(void);
  
 diff --git a/include/openssl/nid.h b/include/openssl/nid.h
-index 09af03d11..d68290da3 100644
+index 09af03d11..61082b8db 100644
 --- a/include/openssl/nid.h
 +++ b/include/openssl/nid.h
-@@ -5514,6 +5514,12 @@ extern "C" {
+@@ -5514,6 +5514,16 @@ extern "C" {
  #define SN_X_Wing "X-Wing"
  #define NID_X_Wing 972
  
@@ -358,11 +384,15 @@ index 09af03d11..d68290da3 100644
 +#define SN_ffdhe3072 "ffdhe3072"
 +#define NID_ffdhe3072 974
 +
++#define SN_kx_dhe "KxDHE"
++#define LN_kx_dhe "kx-dhe"
++#define NID_kx_dhe 975
++
  
  #if defined(__cplusplus)
  } /* extern C */
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 8a7c717eb..418f541a4 100644
+index 8a7c717eb..d78663878 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -631,6 +631,12 @@ OPENSSL_EXPORT int SSL_version(const SSL *ssl);
@@ -441,6 +471,19 @@ index 8a7c717eb..418f541a4 100644
  // SSL_get_cipher_by_value returns the structure representing a TLS cipher
  // suite based on its assigned number, or NULL if unknown. See
  // https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml#tls-parameters-4.
+@@ -1550,9 +1586,9 @@ OPENSSL_EXPORT int SSL_CIPHER_get_cipher_nid(const SSL_CIPHER *cipher);
+ OPENSSL_EXPORT int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *cipher);
+ 
+ // SSL_CIPHER_get_kx_nid returns the NID for `cipher`'s key exchange. This may
+-// be `NID_kx_rsa`, `NID_kx_ecdhe`, or `NID_kx_psk` for TLS 1.2. In TLS 1.3,
+-// cipher suites do not specify the key exchange, so this function returns
+-// `NID_kx_any`.
++// be `NID_kx_rsa`, `NID_kx_dhe`, `NID_kx_ecdhe`, or `NID_kx_psk` for TLS 1.2.
++// In TLS 1.3, cipher suites do not specify the key exchange, so this function
++// returns `NID_kx_any`.
+ OPENSSL_EXPORT int SSL_CIPHER_get_kx_nid(const SSL_CIPHER *cipher);
+ 
+ // SSL_CIPHER_get_auth_nid returns the NID for `cipher`'s authentication
 @@ -2622,6 +2658,9 @@ OPENSSL_EXPORT size_t SSL_CTX_get_num_tickets(const SSL_CTX *ctx);
  #define SSL_GROUP_MLKEM1024 0x0202
  #define SSL_GROUP_P256_KYBER768_DRAFT00 0xfe32
@@ -1190,7 +1233,7 @@ index a8643452f..20f9dd461 100644
    friend RefCounted;
    ~SSLContext();
 diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
-index 7799d79f9..bd16f734b 100644
+index 7799d79f9..1bc769332 100644
 --- a/ssl/ssl_cipher.cc
 +++ b/ssl/ssl_cipher.cc
 @@ -63,6 +63,18 @@ static constexpr SSL_CIPHER kCiphers[] = {
@@ -1203,7 +1246,7 @@ index 7799d79f9..bd16f734b 100644
 +        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES128,
 +        SSL_SHA1,
 +        SSL_HANDSHAKE_MAC_DEFAULT,
@@ -1222,7 +1265,7 @@ index 7799d79f9..bd16f734b 100644
 +        "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES256,
 +        SSL_SHA1,
 +        SSL_HANDSHAKE_MAC_DEFAULT,
@@ -1266,7 +1309,7 @@ index 7799d79f9..bd16f734b 100644
 +        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA256",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA256,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES128,
 +        SSL_SHA256,
 +        SSL_HANDSHAKE_MAC_SHA256,
@@ -1278,7 +1321,7 @@ index 7799d79f9..bd16f734b 100644
 +        "TLS_DHE_RSA_WITH_AES_256_CBC_SHA256",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA256,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES256,
 +        SSL_SHA256,
 +        SSL_HANDSHAKE_MAC_SHA256,
@@ -1297,7 +1340,7 @@ index 7799d79f9..bd16f734b 100644
 +        "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_128_GCM_SHA256,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES128GCM,
 +        SSL_AEAD,
 +        SSL_HANDSHAKE_MAC_SHA256,
@@ -1309,7 +1352,7 @@ index 7799d79f9..bd16f734b 100644
 +        "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_256_GCM_SHA384,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES256GCM,
 +        SSL_AEAD,
 +        SSL_HANDSHAKE_MAC_SHA384,
@@ -1394,7 +1437,30 @@ index 7799d79f9..bd16f734b 100644
      // GCM based TLS v1.2 ciphersuites from RFC 5289
  
      // Cipher C02B
-@@ -454,6 +606,11 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+@@ -411,6 +563,13 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+     // multiple key exchange algs according to the RFCs.
+     {"kRSA", SSL_kRSA, ~0u, ~0u, ~0u, 0},
+ 
++    // Finite-field DHE support was removed in
++    // https://github.com/google/boringssl/commit/7e06de5d2d1b53c57c0c81e8d6ba4122b64cf626.
++    // Keep the legacy OpenSSL aliases for the client support restored here.
++    {"kDHE", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"kEDH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"DH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++
+     {"kECDHE", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"kEECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"ECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+@@ -424,6 +583,8 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+     {"aPSK", ~0u, SSL_aPSK, ~0u, ~0u, 0},
+ 
+     // aliases combining key exchange and server authentication
++    {"DHE", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"EDH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
+     {"ECDHE", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"EECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"RSA", SSL_kRSA, SSL_aRSA_SIGN | SSL_aRSA_DECRYPT, ~0u, ~0u, 0},
+@@ -454,6 +615,11 @@ static const CIPHER_ALIAS kCipherAliases[] = {
      // Legacy strength classes.
      {"HIGH", ~0u, ~0u, ~0u, ~0u, 0},
      {"FIPS", ~0u, ~0u, ~0u, ~0u, 0},
@@ -1406,7 +1472,7 @@ index 7799d79f9..bd16f734b 100644
  };
  
  static const size_t kCipherAliasesLen = std::size(kCipherAliases);
-@@ -523,11 +680,19 @@ bool ssl_cipher_get_evp_aead(const EVP_AEAD **out_aead,
+@@ -523,11 +689,19 @@ bool ssl_cipher_get_evp_aead(const EVP_AEAD **out_aead,
    } else if (cipher->algorithm_mac == SSL_SHA256) {
      if (cipher->algorithm_enc == SSL_AES128) {
        *out_aead = EVP_aead_aes_128_cbc_sha256_tls();
@@ -1426,7 +1492,7 @@ index 7799d79f9..bd16f734b 100644
    } else {
      return false;
    }
-@@ -1009,6 +1174,80 @@ static bool ssl_cipher_process_rulestr(const char *rule_str,
+@@ -1009,6 +1183,80 @@ static bool ssl_cipher_process_rulestr(const char *rule_str,
    return true;
  }
  
@@ -1507,7 +1573,7 @@ index 7799d79f9..bd16f734b 100644
  bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
                              const bool has_aes_hw, const char *rule_str,
                              bool strict) {
-@@ -1031,6 +1270,8 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -1031,6 +1279,8 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
        SSL_CIPHER_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
    };
    static const uint16_t kLegacyCiphers[] = {
@@ -1516,7 +1582,7 @@ index 7799d79f9..bd16f734b 100644
        SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
        SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA,
        SSL_CIPHER_ECDHE_PSK_WITH_AES_128_CBC_SHA,
-@@ -1038,14 +1279,24 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -1038,14 +1288,24 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
        SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA,
        SSL_CIPHER_ECDHE_PSK_WITH_AES_256_CBC_SHA,
        SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
@@ -1541,7 +1607,16 @@ index 7799d79f9..bd16f734b 100644
    };
  
    // Set up a linked list of ciphers.
-@@ -1274,6 +1525,8 @@ int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *cipher) {
+@@ -1168,7 +1428,7 @@ bool ssl_cipher_uses_certificate_auth(const SSL_CIPHER *cipher) {
+ bool ssl_cipher_requires_server_key_exchange(const SSL_CIPHER *cipher) {
+   // Ephemeral Diffie-Hellman key exchanges require a ServerKeyExchange. It is
+   // optional or omitted in all others.
+-  return (cipher->algorithm_mkey & SSL_kECDHE) != 0;
++  return (cipher->algorithm_mkey & (SSL_kDHE | SSL_kECDHE)) != 0;
+ }
+ 
+ size_t ssl_cipher_get_record_split_len(const SSL_CIPHER *cipher) {
+@@ -1274,6 +1534,8 @@ int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *cipher) {
        return NID_sha1;
      case SSL_SHA256:
        return NID_sha256;
@@ -1550,7 +1625,38 @@ index 7799d79f9..bd16f734b 100644
    }
    assert(0);
    return NID_undef;
-@@ -1538,6 +1791,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
+@@ -1283,6 +1545,8 @@ int SSL_CIPHER_get_kx_nid(const SSL_CIPHER *cipher) {
+   switch (cipher->algorithm_mkey) {
+     case SSL_kRSA:
+       return NID_kx_rsa;
++    case SSL_kDHE:
++      return NID_kx_dhe;
+     case SSL_kECDHE:
+       return NID_kx_ecdhe;
+     case SSL_kPSK:
+@@ -1381,6 +1645,10 @@ const char *SSL_CIPHER_get_kx_name(const SSL_CIPHER *cipher) {
+     case SSL_kRSA:
+       return "RSA";
+ 
++    case SSL_kDHE:
++      assert(cipher->algorithm_auth == SSL_aRSA_SIGN);
++      return "DHE_RSA";
++
+     case SSL_kECDHE:
+       switch (cipher->algorithm_auth) {
+         case SSL_aECDSA:
+@@ -1460,6 +1728,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
+       kx = "RSA";
+       break;
+ 
++    case SSL_kDHE:
++      kx = "DH";
++      break;
++
+     case SSL_kECDHE:
+       kx = "ECDH";
+       break;
+@@ -1538,6 +1810,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
        mac = "SHA256";
        break;
  

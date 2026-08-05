@@ -4,6 +4,8 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
+use foreign_types::ForeignTypeRef;
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use std::{
     net::{TcpListener, TcpStream},
@@ -13,7 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::ffi;
+use crate::ssl::{SslCipher, SslContext as PublicSslContext, SslMethod};
+use crate::{ffi, nid::Nid};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CipherPeer {
@@ -108,6 +111,8 @@ const BORINGSSL_PATCH_ADDED_CIPHERS: &[AddedCipher] = &[
         peer: CipherPeer::BoringSslRsa,
     },
 ];
+
+const BORINGSSL_PATCH_DHE_ALIASES: &[&str] = &["kDHE", "kEDH", "DH", "DHE", "EDH"];
 
 // The 42/43-byte pair crosses SHA-256's 64-byte final-block boundary after
 // TLS's 13-byte MAC header, 0x80 marker, and 8-byte length field. The 98/99-byte
@@ -415,6 +420,19 @@ fn payload(len: usize) -> Vec<u8> {
     (0..len).map(|index| (index % 251) as u8).collect()
 }
 
+fn cipher_ids_for_rule(rule: &str) -> Vec<u16> {
+    let mut context = PublicSslContext::builder(SslMethod::tls()).unwrap();
+    context.set_strict_cipher_list(rule).unwrap();
+    let mut ids = context
+        .ciphers()
+        .expect("cipher rule produced no cipher stack")
+        .iter()
+        .map(|cipher| cipher.protocol_id())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
 fn negotiate_with_boringssl(cipher: &AddedCipher, record_lengths: impl IntoIterator<Item = usize>) {
     let identity = match cipher.peer {
         CipherPeer::BoringSslRsa => Identity::Rsa,
@@ -479,6 +497,66 @@ fn boringssl_patch_sha2_cbc_record_lengths_are_exhaustive() {
             _ => continue,
         };
         negotiate_with_boringssl(cipher, 1..=max_len);
+    }
+}
+
+#[test]
+fn boringssl_patch_dhe_aliases_select_every_restored_dhe_cipher() {
+    ffi::init();
+    let mut expected = BORINGSSL_PATCH_ADDED_CIPHERS
+        .iter()
+        .filter(|cipher| cipher.peer == CipherPeer::OpenSslDhe)
+        .map(|cipher| cipher.id)
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+
+    for alias in BORINGSSL_PATCH_DHE_ALIASES {
+        assert_eq!(
+            cipher_ids_for_rule(alias),
+            expected,
+            "{alias} did not select the complete restored DHE cipher set",
+        );
+    }
+}
+
+#[test]
+fn boringssl_patch_dhe_ciphers_report_complete_metadata() {
+    ffi::init();
+    for added in BORINGSSL_PATCH_ADDED_CIPHERS
+        .iter()
+        .filter(|cipher| cipher.peer == CipherPeer::OpenSslDhe)
+    {
+        let cipher = SslCipher::from_value(added.id)
+            .unwrap_or_else(|| panic!("{} is missing", added.rule_name));
+        let kx_nid = unsafe { ffi::SSL_CIPHER_get_kx_nid(cipher.as_ptr()) };
+        assert_ne!(kx_nid, 0, "{} has no key-exchange NID", added.rule_name);
+        assert_eq!(
+            Nid::from_raw(kx_nid).short_name().unwrap(),
+            "KxDHE",
+            "{} reports the wrong key-exchange NID",
+            added.rule_name,
+        );
+        assert_eq!(
+            cipher
+                .cipher_auth_nid()
+                .expect("DHE_RSA cipher has no authentication NID")
+                .short_name()
+                .unwrap(),
+            "AuthRSA",
+            "{} reports the wrong authentication NID",
+            added.rule_name,
+        );
+
+        let kx_name = unsafe { ffi::SSL_CIPHER_get_kx_name(cipher.as_ptr()) };
+        assert!(!kx_name.is_null());
+        assert_eq!(unsafe { CStr::from_ptr(kx_name) }.to_bytes(), b"DHE_RSA");
+
+        let description = cipher.description();
+        assert!(
+            description.contains("Kx=DH") && description.contains("Au=RSA"),
+            "{} has incomplete metadata: {description}",
+            added.rule_name,
+        );
     }
 }
 
