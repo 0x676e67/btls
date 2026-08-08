@@ -1,8 +1,9 @@
 #![cfg(not(feature = "fips"))]
 
-use std::ffi::CStr;
+use std::ffi::{c_int, c_void, CStr};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::slice;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,7 +11,61 @@ use foreign_types::ForeignTypeRef;
 
 use super::server::Server;
 use crate::ffi;
-use crate::ssl::{ExtensionType, SslConnector, SslMethod, SslSignatureAlgorithm, SslVersion};
+use crate::ssl::{
+    ExtensionType, SslConnector, SslContextBuilder, SslMethod, SslSignatureAlgorithm, SslVersion,
+};
+
+type RecordHeaders = Arc<Mutex<Vec<[u8; 5]>>>;
+
+unsafe extern "C" fn capture_record_header(
+    is_write: c_int,
+    _version: c_int,
+    content_type: c_int,
+    buf: *const c_void,
+    len: usize,
+    _ssl: *mut ffi::SSL,
+    arg: *mut c_void,
+) {
+    if is_write != 1
+        || content_type != ffi::SSL3_RT_HEADER
+        || len != ffi::SSL3_RT_HEADER_LENGTH as usize
+        || buf.is_null()
+        || arg.is_null()
+    {
+        return;
+    }
+
+    let mut header = [0; 5];
+    // SAFETY: BoringSSL documents a five-byte buffer for SSL3_RT_HEADER. The
+    // callback argument points to Arc-owned storage, and each context and stream
+    // using the callback is dropped before that storage leaves scope.
+    header.copy_from_slice(unsafe { slice::from_raw_parts(buf.cast(), len) });
+    let headers = unsafe { &*arg.cast::<Mutex<Vec<[u8; 5]>>>() };
+    if let Ok(mut headers) = headers.lock() {
+        headers.push(header);
+    }
+}
+
+fn capture_record_headers(ctx: &mut SslContextBuilder, headers: &RecordHeaders) {
+    unsafe {
+        ffi::SSL_CTX_set_msg_callback(ctx.as_ptr(), Some(capture_record_header));
+        ffi::SSL_CTX_set_msg_callback_arg(ctx.as_ptr(), Arc::as_ptr(headers) as *mut c_void);
+    }
+}
+
+fn clear_record_headers(headers: &RecordHeaders) {
+    headers.lock().unwrap().clear();
+}
+
+fn application_record_lengths(headers: &RecordHeaders) -> Vec<usize> {
+    headers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|header| header[0] == ffi::SSL3_RT_APPLICATION_DATA as u8)
+        .map(|header| u16::from_be_bytes([header[3], header[4]]) as usize)
+        .collect()
+}
 
 fn u16_list(bytes: &[u8]) -> Vec<u16> {
     bytes
@@ -259,7 +314,9 @@ fn boringssl_patch_clienthello_extensions_are_sent() {
         .ctx()
         .set_max_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
-    client.ctx().set_record_size_limit(1200);
+    // The RFC minimum is 64. The existing void setter preserves compatibility
+    // by clamping smaller nonzero values instead of emitting an invalid value.
+    client.ctx().set_record_size_limit(1);
     client
         .ctx()
         .set_delegated_credentials("rsa_pss_rsae_sha256:ecdsa_secp256r1_sha256")
@@ -269,11 +326,156 @@ fn boringssl_patch_clienthello_extensions_are_sent() {
 
     assert_eq!(
         record_size_limit.lock().unwrap().as_deref(),
-        Some(&[0x04, 0xb0][..]),
+        Some(&[0x00, 0x40][..]),
     );
     assert_eq!(
         delegated_credential.lock().unwrap().as_deref(),
         Some(&[0x00, 0x04, 0x08, 0x04, 0x04, 0x03][..]),
+    );
+}
+
+const RECORD_SIZE_LIMIT_TEST_DATA_LEN: usize = 1600;
+
+fn configure_record_size_limit_context(
+    ctx: &mut SslContextBuilder,
+    version: SslVersion,
+    limit: Option<u16>,
+    headers: &RecordHeaders,
+) {
+    ctx.set_min_proto_version(Some(version)).unwrap();
+    ctx.set_max_proto_version(Some(version)).unwrap();
+    if version == SslVersion::TLS1_2 {
+        ctx.set_cipher_list("ECDHE-RSA-AES128-GCM-SHA256").unwrap();
+    }
+    if let Some(limit) = limit {
+        ctx.set_record_size_limit(limit);
+    }
+    capture_record_headers(ctx, headers);
+}
+
+fn expected_record_lengths(
+    mut remaining: usize,
+    max_application_data: usize,
+    record_overhead: usize,
+) -> Vec<usize> {
+    let mut lengths = Vec::new();
+    while remaining != 0 {
+        let fragment = remaining.min(max_application_data);
+        lengths.push(fragment + record_overhead);
+        remaining -= fragment;
+    }
+    lengths
+}
+
+fn assert_record_size_limit_records(
+    version: SslVersion,
+    client_receive_limit: Option<u16>,
+    server_receive_limit: Option<u16>,
+    expected_client_records: &[usize],
+    expected_server_records: &[usize],
+) {
+    let client_headers = RecordHeaders::default();
+    let server_headers = RecordHeaders::default();
+
+    let mut server = Server::builder();
+    configure_record_size_limit_context(
+        server.ctx(),
+        version,
+        server_receive_limit,
+        &server_headers,
+    );
+    let server_headers_for_io = Arc::clone(&server_headers);
+    server.io_cb(move |mut stream| {
+        // Server::Builder writes a one-byte handshake sentinel first. Start the
+        // measurement after it so only the test payload remains.
+        clear_record_headers(&server_headers_for_io);
+        let mut received = vec![0; RECORD_SIZE_LIMIT_TEST_DATA_LEN];
+        stream.read_exact(&mut received).unwrap();
+        assert!(received.iter().all(|&byte| byte == 0x43));
+        stream
+            .write_all(&vec![0x53; RECORD_SIZE_LIMIT_TEST_DATA_LEN])
+            .unwrap();
+    });
+    let server = server.build();
+
+    let mut client = server.client_with_root_ca();
+    configure_record_size_limit_context(
+        client.ctx(),
+        version,
+        client_receive_limit,
+        &client_headers,
+    );
+    let mut stream = client.connect();
+    clear_record_headers(&client_headers);
+
+    stream
+        .write_all(&vec![0x43; RECORD_SIZE_LIMIT_TEST_DATA_LEN])
+        .unwrap();
+    let mut response = vec![0; RECORD_SIZE_LIMIT_TEST_DATA_LEN];
+    stream.read_exact(&mut response).unwrap();
+    assert!(response.iter().all(|&byte| byte == 0x53));
+
+    drop(stream);
+    drop(server);
+
+    assert_eq!(
+        application_record_lengths(&client_headers),
+        expected_client_records,
+        "client records did not follow the server's receive limit",
+    );
+    assert_eq!(
+        application_record_lengths(&server_headers),
+        expected_server_records,
+        "server records did not follow the client's receive limit",
+    );
+}
+
+#[test]
+fn record_size_limit_patch_tls12_is_asymmetric() {
+    // record-size-limit.patch implements the RFC 8449 record behavior that
+    // upstream BoringSSL does not provide. TLS 1.2 AES-GCM adds an 8-byte
+    // explicit nonce and a 16-byte tag after applying the peer's plaintext
+    // limit.
+    assert_record_size_limit_records(
+        SslVersion::TLS1_2,
+        Some(512),
+        Some(700),
+        &expected_record_lengths(RECORD_SIZE_LIMIT_TEST_DATA_LEN, 700, 24),
+        &expected_record_lengths(RECORD_SIZE_LIMIT_TEST_DATA_LEN, 512, 24),
+    );
+}
+
+#[test]
+fn record_size_limit_patch_tls13_is_asymmetric() {
+    // TLS 1.3 counts the inner content type in the negotiated limit. Thus a
+    // limit of N carries at most N - 1 application bytes plus that byte and the
+    // 16-byte AEAD tag.
+    assert_record_size_limit_records(
+        SslVersion::TLS1_3,
+        Some(512),
+        Some(700),
+        &expected_record_lengths(RECORD_SIZE_LIMIT_TEST_DATA_LEN, 699, 17),
+        &expected_record_lengths(RECORD_SIZE_LIMIT_TEST_DATA_LEN, 511, 17),
+    );
+}
+
+#[test]
+fn record_size_limit_patch_requires_negotiation() {
+    // Advertising a receive limit is not enough by itself. Both peers must
+    // opt in before either direction is restricted.
+    assert_record_size_limit_records(
+        SslVersion::TLS1_3,
+        Some(512),
+        None,
+        &expected_record_lengths(RECORD_SIZE_LIMIT_TEST_DATA_LEN, 16_384, 17),
+        &expected_record_lengths(RECORD_SIZE_LIMIT_TEST_DATA_LEN, 16_384, 17),
+    );
+    assert_record_size_limit_records(
+        SslVersion::TLS1_3,
+        None,
+        Some(512),
+        &expected_record_lengths(RECORD_SIZE_LIMIT_TEST_DATA_LEN, 16_384, 17),
+        &expected_record_lengths(RECORD_SIZE_LIMIT_TEST_DATA_LEN, 16_384, 17),
     );
 }
 

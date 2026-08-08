@@ -491,6 +491,8 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     if !config.features.fips {
         println!("cargo:warning=applying patch to boringssl");
         apply_patch(config, "boringssl.patch")?;
+        println!("cargo:warning=applying record size limit patch to boringssl");
+        apply_patch(config, "record-size-limit.patch")?;
     }
 
     println!("cargo:warning=applying loongarch patch to boringssl");

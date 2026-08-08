@@ -410,6 +410,7 @@ jobs:
           boring-pq.patch \
           rpk.patch \
           boringssl.patch \
+          record-size-limit.patch \
           boringssl-loongarch.patch \
           underscore-wildcards.patch; do
           echo "Applying $p"
