@@ -10,7 +10,10 @@ use foreign_types::ForeignTypeRef;
 
 use super::server::Server;
 use crate::ffi;
-use crate::ssl::{ExtensionType, SslConnector, SslMethod, SslSignatureAlgorithm, SslVersion};
+use crate::ssl::{
+    ExtensionType, SslConnector, SslMethod, SslOptions, SslSession, SslSessionCacheMode,
+    SslSignatureAlgorithm, SslVersion,
+};
 
 fn u16_list(bytes: &[u8]) -> Vec<u16> {
     bytes
@@ -198,6 +201,146 @@ fn boringssl_patch_ffdhe_named_groups_are_advertised() {
             "ClientHello did not advertise boringssl.patch NamedGroup {configured_name}",
         );
     }
+}
+
+#[test]
+fn boringssl_patch_ffdhe_named_groups_negotiate_tls13() {
+    // Upstream BoringSSL does not implement these FFDHE key shares. Require
+    // both sides to use each group so boringssl.patch must generate, validate,
+    // and derive a shared secret from the RFC 7919 public values.
+    for (configured_name, expected_name, expected_id) in [
+        ("ffdhe2048", "dhe2048", ffi::SSL_GROUP_FFDHE2048 as u16),
+        ("ffdhe3072", "dhe3072", ffi::SSL_GROUP_FFDHE3072 as u16),
+    ] {
+        let mut server = Server::builder();
+        server
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        server
+            .ctx()
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        server.ctx().set_curves_list(configured_name).unwrap();
+        let server = server.build();
+
+        let mut client = server.client_with_root_ca();
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client
+            .ctx()
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client.ctx().set_curves_list(configured_name).unwrap();
+
+        let stream = client.connect();
+        assert_eq!(stream.ssl().version2(), Some(SslVersion::TLS1_3));
+        assert_eq!(stream.ssl().curve(), Some(expected_id));
+        assert_eq!(stream.ssl().curve_name(), Some(expected_name));
+    }
+}
+
+#[test]
+fn boringssl_patch_no_psk_dhe_ke_omits_psk_on_resumption() {
+    let session = Arc::new(Mutex::new(None));
+    let extensions = Arc::new(Mutex::new(Vec::new()));
+
+    let mut server = Server::builder();
+    server.expected_connections_count(2);
+    server
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    server
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(server.ctx().as_ptr(), 1) };
+    server.ctx().set_select_certificate_callback({
+        let extensions = Arc::clone(&extensions);
+        move |client_hello| {
+            extensions.lock().unwrap().push((
+                client_hello
+                    .get_extension(ExtensionType::PRE_SHARED_KEY)
+                    .is_some(),
+                client_hello
+                    .get_extension(ExtensionType::PSK_KEY_EXCHANGE_MODES)
+                    .is_some(),
+                client_hello
+                    .get_extension(ExtensionType::EARLY_DATA)
+                    .is_some(),
+            ));
+            Ok(())
+        }
+    });
+    let server = server.build();
+
+    let mut first_client = server.client_with_root_ca();
+    first_client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    first_client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(first_client.ctx().as_ptr(), 1) };
+    first_client
+        .ctx()
+        .set_session_cache_mode(SslSessionCacheMode::CLIENT);
+    first_client.ctx().set_new_session_callback({
+        let session = Arc::clone(&session);
+        move |_, new_session| {
+            let mut session = session.lock().unwrap();
+            if session.is_none() {
+                *session = Some(new_session.to_der().unwrap());
+            }
+        }
+    });
+    let first_stream = first_client.connect();
+    assert!(!first_stream.ssl().session_reused());
+
+    let session = SslSession::from_der(
+        session
+            .lock()
+            .unwrap()
+            .as_deref()
+            .expect("TLS 1.3 server did not issue a session ticket"),
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { ffi::SSL_SESSION_early_data_capable(session.as_ref().as_ptr()) },
+        1,
+        "the resumed handshake must exercise an early-data-capable session",
+    );
+
+    let mut resumed_client = server.client_with_root_ca();
+    resumed_client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    resumed_client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(resumed_client.ctx().as_ptr(), 1) };
+    resumed_client.ctx().set_options(SslOptions::NO_PSK_DHE_KE);
+    let mut resumed_client = resumed_client.build().builder();
+    unsafe { resumed_client.ssl().set_session(&session).unwrap() };
+
+    let resumed_stream = resumed_client.connect();
+    assert!(!resumed_stream.ssl().session_reused());
+    assert_eq!(
+        unsafe { ffi::SSL_in_early_data(resumed_stream.ssl().as_ptr()) },
+        0
+    );
+
+    let extensions = extensions.lock().unwrap();
+    assert_eq!(extensions.len(), 2);
+    assert_eq!(extensions[0], (false, true, false));
+    assert_eq!(extensions[1], (false, false, false));
 }
 
 #[test]

@@ -1,5 +1,5 @@
 diff --git a/crypto/cipher/e_tls.cc b/crypto/cipher/e_tls.cc
-index 0edf61a24..f7d472a71 100644
+index 0edf61a24..5cfdf5d9b 100644
 --- a/crypto/cipher/e_tls.cc
 +++ b/crypto/cipher/e_tls.cc
 @@ -442,6 +442,26 @@ static int aead_aes_256_cbc_sha1_tls_implicit_iv_init(
@@ -84,7 +84,7 @@ index 0edf61a24..f7d472a71 100644
    return &aead_des_ede3_cbc_sha1_tls;
  }
 diff --git a/crypto/cipher/tls_cbc.cc b/crypto/cipher/tls_cbc.cc
-index dc7058e5b..fd184a076 100644
+index dc7058e5b..41ae5ea30 100644
 --- a/crypto/cipher/tls_cbc.cc
 +++ b/crypto/cipher/tls_cbc.cc
 @@ -327,10 +327,108 @@ int bssl::EVP_sha256_final_with_secret_suffix(SHA256_CTX *ctx,
@@ -267,7 +267,7 @@ index dc7058e5b..fd184a076 100644
        // EVP_tls_cbc_record_digest_supported should have been called first to
        // check that the hash function is supported.
 diff --git a/crypto/obj/obj_dat.h b/crypto/obj/obj_dat.h
-index e7a00f46c..b0033f6d8 100644
+index 40b5278fc..238e8c1be 100644
 --- a/crypto/obj/obj_dat.h
 +++ b/crypto/obj/obj_dat.h
 @@ -16,7 +16,7 @@
@@ -275,20 +275,29 @@ index e7a00f46c..b0033f6d8 100644
  
  BSSL_NAMESPACE_BEGIN
 -#define NUM_NID 973
-+#define NUM_NID 975
++#define NUM_NID 976
  
  static const uint8_t kObjectData[] = {
      /* NID_rsadsi */
-@@ -8803,6 +8803,8 @@ static const ASN1_OBJECT kObjects[NUM_NID] = {
+@@ -8803,6 +8803,9 @@ static const ASN1_OBJECT kObjects[NUM_NID] = {
      {"P256Kyber768Draft00", "P256Kyber768Draft00", NID_P256Kyber768Draft00, 0,
       NULL, 0},
      {"X-Wing", "X-Wing", NID_X_Wing, 0, NULL, 0},
 +    {"ffdhe2048", "ffdhe2048", NID_ffdhe2048, 0, NULL, 0},
 +    {"ffdhe3072", "ffdhe3072", NID_ffdhe3072, 0, NULL, 0},
++    {"KxDHE", "kx-dhe", NID_kx_dhe, 0, NULL, 0},
  };
  
  static const uint16_t kNIDsInShortNameOrder[] = {
-@@ -9149,6 +9151,8 @@ static const uint16_t kNIDsInShortNameOrder[] = {
+@@ -8914,6 +8917,7 @@ static const uint16_t kNIDsInShortNameOrder[] = {
+     646 /* JOINT-ISO-ITU-T */,
+     773 /* KISA */,
+     957 /* KxANY */,
++    975 /* KxDHE */,
+     952 /* KxECDHE */,
+     953 /* KxPSK */,
+     951 /* KxRSA */,
+@@ -9149,6 +9153,8 @@ static const uint16_t kNIDsInShortNameOrder[] = {
      372 /* extendedStatus */,
      867 /* facsimileTelephoneNumber */,
      462 /* favouriteDrink */,
@@ -297,7 +306,7 @@ index e7a00f46c..b0033f6d8 100644
      857 /* freshestCRL */,
      453 /* friendlyCountry */,
      490 /* friendlyCountryName */,
-@@ -10126,6 +10130,8 @@ static const uint16_t kNIDsInLongNameOrder[] = {
+@@ -10126,6 +10132,8 @@ static const uint16_t kNIDsInLongNameOrder[] = {
      56 /* extendedCertificateAttributes */,
      867 /* facsimileTelephoneNumber */,
      462 /* favouriteDrink */,
@@ -306,18 +315,27 @@ index e7a00f46c..b0033f6d8 100644
      453 /* friendlyCountry */,
      490 /* friendlyCountryName */,
      156 /* friendlyName */,
+@@ -10380,6 +10388,7 @@ static const uint16_t kNIDsInLongNameOrder[] = {
+     150 /* keyBag */,
+     773 /* kisa */,
+     957 /* kx-any */,
++    975 /* kx-dhe */,
+     952 /* kx-ecdhe */,
+     953 /* kx-psk */,
+     951 /* kx-rsa */,
 diff --git a/crypto/obj/obj_mac.num b/crypto/obj/obj_mac.num
-index 25eac5075..88028c1d5 100644
+index 25eac5075..a926c44cd 100644
 --- a/crypto/obj/obj_mac.num
 +++ b/crypto/obj/obj_mac.num
-@@ -960,3 +960,5 @@ ML_DSA_87		969
+@@ -960,3 +960,6 @@ ML_DSA_87		969
  ML_KEM_768		970
  P256Kyber768Draft00		971
  X_Wing		972
 +ffdhe2048		973
 +ffdhe3072		974
++kx_dhe		975
 diff --git a/crypto/obj/objects.txt b/crypto/obj/objects.txt
-index 384b25753..4df384560 100644
+index 384b25753..19e444f33 100644
 --- a/crypto/obj/objects.txt
 +++ b/crypto/obj/objects.txt
 @@ -1343,6 +1343,10 @@ secg-scheme 14 3 : dhSinglePass-cofactorDH-sha512kdf-scheme
@@ -331,6 +349,14 @@ index 384b25753..4df384560 100644
  # NIDs for PQ/T hybrid KEMs (no corresponding OIDs).
  # See draft-irtf-cfrg-concrete-hybrid-kems.
   : X-Wing
+@@ -1358,6 +1362,7 @@ secg-scheme 14 3 : dhSinglePass-cofactorDH-sha512kdf-scheme
+ # NIDs for TLS 1.2 cipher suite key exchanges.
+  : KxRSA : kx-rsa
+  : KxECDHE : kx-ecdhe
++ : KxDHE : kx-dhe
+  : KxPSK : kx-psk
+ 
+ # NIDs for TLS 1.2 cipher suite authentication types.
 diff --git a/include/openssl/aead.h b/include/openssl/aead.h
 index 6b8ad575a..3ff2a5328 100644
 --- a/include/openssl/aead.h
@@ -345,10 +371,10 @@ index 6b8ad575a..3ff2a5328 100644
  OPENSSL_EXPORT const EVP_AEAD *EVP_aead_des_ede3_cbc_sha1_tls_implicit_iv(void);
  
 diff --git a/include/openssl/nid.h b/include/openssl/nid.h
-index 09af03d11..d68290da3 100644
+index 09af03d11..61082b8db 100644
 --- a/include/openssl/nid.h
 +++ b/include/openssl/nid.h
-@@ -5514,6 +5514,12 @@ extern "C" {
+@@ -5514,6 +5514,16 @@ extern "C" {
  #define SN_X_Wing "X-Wing"
  #define NID_X_Wing 972
  
@@ -358,18 +384,22 @@ index 09af03d11..d68290da3 100644
 +#define SN_ffdhe3072 "ffdhe3072"
 +#define NID_ffdhe3072 974
 +
++#define SN_kx_dhe "KxDHE"
++#define LN_kx_dhe "kx-dhe"
++#define NID_kx_dhe 975
++
  
  #if defined(__cplusplus)
  } /* extern C */
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 49972b7f2..8291dc3f8 100644
+index 8a7c717eb..d78663878 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -631,6 +631,12 @@ OPENSSL_EXPORT int SSL_version(const SSL *ssl);
  #define SSL_OP_NO_DTLSv1 SSL_OP_NO_TLSv1
  #define SSL_OP_NO_DTLSv1_2 SSL_OP_NO_TLSv1_2
  
-+// SSL_OP_NO_PSK_DHE_KE disables PSK-DHE-KE.
++// SSL_OP_NO_PSK_DHE_KE disables PSK-DHE-KE, TLS 1.3 PSK resumption, and 0-RTT.
 +#define SSL_OP_NO_PSK_DHE_KE 0x40000000L
 +
 +// SSL_OP_NO_RENEGOTIATION disables renegotiation. This is not recommended.
@@ -441,6 +471,19 @@ index 49972b7f2..8291dc3f8 100644
  // SSL_get_cipher_by_value returns the structure representing a TLS cipher
  // suite based on its assigned number, or NULL if unknown. See
  // https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml#tls-parameters-4.
+@@ -1550,9 +1586,9 @@ OPENSSL_EXPORT int SSL_CIPHER_get_cipher_nid(const SSL_CIPHER *cipher);
+ OPENSSL_EXPORT int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *cipher);
+ 
+ // SSL_CIPHER_get_kx_nid returns the NID for `cipher`'s key exchange. This may
+-// be `NID_kx_rsa`, `NID_kx_ecdhe`, or `NID_kx_psk` for TLS 1.2. In TLS 1.3,
+-// cipher suites do not specify the key exchange, so this function returns
+-// `NID_kx_any`.
++// be `NID_kx_rsa`, `NID_kx_dhe`, `NID_kx_ecdhe`, or `NID_kx_psk` for TLS 1.2.
++// In TLS 1.3, cipher suites do not specify the key exchange, so this function
++// returns `NID_kx_any`.
+ OPENSSL_EXPORT int SSL_CIPHER_get_kx_nid(const SSL_CIPHER *cipher);
+ 
+ // SSL_CIPHER_get_auth_nid returns the NID for `cipher`'s authentication
 @@ -2622,6 +2658,9 @@ OPENSSL_EXPORT size_t SSL_CTX_get_num_tickets(const SSL_CTX *ctx);
  #define SSL_GROUP_MLKEM1024 0x0202
  #define SSL_GROUP_P256_KYBER768_DRAFT00 0xfe32
@@ -451,7 +494,7 @@ index 49972b7f2..8291dc3f8 100644
  // SSL_CTX_set1_group_ids sets the preferred groups for `ctx` to `group_ids`.
  // Each element of `group_ids` should be a unique one of the `SSL_GROUP_*`
  // constants. If `group_ids` is empty, a default list will be set instead. It
-@@ -5615,6 +5654,56 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
+@@ -5560,6 +5599,56 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  
@@ -508,7 +551,7 @@ index 49972b7f2..8291dc3f8 100644
  // SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
  // record with `ssl`.
  OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
-@@ -5992,7 +6081,7 @@ DEFINE_STACK_OF(SSL_COMP)
+@@ -5937,7 +6026,7 @@ DEFINE_STACK_OF(SSL_COMP)
  #define SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG 0
  #define SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG 0
  #define SSL_OP_NO_COMPRESSION 0
@@ -517,7 +560,7 @@ index 49972b7f2..8291dc3f8 100644
  #define SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION 0
  #define SSL_OP_NO_SSLv2 0
  #define SSL_OP_NO_SSLv3 0
-@@ -6927,7 +7016,6 @@ OPENSSL_EXPORT void SSL_CTX_set_aes_hw_override_for_testing(
+@@ -6872,7 +6961,6 @@ OPENSSL_EXPORT void SSL_CTX_set_aes_hw_override_for_testing(
  // `SSL_CTX_set_aes_override_for_testing` but only configures a single `SSL*`.
  OPENSSL_EXPORT void SSL_set_aes_hw_override_for_testing(SSL *ssl,
                                                          bool override_value);
@@ -615,7 +658,7 @@ index f4b348481..66484b786 100644
  }  // extern C
  #endif
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 56de76e37..032490ad4 100644
+index 56de76e37..f8627416b 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -706,7 +706,8 @@ static bool ext_ri_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
@@ -628,7 +671,20 @@ index 56de76e37..032490ad4 100644
      return true;
    }
  
-@@ -2269,7 +2270,8 @@ bool ssl_ext_pre_shared_key_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+@@ -1981,7 +1982,11 @@ static bool should_offer_psk(const SSL_HANDSHAKE *hs,
+   // PSK, at least when we offer early data? Otherwise ClientHelloOuter will
+   // contain an early_data extension without a pre_shared_key extension and
+   // potentially break the recovery flow.
+-  return hs->max_version >= TLS1_3_VERSION && !hs->pre_shared_keys.empty() &&
++  // BoringSSL only implements PSK-DHE-KE. If that mode is disabled, omitting
++  // the PSK also keeps pre_shared_key and psk_key_exchange_modes consistent as
++  // required by RFC 8446, Section 4.2.9.
++  return !(SSL_get_options(hs->ssl) & SSL_OP_NO_PSK_DHE_KE) &&
++         hs->max_version >= TLS1_3_VERSION && !hs->pre_shared_keys.empty() &&
+          type != ssl_client_hello_outer;
+ }
+ 
+@@ -2269,7 +2274,8 @@ bool ssl_ext_pre_shared_key_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
  static bool ext_psk_key_exchange_modes_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -638,7 +694,7 @@ index 56de76e37..032490ad4 100644
      return true;
    }
    // We do not support resumption with PAKEs, so do not offer any PSK key
-@@ -3314,6 +3316,30 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
+@@ -3314,6 +3320,30 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
  static bool ext_delegated_credential_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -669,7 +725,7 @@ index 56de76e37..032490ad4 100644
    return true;
  }
  
-@@ -3870,6 +3896,38 @@ bool ssl_negotiate_alps(SSL_HANDSHAKE *hs, uint8_t *out_alert,
+@@ -3870,6 +3900,38 @@ bool ssl_negotiate_alps(SSL_HANDSHAKE *hs, uint8_t *out_alert,
    return true;
  }
  
@@ -708,7 +764,7 @@ index 56de76e37..032490ad4 100644
  // Client certificate type & Server certificate type
  //
  // https://www.rfc-editor.org/rfc/rfc7250.html#section-3
-@@ -4317,6 +4375,13 @@ static const struct tls_extension kExtensions[] = {
+@@ -4317,6 +4379,13 @@ static const struct tls_extension kExtensions[] = {
          ext_trust_anchors_parse_clienthello,
          ext_trust_anchors_add_serverhello,
      },
@@ -722,7 +778,7 @@ index 56de76e37..032490ad4 100644
      {
          TLSEXT_TYPE_client_cert_type,
          ext_client_cert_type_add_clienthello,
-@@ -4353,6 +4418,105 @@ static_assert(kNumExtensions <=
+@@ -4353,6 +4422,105 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
@@ -829,7 +885,7 @@ index 56de76e37..032490ad4 100644
    if (!hs->config->permute_extensions) {
      return true;
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index a4a53cda6..49411378d 100644
+index a4a53cda6..f52bff3c0 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
 @@ -23,9 +23,11 @@
@@ -926,7 +982,21 @@ index a4a53cda6..49411378d 100644
        }
      }
    }
-@@ -444,7 +463,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+@@ -288,6 +307,13 @@ static ssl_early_data_reason_t should_offer_early_data(
+     return ssl_early_data_protocol_version;
+   }
+ 
++  // BoringSSL only implements PSK-DHE-KE, so this option also suppresses the
++  // pre_shared_key extension. Early data cannot be offered without that
++  // extension. See RFC 8446, Sections 4.2.10 and 4.2.11.
++  if (SSL_get_options(ssl) & SSL_OP_NO_PSK_DHE_KE) {
++    return ssl_early_data_no_session_offered;
++  }
++
+   if (ssl->session == nullptr) {
+     return ssl_early_data_no_session_offered;
+   }
+@@ -444,7 +470,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
    ssl_setup_client_certificate_type(hs);
    if (!ssl_setup_pre_shared_keys(hs) ||  //
        !ssl_setup_key_shares(hs, /*override_group_id=*/0) ||
@@ -935,7 +1005,7 @@ index a4a53cda6..49411378d 100644
        !ssl_encrypt_client_hello(hs, Span(ech_enc, ech_enc_len)) ||
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
-@@ -1051,7 +1070,29 @@ static enum ssl_hs_wait_t do_read_server_key_exchange(SSL_HANDSHAKE *hs) {
+@@ -1051,7 +1077,29 @@ static enum ssl_hs_wait_t do_read_server_key_exchange(SSL_HANDSHAKE *hs) {
      hs->peer_psk_identity_hint.reset(raw);
    }
  
@@ -966,7 +1036,7 @@ index a4a53cda6..49411378d 100644
      // Parse the server parameters.
      uint8_t group_type;
      uint16_t group_id;
-@@ -1474,6 +1515,62 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
+@@ -1474,6 +1522,62 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
          !CBB_flush(&body)) {
        return ssl_hs_error;
      }
@@ -1030,7 +1100,7 @@ index a4a53cda6..49411378d 100644
      CBB child;
      if (!CBB_add_u8_length_prefixed(&body, &child)) {
 diff --git a/ssl/internal.h b/ssl/internal.h
-index a8643452f..b631c016a 100644
+index a8643452f..20f9dd461 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -218,10 +218,11 @@ BSSL_NAMESPACE_BEGIN
@@ -1163,7 +1233,7 @@ index a8643452f..b631c016a 100644
    friend RefCounted;
    ~SSLContext();
 diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
-index 7799d79f9..de5159049 100644
+index 7799d79f9..1bc769332 100644
 --- a/ssl/ssl_cipher.cc
 +++ b/ssl/ssl_cipher.cc
 @@ -63,6 +63,18 @@ static constexpr SSL_CIPHER kCiphers[] = {
@@ -1176,7 +1246,7 @@ index 7799d79f9..de5159049 100644
 +        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES128,
 +        SSL_SHA1,
 +        SSL_HANDSHAKE_MAC_DEFAULT,
@@ -1195,7 +1265,7 @@ index 7799d79f9..de5159049 100644
 +        "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES256,
 +        SSL_SHA1,
 +        SSL_HANDSHAKE_MAC_DEFAULT,
@@ -1239,7 +1309,7 @@ index 7799d79f9..de5159049 100644
 +        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA256",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA256,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES128,
 +        SSL_SHA256,
 +        SSL_HANDSHAKE_MAC_SHA256,
@@ -1251,7 +1321,7 @@ index 7799d79f9..de5159049 100644
 +        "TLS_DHE_RSA_WITH_AES_256_CBC_SHA256",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA256,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES256,
 +        SSL_SHA256,
 +        SSL_HANDSHAKE_MAC_SHA256,
@@ -1270,7 +1340,7 @@ index 7799d79f9..de5159049 100644
 +        "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_128_GCM_SHA256,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES128GCM,
 +        SSL_AEAD,
 +        SSL_HANDSHAKE_MAC_SHA256,
@@ -1282,7 +1352,7 @@ index 7799d79f9..de5159049 100644
 +        "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
 +        SSL_CIPHER_DHE_RSA_WITH_AES_256_GCM_SHA384,
 +        SSL_kDHE,
-+        SSL_aRSA_DECRYPT,
++        SSL_aRSA_SIGN,
 +        SSL_AES256GCM,
 +        SSL_AEAD,
 +        SSL_HANDSHAKE_MAC_SHA384,
@@ -1367,7 +1437,30 @@ index 7799d79f9..de5159049 100644
      // GCM based TLS v1.2 ciphersuites from RFC 5289
  
      // Cipher C02B
-@@ -454,6 +606,11 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+@@ -411,6 +563,13 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+     // multiple key exchange algs according to the RFCs.
+     {"kRSA", SSL_kRSA, ~0u, ~0u, ~0u, 0},
+ 
++    // Finite-field DHE support was removed in
++    // https://github.com/google/boringssl/commit/7e06de5d2d1b53c57c0c81e8d6ba4122b64cf626.
++    // Keep the legacy OpenSSL aliases for the client support restored here.
++    {"kDHE", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"kEDH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"DH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++
+     {"kECDHE", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"kEECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"ECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+@@ -424,6 +583,8 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+     {"aPSK", ~0u, SSL_aPSK, ~0u, ~0u, 0},
+ 
+     // aliases combining key exchange and server authentication
++    {"DHE", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"EDH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
+     {"ECDHE", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"EECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"RSA", SSL_kRSA, SSL_aRSA_SIGN | SSL_aRSA_DECRYPT, ~0u, ~0u, 0},
+@@ -454,6 +615,11 @@ static const CIPHER_ALIAS kCipherAliases[] = {
      // Legacy strength classes.
      {"HIGH", ~0u, ~0u, ~0u, ~0u, 0},
      {"FIPS", ~0u, ~0u, ~0u, ~0u, 0},
@@ -1379,7 +1472,7 @@ index 7799d79f9..de5159049 100644
  };
  
  static const size_t kCipherAliasesLen = std::size(kCipherAliases);
-@@ -523,11 +680,19 @@ bool ssl_cipher_get_evp_aead(const EVP_AEAD **out_aead,
+@@ -523,11 +689,19 @@ bool ssl_cipher_get_evp_aead(const EVP_AEAD **out_aead,
    } else if (cipher->algorithm_mac == SSL_SHA256) {
      if (cipher->algorithm_enc == SSL_AES128) {
        *out_aead = EVP_aead_aes_128_cbc_sha256_tls();
@@ -1399,7 +1492,7 @@ index 7799d79f9..de5159049 100644
    } else {
      return false;
    }
-@@ -1009,6 +1174,80 @@ static bool ssl_cipher_process_rulestr(const char *rule_str,
+@@ -1009,6 +1183,80 @@ static bool ssl_cipher_process_rulestr(const char *rule_str,
    return true;
  }
  
@@ -1480,7 +1573,7 @@ index 7799d79f9..de5159049 100644
  bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
                              const bool has_aes_hw, const char *rule_str,
                              bool strict) {
-@@ -1031,6 +1270,8 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -1031,6 +1279,8 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
        SSL_CIPHER_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
    };
    static const uint16_t kLegacyCiphers[] = {
@@ -1489,7 +1582,7 @@ index 7799d79f9..de5159049 100644
        SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
        SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA,
        SSL_CIPHER_ECDHE_PSK_WITH_AES_128_CBC_SHA,
-@@ -1038,14 +1279,24 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -1038,14 +1288,24 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
        SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA,
        SSL_CIPHER_ECDHE_PSK_WITH_AES_256_CBC_SHA,
        SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
@@ -1514,7 +1607,16 @@ index 7799d79f9..de5159049 100644
    };
  
    // Set up a linked list of ciphers.
-@@ -1274,6 +1525,8 @@ int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *cipher) {
+@@ -1168,7 +1428,7 @@ bool ssl_cipher_uses_certificate_auth(const SSL_CIPHER *cipher) {
+ bool ssl_cipher_requires_server_key_exchange(const SSL_CIPHER *cipher) {
+   // Ephemeral Diffie-Hellman key exchanges require a ServerKeyExchange. It is
+   // optional or omitted in all others.
+-  return (cipher->algorithm_mkey & SSL_kECDHE) != 0;
++  return (cipher->algorithm_mkey & (SSL_kDHE | SSL_kECDHE)) != 0;
+ }
+ 
+ size_t ssl_cipher_get_record_split_len(const SSL_CIPHER *cipher) {
+@@ -1274,6 +1534,8 @@ int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *cipher) {
        return NID_sha1;
      case SSL_SHA256:
        return NID_sha256;
@@ -1523,7 +1625,38 @@ index 7799d79f9..de5159049 100644
    }
    assert(0);
    return NID_undef;
-@@ -1538,6 +1791,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
+@@ -1283,6 +1545,8 @@ int SSL_CIPHER_get_kx_nid(const SSL_CIPHER *cipher) {
+   switch (cipher->algorithm_mkey) {
+     case SSL_kRSA:
+       return NID_kx_rsa;
++    case SSL_kDHE:
++      return NID_kx_dhe;
+     case SSL_kECDHE:
+       return NID_kx_ecdhe;
+     case SSL_kPSK:
+@@ -1381,6 +1645,10 @@ const char *SSL_CIPHER_get_kx_name(const SSL_CIPHER *cipher) {
+     case SSL_kRSA:
+       return "RSA";
+ 
++    case SSL_kDHE:
++      assert(cipher->algorithm_auth == SSL_aRSA_SIGN);
++      return "DHE_RSA";
++
+     case SSL_kECDHE:
+       switch (cipher->algorithm_auth) {
+         case SSL_aECDSA:
+@@ -1460,6 +1728,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
+       kx = "RSA";
+       break;
+ 
++    case SSL_kDHE:
++      kx = "DH";
++      break;
++
+     case SSL_kECDHE:
+       kx = "ECDH";
+       break;
+@@ -1538,6 +1810,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
        mac = "SHA256";
        break;
  
@@ -1535,10 +1668,189 @@ index 7799d79f9..de5159049 100644
        mac = "AEAD";
        break;
 diff --git a/ssl/ssl_key_share.cc b/ssl/ssl_key_share.cc
-index a6fec6ae8..28ff51a36 100644
+index a6fec6ae8..2eaaf86dc 100644
 --- a/ssl/ssl_key_share.cc
 +++ b/ssl/ssl_key_share.cc
-@@ -549,6 +549,8 @@ constexpr NamedGroup kNamedGroups[] = {
+@@ -23,6 +23,7 @@
+ #include <openssl/bn.h>
+ #include <openssl/bytestring.h>
+ #include <openssl/curve25519.h>
++#include <openssl/dh.h>
+ #include <openssl/ec.h>
+ #include <openssl/err.h>
+ #include <openssl/hrss.h>
+@@ -137,6 +138,170 @@ class ECKeyShare : public SSLKeyShare {
+   uint16_t group_id_;
+ };
+ 
++UniquePtr<DH> MakeFFDHEGroup(UniquePtr<BIGNUM> p) {
++  UniquePtr<DH> dh(DH_new());
++  UniquePtr<BIGNUM> g(BN_new());
++  if (!p || !dh || !g || !BN_set_word(g.get(), 2) ||
++      !DH_set0_pqg(dh.get(), p.get(), /*q=*/nullptr, g.get())) {
++    return nullptr;
++  }
++  // DH_set0_pqg takes ownership on success.
++  p.release();
++  g.release();
++  return dh;
++}
++
++UniquePtr<DH> NewFFDHE2048Group() {
++  UniquePtr<DH> params(DH_get_rfc7919_2048());
++  if (!params) {
++    return nullptr;
++  }
++  return MakeFFDHEGroup(
++      UniquePtr<BIGNUM>(BN_dup(DH_get0_p(params.get()))));
++}
++
++UniquePtr<DH> NewFFDHE3072Group() {
++  // RFC 7919, Appendix A.2.
++  // https://www.rfc-editor.org/rfc/rfc7919#appendix-A.2
++  static const char kFFDHE3072Prime[] =
++      "FFFFFFFFFFFFFFFFADF85458A2BB4A9AAFDC5620273D3CF1D8B9C583CE2D3695"
++      "A9E13641146433FBCC939DCE249B3EF97D2FE363630C75D8F681B202AEC4617A"
++      "D3DF1ED5D5FD65612433F51F5F066ED0856365553DED1AF3B557135E7F57C935"
++      "984F0C70E0E68B77E2A689DAF3EFE8721DF158A136ADE73530ACCA4F483A797A"
++      "BC0AB182B324FB61D108A94BB2C8E3FBB96ADAB760D7F4681D4F42A3DE394DF4"
++      "AE56EDE76372BB190B07A7C8EE0A6D709E02FCE1CDF7E2ECC03404CD28342F61"
++      "9172FE9CE98583FF8E4F1232EEF28183C3FE3B1B4C6FAD733BB5FCBC2EC22005"
++      "C58EF1837D1683B2C6F34A26C1B2EFFA886B4238611FCFDCDE355B3B6519035B"
++      "BC34F4DEF99C023861B46FC9D6E6C9077AD91D2691F7F7EE598CB0FAC186D91C"
++      "AEFE130985139270B4130C93BC437944F4FD4452E2D74DD364F2E21E71F54BFF"
++      "5CAE82AB9C9DF69EE86D2BC522363A0DABC521979B0DEADA1DBF9A42D5C4484E"
++      "0ABCD06BFA53DDEF3C1B20EE3FD59D7C25E41D2B66C62E37FFFFFFFFFFFFFFFF";
++
++  BIGNUM *p_raw = nullptr;
++  if (BN_hex2bn(&p_raw, kFFDHE3072Prime) == 0) {
++    return nullptr;
++  }
++  return MakeFFDHEGroup(UniquePtr<BIGNUM>(p_raw));
++}
++
++class FFDHEKeyShare : public SSLKeyShare {
++ public:
++  FFDHEKeyShare(UniquePtr<DH> dh, uint16_t group_id, unsigned private_bits)
++      : dh_(std::move(dh)),
++        group_id_(group_id),
++        private_bits_(private_bits) {}
++
++  uint16_t GroupID() const override { return group_id_; }
++
++  bool Generate(CBB *out) override {
++    assert(dh_);
++    assert(DH_get0_priv_key(dh_.get()) == nullptr);
++
++    // RFC 7919, Section 5.2 permits short exponents and gives the minimum
++    // length for each named group. Setting the top bit guarantees that the
++    // generated private value has the requested length.
++    UniquePtr<BIGNUM> private_key(BN_new());
++    if (!private_key ||
++        !BN_rand(private_key.get(), static_cast<int>(private_bits_),
++                 BN_RAND_TOP_ONE,
++                 BN_RAND_BOTTOM_ANY) ||
++        !DH_set0_key(dh_.get(), /*pub_key=*/nullptr, private_key.get())) {
++      return false;
++    }
++    // DH_set0_key takes ownership on success.
++    private_key.release();
++
++    const int public_key_len = DH_size(dh_.get());
++    return public_key_len > 0 && DH_generate_key(dh_.get()) &&
++           BN_bn2cbb_padded(out, public_key_len,
++                            DH_get0_pub_key(dh_.get()));
++  }
++
++  bool Encap(CBB *out_ciphertext, Array<uint8_t> *out_secret,
++             uint8_t *out_alert, Span<const uint8_t> peer_key) override {
++    *out_alert = SSL_AD_INTERNAL_ERROR;
++    return Generate(out_ciphertext) && Decap(out_secret, out_alert, peer_key);
++  }
++
++  bool Decap(Array<uint8_t> *out_secret, uint8_t *out_alert,
++             Span<const uint8_t> ciphertext) override {
++    assert(dh_);
++    assert(DH_get0_priv_key(dh_.get()) != nullptr);
++    *out_alert = SSL_AD_INTERNAL_ERROR;
++
++    const int dh_size_int = DH_size(dh_.get());
++    if (dh_size_int <= 0) {
++      return false;
++    }
++    const size_t dh_size = static_cast<size_t>(dh_size_int);
++    if (ciphertext.size() != dh_size) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_DH_PUBLIC_VALUE_LENGTH_IS_WRONG);
++      return false;
++    }
++
++    UniquePtr<BIGNUM> peer_key(
++        BN_bin2bn(ciphertext.data(), ciphertext.size(), nullptr));
++    if (!peer_key) {
++      return false;
++    }
++
++    int check_result;
++    if (!DH_check_pub_key(dh_.get(), peer_key.get(), &check_result)) {
++      return false;
++    }
++    if (check_result != 0) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(DH, DH_R_INVALID_PUBKEY);
++      return false;
++    }
++
++    Array<uint8_t> secret;
++    if (!secret.InitForOverwrite(dh_size) ||
++        DH_compute_key_padded(secret.data(), peer_key.get(), dh_.get()) !=
++            static_cast<int>(dh_size)) {
++      return false;
++    }
++
++    *out_secret = std::move(secret);
++    return true;
++  }
++
++  bool SerializePrivateKey(CBB *out) override {
++    assert(dh_);
++    const BIGNUM *private_key = DH_get0_priv_key(dh_.get());
++    assert(private_key);
++    return BN_bn2cbb_padded(out, PrivateKeyBytes(), private_key);
++  }
++
++  bool DeserializePrivateKey(CBS *in) override {
++    assert(dh_);
++    assert(DH_get0_priv_key(dh_.get()) == nullptr);
++    if (CBS_len(in) != PrivateKeyBytes()) {
++      return false;
++    }
++
++    UniquePtr<BIGNUM> private_key(
++        BN_bin2bn(CBS_data(in), CBS_len(in), nullptr));
++    if (!private_key || BN_num_bits(private_key.get()) != private_bits_ ||
++        !DH_set0_key(dh_.get(), /*pub_key=*/nullptr, private_key.get())) {
++      return false;
++    }
++    // DH_set0_key takes ownership on success.
++    private_key.release();
++    return true;
++  }
++
++ private:
++  size_t PrivateKeyBytes() const {
++    return static_cast<size_t>((private_bits_ + 7) / 8);
++  }
++
++  UniquePtr<DH> dh_;
++  uint16_t group_id_;
++  unsigned private_bits_;
++};
++
+ class X25519KeyShare : public SSLKeyShare {
+  public:
+   X25519KeyShare() {}
+@@ -549,6 +714,8 @@ constexpr NamedGroup kNamedGroups[] = {
      {NID_ML_KEM_1024, SSL_GROUP_MLKEM1024, "MLKEM1024", ""},
      {NID_P256Kyber768Draft00, SSL_GROUP_P256_KYBER768_DRAFT00,
       "P256Kyber768Draft00", "P256Kyber768D00"},
@@ -1547,8 +1859,31 @@ index a6fec6ae8..28ff51a36 100644
  };
  
  static_assert(std::size(kNamedGroups) == kNumNamedGroups,
+@@ -587,6 +754,22 @@ UniquePtr<SSLKeyShare> SSLKeyShare::Create(uint16_t group_id) {
+       return MakeUnique<MLKEM1024KeyShare>();
+     case SSL_GROUP_P256_KYBER768_DRAFT00:
+       return MakeUnique<P256Kyber768Draft00KeyShare>();
++    case SSL_GROUP_FFDHE2048: {
++      UniquePtr<DH> dh = NewFFDHE2048Group();
++      if (!dh) {
++        return nullptr;
++      }
++      return MakeUnique<FFDHEKeyShare>(std::move(dh), SSL_GROUP_FFDHE2048,
++                                       225);
++    }
++    case SSL_GROUP_FFDHE3072: {
++      UniquePtr<DH> dh = NewFFDHE3072Group();
++      if (!dh) {
++        return nullptr;
++      }
++      return MakeUnique<FFDHEKeyShare>(std::move(dh), SSL_GROUP_FFDHE3072,
++                                       275);
++    }
+     default:
+       return nullptr;
+   }
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index dfa587622..0c9aaf906 100644
+index 081276f72..ad3cd0767 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -401,7 +401,8 @@ bssl::SSLContext::SSLContext(const SSL_METHOD *ssl_method)
@@ -1794,7 +2129,7 @@ index ae7c9bbd5..af40dd514 100644
 +                          MakeConstSpan(sigalgs.data(), sigalgs.size()));
 +}
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
-index a8e308398..5a73a8d02 100644
+index 88b81e35a..4d0f3252c 100644
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
 @@ -217,6 +217,7 @@ static const CipherTest kCipherTests[] = {
@@ -1873,7 +2208,7 @@ index a8e308398..5a73a8d02 100644
              {SSL_CIPHER_RSA_WITH_3DES_EDE_CBC_SHA, 0},
          },
          false,
-@@ -2358,9 +2373,9 @@ TEST(SSLTest, SetGroupIdsWithEqualPreference) {
+@@ -2359,9 +2374,9 @@ TEST(SSLTest, SetGroupIdsWithEqualPreference) {
  // Test that the SSL group flags are defaulted to zero when zero groups are set
  // (i.e. using the default groups).
  TEST(SSLTest, SetGroupIdsWithFlags_DefaultGroups) {
@@ -1886,7 +2221,7 @@ index a8e308398..5a73a8d02 100644
    const uint32_t kBogusFlags[] = {SSL_GROUP_FLAG_EQUAL_PREFERENCE_WITH_NEXT,
                                    SSL_GROUP_FLAG_EQUAL_PREFERENCE_WITH_NEXT, 0};
    bssl::UniquePtr<SSL_CTX> server_ctx =
-@@ -4212,36 +4227,39 @@ TEST(SSLTest, ClientHello) {
+@@ -4217,36 +4232,39 @@ TEST(SSLTest, ClientHello) {
      std::vector<uint8_t> expected;
    } kTests[] = {
        {TLS1_VERSION,
@@ -1949,7 +2284,7 @@ index a8e308398..5a73a8d02 100644
        // TODO(davidben): Add a change detector for TLS 1.3 once the spec and our
        // implementation has settled enough that it won't change.
    };
-@@ -7027,7 +7045,9 @@ TEST(SSLTest, SigAlgs) {
+@@ -7045,7 +7063,9 @@ TEST(SSLTest, SigAlgs) {
        {{1}, false, {}},
        {{1, 2, 3}, false, {}},
        {{NID_sha256, EVP_PKEY_ED25519}, false, {}},
@@ -1960,7 +2295,7 @@ index a8e308398..5a73a8d02 100644
        {{NID_sha256, EVP_PKEY_ML_DSA_44}, false, {}},
  
        {{NID_sha256, EVP_PKEY_RSA}, true, {SSL_SIGN_RSA_PKCS1_SHA256}},
-@@ -7082,8 +7102,13 @@ TEST(SSLTest, SigAlgsList) {
+@@ -7100,8 +7120,13 @@ TEST(SSLTest, SigAlgsList) {
        {":RSA+SHA256+:", false, {}},
        {"!", false, {}},
        {"\x01", false, {}},
@@ -1976,7 +2311,7 @@ index a8e308398..5a73a8d02 100644
  
        {"RSA+SHA256", true, {SSL_SIGN_RSA_PKCS1_SHA256}},
        {"RSA+SHA256:ed25519",
-@@ -10165,6 +10190,55 @@ TEST(SSLTest, PermuteExtensions) {
+@@ -10183,6 +10208,55 @@ TEST(SSLTest, PermuteExtensions) {
    }
  }
  
@@ -2032,7 +2367,7 @@ index a8e308398..5a73a8d02 100644
  TEST(SSLTest, HostMatching) {
    static const char kCertPEM[] = R"(
  -----BEGIN CERTIFICATE-----
-@@ -10866,10 +10940,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
+@@ -10884,10 +10958,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
  
    static const uint16_t kDuplicatePrefs[] = {SSL_SIGN_RSA_PKCS1_SHA256,
                                               SSL_SIGN_RSA_PKCS1_SHA256};
