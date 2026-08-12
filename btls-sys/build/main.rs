@@ -489,8 +489,21 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     }
 
     if !config.features.fips {
-        println!("cargo:warning=applying patch to boringssl");
-        apply_patch(config, "boringssl.patch")?;
+        for patch_name in [
+            "0001-boringssl-ffdhe.patch",
+            "0002-boringssl-legacy-ciphers.patch",
+            "0003-boringssl-tls-options.patch",
+            "0004-boringssl-extension-order.patch",
+            "0005-record-size-limit.patch",
+            "0006-delegated-credentials.patch",
+            "0007-boringssl-cipher-preferences.patch",
+            "0008-boringssl-sigalgs.patch",
+            "0009-boringssl-zstd-cert-compression.patch",
+            "0010-boringssl-build-compat.patch",
+        ] {
+            println!("cargo:warning=applying {patch_name} to boringssl");
+            apply_patch(config, patch_name)?;
+        }
     }
 
     println!("cargo:warning=applying loongarch patch to boringssl");

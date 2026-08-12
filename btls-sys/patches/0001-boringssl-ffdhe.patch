@@ -1,0 +1,324 @@
+diff --git a/crypto/obj/obj_dat.h b/crypto/obj/obj_dat.h
+index 40b5278fc..b0033f6d8 100644
+--- a/crypto/obj/obj_dat.h
++++ b/crypto/obj/obj_dat.h
+@@ -16,7 +16,7 @@
+ 
+ 
+ BSSL_NAMESPACE_BEGIN
+-#define NUM_NID 973
++#define NUM_NID 975
+ 
+ static const uint8_t kObjectData[] = {
+     /* NID_rsadsi */
+@@ -8803,6 +8803,8 @@ static const ASN1_OBJECT kObjects[NUM_NID] = {
+     {"P256Kyber768Draft00", "P256Kyber768Draft00", NID_P256Kyber768Draft00, 0,
+      NULL, 0},
+     {"X-Wing", "X-Wing", NID_X_Wing, 0, NULL, 0},
++    {"ffdhe2048", "ffdhe2048", NID_ffdhe2048, 0, NULL, 0},
++    {"ffdhe3072", "ffdhe3072", NID_ffdhe3072, 0, NULL, 0},
+ };
+ 
+ static const uint16_t kNIDsInShortNameOrder[] = {
+@@ -9149,6 +9151,8 @@ static const uint16_t kNIDsInShortNameOrder[] = {
+     372 /* extendedStatus */,
+     867 /* facsimileTelephoneNumber */,
+     462 /* favouriteDrink */,
++    973 /* ffdhe2048 */,
++    974 /* ffdhe3072 */,
+     857 /* freshestCRL */,
+     453 /* friendlyCountry */,
+     490 /* friendlyCountryName */,
+@@ -10126,6 +10130,8 @@ static const uint16_t kNIDsInLongNameOrder[] = {
+     56 /* extendedCertificateAttributes */,
+     867 /* facsimileTelephoneNumber */,
+     462 /* favouriteDrink */,
++    973 /* ffdhe2048 */,
++    974 /* ffdhe3072 */,
+     453 /* friendlyCountry */,
+     490 /* friendlyCountryName */,
+     156 /* friendlyName */,
+diff --git a/crypto/obj/obj_mac.num b/crypto/obj/obj_mac.num
+index 25eac5075..88028c1d5 100644
+--- a/crypto/obj/obj_mac.num
++++ b/crypto/obj/obj_mac.num
+@@ -960,3 +960,5 @@ ML_DSA_87		969
+ ML_KEM_768		970
+ P256Kyber768Draft00		971
+ X_Wing		972
++ffdhe2048		973
++ffdhe3072		974
+diff --git a/crypto/obj/objects.txt b/crypto/obj/objects.txt
+index 384b25753..4df384560 100644
+--- a/crypto/obj/objects.txt
++++ b/crypto/obj/objects.txt
+@@ -1343,6 +1343,10 @@ secg-scheme 14 3 : dhSinglePass-cofactorDH-sha512kdf-scheme
+  : P256Kyber768Draft00
+  : X25519MLKEM768
+ 
++# NIDs for finite-field Diffie-Hellman groups in TLS (no corresponding OIDs).
++ : ffdhe2048
++ : ffdhe3072
++
+ # NIDs for PQ/T hybrid KEMs (no corresponding OIDs).
+ # See draft-irtf-cfrg-concrete-hybrid-kems.
+  : X-Wing
+diff --git a/include/openssl/nid.h b/include/openssl/nid.h
+index 09af03d11..d68290da3 100644
+--- a/include/openssl/nid.h
++++ b/include/openssl/nid.h
+@@ -5514,6 +5514,12 @@ extern "C" {
+ #define SN_X_Wing "X-Wing"
+ #define NID_X_Wing 972
+ 
++#define SN_ffdhe2048 "ffdhe2048"
++#define NID_ffdhe2048 973
++
++#define SN_ffdhe3072 "ffdhe3072"
++#define NID_ffdhe3072 974
++
+ 
+ #if defined(__cplusplus)
+ } /* extern C */
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 8a7c717eb..efe410481 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -2622,6 +2622,9 @@ OPENSSL_EXPORT size_t SSL_CTX_get_num_tickets(const SSL_CTX *ctx);
+ #define SSL_GROUP_MLKEM1024 0x0202
+ #define SSL_GROUP_P256_KYBER768_DRAFT00 0xfe32
+ 
++#define SSL_GROUP_FFDHE2048 256
++#define SSL_GROUP_FFDHE3072 257
++
+ // SSL_CTX_set1_group_ids sets the preferred groups for `ctx` to `group_ids`.
+ // Each element of `group_ids` should be a unique one of the `SSL_GROUP_*`
+ // constants. If `group_ids` is empty, a default list will be set instead. It
+diff --git a/ssl/internal.h b/ssl/internal.h
+index a8643452f..fab6c0423 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -918,7 +918,7 @@ struct NamedGroup {
+ Span<const NamedGroup> NamedGroups();
+ 
+ // kNumNamedGroups is the number of supported groups.
+-constexpr size_t kNumNamedGroups = 8u;
++constexpr size_t kNumNamedGroups = 10u;
+ 
+ // DefaultSupportedGroupIds returns the list of IDs for the default groups that
+ // are supported when the caller hasn't explicitly configured supported groups.
+diff --git a/ssl/ssl_key_share.cc b/ssl/ssl_key_share.cc
+index a6fec6ae8..8ce8e3cbd 100644
+--- a/ssl/ssl_key_share.cc
++++ b/ssl/ssl_key_share.cc
+@@ -23,6 +23,7 @@
+ #include <openssl/bn.h>
+ #include <openssl/bytestring.h>
+ #include <openssl/curve25519.h>
++#include <openssl/dh.h>
+ #include <openssl/ec.h>
+ #include <openssl/err.h>
+ #include <openssl/hrss.h>
+@@ -137,6 +138,170 @@ class ECKeyShare : public SSLKeyShare {
+   uint16_t group_id_;
+ };
+ 
++UniquePtr<DH> MakeFFDHEGroup(UniquePtr<BIGNUM> p) {
++  UniquePtr<DH> dh(DH_new());
++  UniquePtr<BIGNUM> g(BN_new());
++  if (!p || !dh || !g || !BN_set_word(g.get(), 2) ||
++      !DH_set0_pqg(dh.get(), p.get(), /*q=*/nullptr, g.get())) {
++    return nullptr;
++  }
++  // DH_set0_pqg takes ownership on success.
++  p.release();
++  g.release();
++  return dh;
++}
++
++UniquePtr<DH> NewFFDHE2048Group() {
++  UniquePtr<DH> params(DH_get_rfc7919_2048());
++  if (!params) {
++    return nullptr;
++  }
++  return MakeFFDHEGroup(
++      UniquePtr<BIGNUM>(BN_dup(DH_get0_p(params.get()))));
++}
++
++UniquePtr<DH> NewFFDHE3072Group() {
++  // RFC 7919, Appendix A.2.
++  // https://www.rfc-editor.org/rfc/rfc7919#appendix-A.2
++  static const char kFFDHE3072Prime[] =
++      "FFFFFFFFFFFFFFFFADF85458A2BB4A9AAFDC5620273D3CF1D8B9C583CE2D3695"
++      "A9E13641146433FBCC939DCE249B3EF97D2FE363630C75D8F681B202AEC4617A"
++      "D3DF1ED5D5FD65612433F51F5F066ED0856365553DED1AF3B557135E7F57C935"
++      "984F0C70E0E68B77E2A689DAF3EFE8721DF158A136ADE73530ACCA4F483A797A"
++      "BC0AB182B324FB61D108A94BB2C8E3FBB96ADAB760D7F4681D4F42A3DE394DF4"
++      "AE56EDE76372BB190B07A7C8EE0A6D709E02FCE1CDF7E2ECC03404CD28342F61"
++      "9172FE9CE98583FF8E4F1232EEF28183C3FE3B1B4C6FAD733BB5FCBC2EC22005"
++      "C58EF1837D1683B2C6F34A26C1B2EFFA886B4238611FCFDCDE355B3B6519035B"
++      "BC34F4DEF99C023861B46FC9D6E6C9077AD91D2691F7F7EE598CB0FAC186D91C"
++      "AEFE130985139270B4130C93BC437944F4FD4452E2D74DD364F2E21E71F54BFF"
++      "5CAE82AB9C9DF69EE86D2BC522363A0DABC521979B0DEADA1DBF9A42D5C4484E"
++      "0ABCD06BFA53DDEF3C1B20EE3FD59D7C25E41D2B66C62E37FFFFFFFFFFFFFFFF";
++
++  BIGNUM *p_raw = nullptr;
++  if (BN_hex2bn(&p_raw, kFFDHE3072Prime) == 0) {
++    return nullptr;
++  }
++  return MakeFFDHEGroup(UniquePtr<BIGNUM>(p_raw));
++}
++
++class FFDHEKeyShare : public SSLKeyShare {
++ public:
++  FFDHEKeyShare(UniquePtr<DH> dh, uint16_t group_id, unsigned private_bits)
++      : dh_(std::move(dh)),
++        group_id_(group_id),
++        private_bits_(private_bits) {}
++
++  uint16_t GroupID() const override { return group_id_; }
++
++  bool Generate(CBB *out) override {
++    assert(dh_);
++    assert(DH_get0_priv_key(dh_.get()) == nullptr);
++
++    // RFC 7919, Section 5.2 permits short exponents and gives the minimum
++    // length for each named group. Setting the top bit guarantees that the
++    // generated private value has the requested length.
++    UniquePtr<BIGNUM> private_key(BN_new());
++    if (!private_key ||
++        !BN_rand(private_key.get(), static_cast<int>(private_bits_),
++                 BN_RAND_TOP_ONE,
++                 BN_RAND_BOTTOM_ANY) ||
++        !DH_set0_key(dh_.get(), /*pub_key=*/nullptr, private_key.get())) {
++      return false;
++    }
++    // DH_set0_key takes ownership on success.
++    private_key.release();
++
++    const int public_key_len = DH_size(dh_.get());
++    return public_key_len > 0 && DH_generate_key(dh_.get()) &&
++           BN_bn2cbb_padded(out, public_key_len,
++                            DH_get0_pub_key(dh_.get()));
++  }
++
++  bool Encap(CBB *out_ciphertext, Array<uint8_t> *out_secret,
++             uint8_t *out_alert, Span<const uint8_t> peer_key) override {
++    *out_alert = SSL_AD_INTERNAL_ERROR;
++    return Generate(out_ciphertext) && Decap(out_secret, out_alert, peer_key);
++  }
++
++  bool Decap(Array<uint8_t> *out_secret, uint8_t *out_alert,
++             Span<const uint8_t> ciphertext) override {
++    assert(dh_);
++    assert(DH_get0_priv_key(dh_.get()) != nullptr);
++    *out_alert = SSL_AD_INTERNAL_ERROR;
++
++    const int dh_size_int = DH_size(dh_.get());
++    if (dh_size_int <= 0) {
++      return false;
++    }
++    const size_t dh_size = static_cast<size_t>(dh_size_int);
++    if (ciphertext.size() != dh_size) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_DH_PUBLIC_VALUE_LENGTH_IS_WRONG);
++      return false;
++    }
++
++    UniquePtr<BIGNUM> peer_key(
++        BN_bin2bn(ciphertext.data(), ciphertext.size(), nullptr));
++    if (!peer_key) {
++      return false;
++    }
++
++    int check_result;
++    if (!DH_check_pub_key(dh_.get(), peer_key.get(), &check_result)) {
++      return false;
++    }
++    if (check_result != 0) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(DH, DH_R_INVALID_PUBKEY);
++      return false;
++    }
++
++    Array<uint8_t> secret;
++    if (!secret.InitForOverwrite(dh_size) ||
++        DH_compute_key_padded(secret.data(), peer_key.get(), dh_.get()) !=
++            static_cast<int>(dh_size)) {
++      return false;
++    }
++
++    *out_secret = std::move(secret);
++    return true;
++  }
++
++  bool SerializePrivateKey(CBB *out) override {
++    assert(dh_);
++    const BIGNUM *private_key = DH_get0_priv_key(dh_.get());
++    assert(private_key);
++    return BN_bn2cbb_padded(out, PrivateKeyBytes(), private_key);
++  }
++
++  bool DeserializePrivateKey(CBS *in) override {
++    assert(dh_);
++    assert(DH_get0_priv_key(dh_.get()) == nullptr);
++    if (CBS_len(in) != PrivateKeyBytes()) {
++      return false;
++    }
++
++    UniquePtr<BIGNUM> private_key(
++        BN_bin2bn(CBS_data(in), CBS_len(in), nullptr));
++    if (!private_key || BN_num_bits(private_key.get()) != private_bits_ ||
++        !DH_set0_key(dh_.get(), /*pub_key=*/nullptr, private_key.get())) {
++      return false;
++    }
++    // DH_set0_key takes ownership on success.
++    private_key.release();
++    return true;
++  }
++
++ private:
++  size_t PrivateKeyBytes() const {
++    return static_cast<size_t>((private_bits_ + 7) / 8);
++  }
++
++  UniquePtr<DH> dh_;
++  uint16_t group_id_;
++  unsigned private_bits_;
++};
++
+ class X25519KeyShare : public SSLKeyShare {
+  public:
+   X25519KeyShare() {}
+@@ -549,6 +714,8 @@ constexpr NamedGroup kNamedGroups[] = {
+     {NID_ML_KEM_1024, SSL_GROUP_MLKEM1024, "MLKEM1024", ""},
+     {NID_P256Kyber768Draft00, SSL_GROUP_P256_KYBER768_DRAFT00,
+      "P256Kyber768Draft00", "P256Kyber768D00"},
++    {NID_ffdhe2048, SSL_GROUP_FFDHE2048, "dhe2048", "ffdhe2048"},
++    {NID_ffdhe3072, SSL_GROUP_FFDHE3072, "dhe3072", "ffdhe3072"},
+ };
+ 
+ static_assert(std::size(kNamedGroups) == kNumNamedGroups,
+@@ -587,6 +754,22 @@ UniquePtr<SSLKeyShare> SSLKeyShare::Create(uint16_t group_id) {
+       return MakeUnique<MLKEM1024KeyShare>();
+     case SSL_GROUP_P256_KYBER768_DRAFT00:
+       return MakeUnique<P256Kyber768Draft00KeyShare>();
++    case SSL_GROUP_FFDHE2048: {
++      UniquePtr<DH> dh = NewFFDHE2048Group();
++      if (!dh) {
++        return nullptr;
++      }
++      return MakeUnique<FFDHEKeyShare>(std::move(dh), SSL_GROUP_FFDHE2048,
++                                       225);
++    }
++    case SSL_GROUP_FFDHE3072: {
++      UniquePtr<DH> dh = NewFFDHE3072Group();
++      if (!dh) {
++        return nullptr;
++      }
++      return MakeUnique<FFDHEKeyShare>(std::move(dh), SSL_GROUP_FFDHE3072,
++                                       275);
++    }
+     default:
+       return nullptr;
+   }

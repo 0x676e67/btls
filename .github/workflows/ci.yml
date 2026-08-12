@@ -409,7 +409,16 @@ jobs:
           bad-cert-verification.patch \
           boring-pq.patch \
           rpk.patch \
-          boringssl.patch \
+          0001-boringssl-ffdhe.patch \
+          0002-boringssl-legacy-ciphers.patch \
+          0003-boringssl-tls-options.patch \
+          0004-boringssl-extension-order.patch \
+          0005-record-size-limit.patch \
+          0006-delegated-credentials.patch \
+          0007-boringssl-cipher-preferences.patch \
+          0008-boringssl-sigalgs.patch \
+          0009-boringssl-zstd-cert-compression.patch \
+          0010-boringssl-build-compat.patch \
           boringssl-loongarch.patch \
           underscore-wildcards.patch; do
           echo "Applying $p"

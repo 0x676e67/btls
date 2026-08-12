@@ -1,0 +1,145 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index b5c5993e7..b7e670765 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5600,6 +5600,14 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+ OPENSSL_EXPORT int SSL_CTX_set_extension_order(SSL_CTX *ctx,
+                                                const uint16_t *ids, int num);
+ 
++// SSL_set_record_size_limit configures whether sockets on |ssl| should
++// send record size limit extension.
++OPENSSL_EXPORT void SSL_set_record_size_limit(SSL *ssl, uint16_t limit);
++
++// SSL_CTX_set_record_size_limit configures whether sockets on |ctx| should
++// send record size limit extension.
++OPENSSL_EXPORT void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit);
++
+ // SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
+ // record with `ssl`.
+ OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
+diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
+index 0a01b2456..611b202e1 100644
+--- a/include/openssl/tls1.h
++++ b/include/openssl/tls1.h
+@@ -48,6 +48,9 @@ extern "C" {
+ #define TLS1_AD_NO_APPLICATION_PROTOCOL 120
+ #define TLS1_AD_ECH_REQUIRED 121
+ 
++// Extension types from RFC 8449
++#define TLSEXT_TYPE_record_size_limit 28
++
+ // ExtensionType values from RFC 6066
+ #define TLSEXT_TYPE_server_name 0
+ #define TLSEXT_TYPE_status_request 5
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 9ad7527ec..51161f461 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -3876,6 +3876,38 @@ bool ssl_negotiate_alps(SSL_HANDSHAKE *hs, uint8_t *out_alert,
+   return true;
+ }
+ 
++static bool record_size_limit_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
++                                              CBB *out_compressible,
++                                              ssl_client_hello_type_t type) {
++  if (hs->config->record_size_limit != 0) {
++    CBB data;
++    const uint16_t data_ = hs->config->record_size_limit;
++    if (!CBB_add_u16(out, TLSEXT_TYPE_record_size_limit) ||
++        !CBB_add_u16_length_prefixed(out, &data) ||
++        !CBB_add_u16(&data, data_) || !CBB_flush(out)) {
++      return false;
++    }
++  }
++
++  return true;
++}
++
++static bool record_size_limit_parse_serverhello(SSL_HANDSHAKE *hs,
++                                                uint8_t *out_alert,
++                                                CBS *contents) {
++  return true;
++}
++
++static bool record_size_limit_parse_clienthello(SSL_HANDSHAKE *hs,
++                                                uint8_t *out_alert,
++                                                CBS *contents) {
++  return true;
++}
++
++static bool record_size_limit_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
++  return true;
++}
++
+ // Client certificate type & Server certificate type
+ //
+ // https://www.rfc-editor.org/rfc/rfc7250.html#section-3
+@@ -4323,6 +4355,13 @@ static const struct tls_extension kExtensions[] = {
+         ext_trust_anchors_parse_clienthello,
+         ext_trust_anchors_add_serverhello,
+     },
++    {
++        TLSEXT_TYPE_record_size_limit,
++        record_size_limit_add_clienthello,
++        record_size_limit_parse_serverhello,
++        record_size_limit_parse_clienthello,
++        record_size_limit_add_serverhello,
++    },
+     {
+         TLSEXT_TYPE_client_cert_type,
+         ext_client_cert_type_add_clienthello,
+diff --git a/ssl/internal.h b/ssl/internal.h
+index 506775b90..1f524fa90 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -3572,6 +3572,9 @@ struct SSL_CONFIG {
+   // to negotiate and convey application settings.
+   bool alps_use_new_codepoint : 1;
+ 
++  // record_size_limit is whether to send record size limit extension.
++  uint16_t record_size_limit = 0;
++
+   // server_padding_enabled is true iff the server is willing to send additional
+   // padding to clients that request it through the server padding extension.
+   bool server_padding_enabled : 1;
+@@ -4244,6 +4247,9 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+   // signal its sessions may be resumed across names in the server certificate.
+   bool resumption_across_names_enabled : 1;
+ 
++  // record_size_limit is whether to send record size limit extension.
++  uint16_t record_size_limit = 0;
++
+   // extension_order stores wire extension IDs in the order requested by
+   // SSL_CTX_set_extension_order. An empty array leaves the order unset.
+   bssl::Array<uint16_t> extension_order;
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index d60c8c588..e50b5f85b 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -573,6 +573,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
+   ssl->config->ocsp_stapling_enabled = ctx_impl->ocsp_stapling_enabled;
+   ssl->config->handoff = ctx_impl->handoff;
+   ssl->quic_method = ctx_impl->quic_method;
++  ssl->config->record_size_limit = ctx_impl->record_size_limit;
+ 
+   if (!ssl->method->ssl_new(ssl.get()) ||
+       !ssl->ctx->x509_method->ssl_new(ssl->s3->hs.get())) {
+@@ -2316,6 +2317,18 @@ void SSL_enable_ocsp_stapling(SSL *ssl) {
+   ssl_impl->config->ocsp_stapling_enabled = true;
+ }
+ 
++void SSL_set_record_size_limit(SSL *ssl, uint16_t limit) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return;
++  }
++  ssl_impl->config->record_size_limit = limit;
++}
++
++void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit) {
++  FromOpaque(ctx)->record_size_limit = limit;
++}
++
+ void SSL_get0_signed_cert_timestamp_list(const SSL *ssl, const uint8_t **out,
+                                          size_t *out_len) {
+   SSL_SESSION *session = SSL_get_session(ssl);

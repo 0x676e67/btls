@@ -1,0 +1,12 @@
+diff --git a/third_party/benchmark/src/string_util.cc b/third_party/benchmark/src/string_util.cc
+index 9c5df3ba2..395cdc2f4 100644
+--- a/third_party/benchmark/src/string_util.cc
++++ b/third_party/benchmark/src/string_util.cc
+@@ -152,6 +152,7 @@ std::string HumanReadableNumber(double n, Counter::OneK one_k) {
+   return ToBinaryStringFullySpecified(n, 1, one_k);
+ }
+ 
++PRINTF_FORMAT_STRING_FUNC(1, 2)
+ std::string StrFormat(const char* format, ...) {
+   va_list args;
+   va_start(args, format);

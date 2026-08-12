@@ -1,0 +1,11 @@
+diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
+index 611b202e1..66484b786 100644
+--- a/include/openssl/tls1.h
++++ b/include/openssl/tls1.h
+@@ -177,5 +177,6 @@ extern "C" {
+ // From https://www.rfc-editor.org/rfc/rfc8879.html#section-3
+ #define TLSEXT_cert_compression_zlib 1
+ #define TLSEXT_cert_compression_brotli 2
++#define TLSEXT_cert_compression_zstd 3
+ 
+ #define TLSEXT_MAXLEN_host_name 255

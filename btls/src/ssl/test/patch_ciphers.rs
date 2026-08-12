@@ -32,7 +32,7 @@ struct AddedCipher {
     peer: CipherPeer,
 }
 
-// This is the cipher inventory restored by boringssl.patch, not upstream
+// This is the cipher inventory restored by 0002-boringssl-legacy-ciphers.patch, not upstream
 // BoringSSL's native list. Keep every entry negotiating so patch migrations do
 // not silently leave a name that cannot carry TLS 1.2 application data.
 // https://www.rfc-editor.org/rfc/rfc5246

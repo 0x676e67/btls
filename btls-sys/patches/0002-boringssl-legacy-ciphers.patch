@@ -1,0 +1,1142 @@
+diff --git a/crypto/cipher/e_tls.cc b/crypto/cipher/e_tls.cc
+index 0edf61a24..5cfdf5d9b 100644
+--- a/crypto/cipher/e_tls.cc
++++ b/crypto/cipher/e_tls.cc
+@@ -442,6 +442,26 @@ static int aead_aes_256_cbc_sha1_tls_implicit_iv_init(
+                        EVP_sha1(), 1);
+ }
+ 
++// BoringSSL removed these SHA-2 CBC AEADs in
++// https://github.com/google/boringssl/commit/6e678eeb6e76171712ae00d467321b6fe196152d.
++// This restores the implementation immediately before that commit on the
++// current AEAD interface.
++static int aead_aes_256_cbc_sha256_tls_init(EVP_AEAD_CTX *ctx,
++                                            const uint8_t *key, size_t key_len,
++                                            size_t tag_len,
++                                            enum evp_aead_direction_t dir) {
++  return aead_tls_init(ctx, key, key_len, tag_len, dir, EVP_aes_256_cbc(),
++                       EVP_sha256(), 0);
++}
++
++static int aead_aes_256_cbc_sha384_tls_init(EVP_AEAD_CTX *ctx,
++                                            const uint8_t *key, size_t key_len,
++                                            size_t tag_len,
++                                            enum evp_aead_direction_t dir) {
++  return aead_tls_init(ctx, key, key_len, tag_len, dir, EVP_aes_256_cbc(),
++                       EVP_sha384(), 0);
++}
++
+ static int aead_des_ede3_cbc_sha1_tls_init(EVP_AEAD_CTX *ctx,
+                                            const uint8_t *key, size_t key_len,
+                                            size_t tag_len,
+@@ -551,6 +571,38 @@ static const EVP_AEAD aead_aes_256_cbc_sha1_tls_implicit_iv = {
+     aead_tls_tag_len,
+ };
+ 
++static const EVP_AEAD aead_aes_256_cbc_sha256_tls = {
++    SHA256_DIGEST_LENGTH + 32,  // key len (SHA256 + AES256)
++    16,                         // nonce len (IV)
++    16 + SHA256_DIGEST_LENGTH,  // overhead (padding + SHA256)
++    SHA256_DIGEST_LENGTH,       // max tag length
++
++    NULL,  // init
++    aead_aes_256_cbc_sha256_tls_init,
++    aead_tls_cleanup,
++    aead_tls_openv,
++    aead_tls_sealv,
++    NULL,  // open_gather
++    NULL,  // get_iv
++    aead_tls_tag_len,
++};
++
++static const EVP_AEAD aead_aes_256_cbc_sha384_tls = {
++    SHA384_DIGEST_LENGTH + 32,  // key len (SHA384 + AES256)
++    16,                         // nonce len (IV)
++    16 + SHA384_DIGEST_LENGTH,  // overhead (padding + SHA384)
++    SHA384_DIGEST_LENGTH,       // max tag length
++
++    NULL,  // init
++    aead_aes_256_cbc_sha384_tls_init,
++    aead_tls_cleanup,
++    aead_tls_openv,
++    aead_tls_sealv,
++    NULL,  // open_gather
++    NULL,  // get_iv
++    aead_tls_tag_len,
++};
++
+ static const EVP_AEAD aead_des_ede3_cbc_sha1_tls = {
+     SHA_DIGEST_LENGTH + 24,  // key len (SHA1 + 3DES)
+     8,                       // nonce len (IV)
+@@ -603,6 +655,14 @@ const EVP_AEAD *EVP_aead_aes_256_cbc_sha1_tls_implicit_iv() {
+   return &aead_aes_256_cbc_sha1_tls_implicit_iv;
+ }
+ 
++const EVP_AEAD *EVP_aead_aes_256_cbc_sha256_tls() {
++  return &aead_aes_256_cbc_sha256_tls;
++}
++
++const EVP_AEAD *EVP_aead_aes_256_cbc_sha384_tls() {
++  return &aead_aes_256_cbc_sha384_tls;
++}
++
+ const EVP_AEAD *EVP_aead_des_ede3_cbc_sha1_tls() {
+   return &aead_des_ede3_cbc_sha1_tls;
+ }
+diff --git a/crypto/cipher/tls_cbc.cc b/crypto/cipher/tls_cbc.cc
+index dc7058e5b..41ae5ea30 100644
+--- a/crypto/cipher/tls_cbc.cc
++++ b/crypto/cipher/tls_cbc.cc
+@@ -327,10 +327,108 @@ int bssl::EVP_sha256_final_with_secret_suffix(SHA256_CTX *ctx,
+   return 1;
+ }
+ 
++// BoringSSL removed generic SHA-384 CBC verification in
++// https://github.com/google/boringssl/commit/c31fb79cfe35f8b14731bb2598d091b2e1394577.
++// This specialization follows the current SHA-256 secret-suffix design while
++// retaining SHA-384's 128-byte block and 16-byte length field. That design was
++// introduced in
++// https://github.com/google/boringssl/commit/b1c6f45f1fe6d808555d04a41bb44b322e4f4c1d.
++// The earlier SHA-384 variable-block correction is recorded in
++// https://github.com/google/boringssl/commit/144d924e0b3c3a5ceb7083a408ba69b7cca1a25c.
++// Its fixed variance count is replaced by the public max_len loop below.
++static int sha384_final_with_secret_suffix(
++    SHA512_CTX *ctx, uint8_t out[SHA384_DIGEST_LENGTH], const uint8_t *in,
++    size_t len, size_t max_len) {
++  constexpr size_t kBlockSize = SHA384_CBLOCK;
++  constexpr size_t kLengthFieldSize = 2 * sizeof(uint64_t);
++  static_assert(SHA384_DIGEST_LENGTH == 48);
++  static_assert(kBlockSize == 128);
++  static_assert(kLengthFieldSize == 16);
++  static_assert(kBlockSize == SHA512_CBLOCK);
++
++  // TLS records are much smaller than this bound. Keeping the total byte count
++  // below 2^61 lets the SHA-384 bit length fit in the low half of its 128-bit
++  // length field and also bounds the block-count arithmetic below.
++  constexpr uint64_t kMaxBytes = UINT64_MAX >> 3;
++  if (len > max_len || ctx->md_len != SHA384_DIGEST_LENGTH ||
++      ctx->num >= kBlockSize ||
++      ctx->bytes_so_far_high != 0 ||
++      ctx->bytes_so_far_low > kMaxBytes ||
++      max_len > kMaxBytes - ctx->bytes_so_far_low ||
++      max_len >
++          SIZE_MAX - ctx->num - 1 - kLengthFieldSize - (kBlockSize - 1)) {
++    return 0;
++  }
++
++  // SHA-384 uses SHA-512's compression function, 128-byte blocks, and 16-byte
++  // length field. See FIPS 180-4, sections 5.1.2 and 5.3.4.
++  // https://doi.org/10.6028/NIST.FIPS.180-4
++  size_t num_blocks =
++      (ctx->num + len + 1 + kLengthFieldSize + kBlockSize - 1) / kBlockSize;
++  size_t last_block = num_blocks - 1;
++  size_t max_blocks =
++      (ctx->num + max_len + 1 + kLengthFieldSize + kBlockSize - 1) /
++      kBlockSize;
++
++  uint64_t total_bits = (ctx->bytes_so_far_low + len) << 3;
++  uint8_t length_bytes[kLengthFieldSize] = {0};
++  CRYPTO_store_u64_be(
++      length_bytes + kLengthFieldSize - sizeof(total_bits), total_bits);
++
++  uint8_t block[kBlockSize] = {0};
++  uint8_t result[SHA384_DIGEST_LENGTH] = {0};
++  size_t input_idx = 0;
++  for (size_t i = 0; i < max_blocks; i++) {
++    size_t block_start = 0;
++    if (i == 0) {
++      OPENSSL_memcpy(block, ctx->p, ctx->num);
++      block_start = ctx->num;
++    }
++    if (input_idx < max_len) {
++      size_t to_copy = kBlockSize - block_start;
++      if (to_copy > max_len - input_idx) {
++        to_copy = max_len - input_idx;
++      }
++      OPENSSL_memcpy(block + block_start, in + input_idx, to_copy);
++    }
++
++    for (size_t j = block_start; j < kBlockSize; j++) {
++      size_t idx = input_idx + j - block_start;
++      uint8_t is_in_bounds =
++          constant_time_lt_8(idx, value_barrier_w(len));
++      uint8_t is_padding_byte =
++          constant_time_eq_8(idx, value_barrier_w(len));
++      block[j] &= is_in_bounds;
++      block[j] |= 0x80 & is_padding_byte;
++    }
++
++    input_idx += kBlockSize - block_start;
++
++    crypto_word_t is_last_block =
++        value_barrier_w(constant_time_eq_w(i, last_block));
++    for (size_t j = 0; j < sizeof(length_bytes); j++) {
++      block[kBlockSize - sizeof(length_bytes) + j] |=
++          is_last_block & length_bytes[j];
++    }
++
++    SHA512_Transform(ctx, block);
++    for (size_t j = 0; j < 8; j++) {
++      CRYPTO_store_u64_be(block + 8 * j, ctx->h[j]);
++    }
++    for (size_t j = 0; j < sizeof(result); j++) {
++      result[j] |= block[j] & is_last_block;
++    }
++  }
++
++  OPENSSL_memcpy(out, result, sizeof(result));
++  return 1;
++}
++
+ int bssl::EVP_tls_cbc_record_digest_supported(const EVP_MD *md) {
+   switch (EVP_MD_type(md)) {
+     case NID_sha1:
+     case NID_sha256:
++    case NID_sha384:
+       return 1;
+     default:
+       return 0;
+@@ -449,6 +547,57 @@ static int tls_cbc_digest_record_sha256(
+   return 1;
+ }
+ 
++static int tls_cbc_digest_record_sha384(
++    uint8_t *md_out, size_t *md_out_size, const uint8_t len_header[2],
++    Span<const CRYPTO_IVEC> aadvecs,
++    Span<const CRYPTO_IOVEC> iovecs_without_trailer,
++    Span<const uint8_t> trailer, size_t data_in_trailer_size,
++    const uint8_t *mac_secret, unsigned mac_secret_length) {
++  if (mac_secret_length > SHA512_CBLOCK) {
++    // HMAC pads small keys with zeros and hashes large keys down. This function
++    // should never reach the large key case.
++    assert(0);
++    return 0;
++  }
++
++  uint8_t hmac_pad[SHA512_CBLOCK];
++  OPENSSL_memset(hmac_pad, 0, sizeof(hmac_pad));
++  OPENSSL_memcpy(hmac_pad, mac_secret, mac_secret_length);
++  for (size_t i = 0; i < SHA512_CBLOCK; i++) {
++    hmac_pad[i] ^= 0x36;
++  }
++
++  SHA512_CTX ctx;
++  SHA384_Init(&ctx);
++  SHA384_Update(&ctx, hmac_pad, SHA512_CBLOCK);
++  for (const CRYPTO_IVEC &aadvec : aadvecs) {
++    SHA384_Update(&ctx, aadvec.in, aadvec.len);
++  }
++  SHA384_Update(&ctx, len_header, 2);
++
++  for (const CRYPTO_IOVEC &iovec : iovecs_without_trailer) {
++    SHA384_Update(&ctx, iovec.out, iovec.len);
++  }
++
++  uint8_t mac_out[SHA384_DIGEST_LENGTH];
++  if (!sha384_final_with_secret_suffix(&ctx, mac_out, trailer.data(),
++                                        data_in_trailer_size,
++                                        trailer.size())) {
++    return 0;
++  }
++
++  SHA384_Init(&ctx);
++  for (size_t i = 0; i < SHA512_CBLOCK; i++) {
++    hmac_pad[i] ^= 0x6a;
++  }
++
++  SHA384_Update(&ctx, hmac_pad, SHA512_CBLOCK);
++  SHA384_Update(&ctx, mac_out, SHA384_DIGEST_LENGTH);
++  SHA384_Final(md_out, &ctx);
++  *md_out_size = SHA384_DIGEST_LENGTH;
++  return 1;
++}
++
+ int bssl::EVP_tls_cbc_digest_record(
+     const EVP_MD *md, uint8_t *md_out, size_t *md_out_size,
+     const uint8_t len_header[2], Span<const CRYPTO_IVEC> aadvecs,
+@@ -466,6 +615,11 @@ int bssl::EVP_tls_cbc_digest_record(
+           md_out, md_out_size, len_header, aadvecs, iovecs_without_trailer,
+           trailer, data_in_trailer_size, mac_secret, mac_secret_length);
+ 
++    case NID_sha384:
++      return tls_cbc_digest_record_sha384(  //
++          md_out, md_out_size, len_header, aadvecs, iovecs_without_trailer,
++          trailer, data_in_trailer_size, mac_secret, mac_secret_length);
++
+     default:
+       // EVP_tls_cbc_record_digest_supported should have been called first to
+       // check that the hash function is supported.
+diff --git a/crypto/obj/obj_dat.h b/crypto/obj/obj_dat.h
+index b0033f6d8..238e8c1be 100644
+--- a/crypto/obj/obj_dat.h
++++ b/crypto/obj/obj_dat.h
+@@ -16,7 +16,7 @@
+ 
+ 
+ BSSL_NAMESPACE_BEGIN
+-#define NUM_NID 975
++#define NUM_NID 976
+ 
+ static const uint8_t kObjectData[] = {
+     /* NID_rsadsi */
+@@ -8805,6 +8805,7 @@ static const ASN1_OBJECT kObjects[NUM_NID] = {
+     {"X-Wing", "X-Wing", NID_X_Wing, 0, NULL, 0},
+     {"ffdhe2048", "ffdhe2048", NID_ffdhe2048, 0, NULL, 0},
+     {"ffdhe3072", "ffdhe3072", NID_ffdhe3072, 0, NULL, 0},
++    {"KxDHE", "kx-dhe", NID_kx_dhe, 0, NULL, 0},
+ };
+ 
+ static const uint16_t kNIDsInShortNameOrder[] = {
+@@ -8916,6 +8917,7 @@ static const uint16_t kNIDsInShortNameOrder[] = {
+     646 /* JOINT-ISO-ITU-T */,
+     773 /* KISA */,
+     957 /* KxANY */,
++    975 /* KxDHE */,
+     952 /* KxECDHE */,
+     953 /* KxPSK */,
+     951 /* KxRSA */,
+@@ -10386,6 +10388,7 @@ static const uint16_t kNIDsInLongNameOrder[] = {
+     150 /* keyBag */,
+     773 /* kisa */,
+     957 /* kx-any */,
++    975 /* kx-dhe */,
+     952 /* kx-ecdhe */,
+     953 /* kx-psk */,
+     951 /* kx-rsa */,
+diff --git a/crypto/obj/obj_mac.num b/crypto/obj/obj_mac.num
+index 88028c1d5..a926c44cd 100644
+--- a/crypto/obj/obj_mac.num
++++ b/crypto/obj/obj_mac.num
+@@ -962,3 +962,4 @@ P256Kyber768Draft00		971
+ X_Wing		972
+ ffdhe2048		973
+ ffdhe3072		974
++kx_dhe		975
+diff --git a/crypto/obj/objects.txt b/crypto/obj/objects.txt
+index 4df384560..19e444f33 100644
+--- a/crypto/obj/objects.txt
++++ b/crypto/obj/objects.txt
+@@ -1362,6 +1362,7 @@ secg-scheme 14 3 : dhSinglePass-cofactorDH-sha512kdf-scheme
+ # NIDs for TLS 1.2 cipher suite key exchanges.
+  : KxRSA : kx-rsa
+  : KxECDHE : kx-ecdhe
++ : KxDHE : kx-dhe
+  : KxPSK : kx-psk
+ 
+ # NIDs for TLS 1.2 cipher suite authentication types.
+diff --git a/include/openssl/aead.h b/include/openssl/aead.h
+index 6b8ad575a..3ff2a5328 100644
+--- a/include/openssl/aead.h
++++ b/include/openssl/aead.h
+@@ -579,6 +579,8 @@ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_128_cbc_sha1_tls_implicit_iv(void);
+ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_128_cbc_sha256_tls(void);
+ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_256_cbc_sha1_tls(void);
+ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_256_cbc_sha1_tls_implicit_iv(void);
++OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_256_cbc_sha256_tls(void);
++OPENSSL_EXPORT const EVP_AEAD *EVP_aead_aes_256_cbc_sha384_tls(void);
+ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_des_ede3_cbc_sha1_tls(void);
+ OPENSSL_EXPORT const EVP_AEAD *EVP_aead_des_ede3_cbc_sha1_tls_implicit_iv(void);
+ 
+diff --git a/include/openssl/nid.h b/include/openssl/nid.h
+index d68290da3..61082b8db 100644
+--- a/include/openssl/nid.h
++++ b/include/openssl/nid.h
+@@ -5520,6 +5520,10 @@ extern "C" {
+ #define SN_ffdhe3072 "ffdhe3072"
+ #define NID_ffdhe3072 974
+ 
++#define SN_kx_dhe "KxDHE"
++#define LN_kx_dhe "kx-dhe"
++#define NID_kx_dhe 975
++
+ 
+ #if defined(__cplusplus)
+ } /* extern C */
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index efe410481..c7c596ddf 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -1501,18 +1501,24 @@ DEFINE_CONST_STACK_OF(SSL_CIPHER)
+ #define SSL_CIPHER_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 0xcca8
+ #define SSL_CIPHER_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 0xcca9
+ #define SSL_CIPHER_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 0xccac
++#define SSL_CIPHER_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA 0xc008
+ #define SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA 0xc009
+ #define SSL_CIPHER_ECDHE_ECDSA_WITH_AES_256_CBC_SHA 0xc00a
++#define SSL_CIPHER_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA 0xc012
+ #define SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA 0xc013
+ #define SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA 0xc014
+ #define SSL_CIPHER_ECDHE_PSK_WITH_AES_128_CBC_SHA 0xc035
+ #define SSL_CIPHER_ECDHE_PSK_WITH_AES_256_CBC_SHA 0xc036
+ #define SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 0xc023
++#define SSL_CIPHER_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 0xc024
+ #define SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA256 0xc027
++#define SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA384 0xc028
+ #define SSL_CIPHER_RSA_WITH_AES_128_GCM_SHA256 0x009c
+ #define SSL_CIPHER_RSA_WITH_AES_256_GCM_SHA384 0x009d
+ #define SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA 0x002f
+ #define SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA 0x0035
++#define SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA256 0x003c
++#define SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA256 0x003d
+ #define SSL_CIPHER_PSK_WITH_AES_128_CBC_SHA 0x008c
+ #define SSL_CIPHER_PSK_WITH_AES_256_CBC_SHA 0x008d
+ #define SSL_CIPHER_RSA_WITH_3DES_EDE_CBC_SHA 0x000a
+@@ -1522,6 +1528,24 @@ DEFINE_CONST_STACK_OF(SSL_CIPHER)
+ #define SSL_CIPHER_EMPTY_RENEGOTIATION_INFO_SCSV 0x00ff
+ #define SSL_CIPHER_FALLBACK_SCSV 0x5600
+ 
++// Cipher 33
++#define SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA 0x0033
++
++// Cipher 39
++#define SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA 0x0039
++
++// Cipher 67
++#define SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA256 0x0067
++
++// Cipher 6B
++#define SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA256 0x006B
++
++// Cipher 9E
++#define SSL_CIPHER_DHE_RSA_WITH_AES_128_GCM_SHA256 0x009E
++
++// Cipher 9F
++#define SSL_CIPHER_DHE_RSA_WITH_AES_256_GCM_SHA384 0x009F
++
+ // SSL_get_cipher_by_value returns the structure representing a TLS cipher
+ // suite based on its assigned number, or NULL if unknown. See
+ // https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml#tls-parameters-4.
+@@ -1550,9 +1574,9 @@ OPENSSL_EXPORT int SSL_CIPHER_get_cipher_nid(const SSL_CIPHER *cipher);
+ OPENSSL_EXPORT int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *cipher);
+ 
+ // SSL_CIPHER_get_kx_nid returns the NID for `cipher`'s key exchange. This may
+-// be `NID_kx_rsa`, `NID_kx_ecdhe`, or `NID_kx_psk` for TLS 1.2. In TLS 1.3,
+-// cipher suites do not specify the key exchange, so this function returns
+-// `NID_kx_any`.
++// be `NID_kx_rsa`, `NID_kx_dhe`, `NID_kx_ecdhe`, or `NID_kx_psk` for TLS 1.2.
++// In TLS 1.3, cipher suites do not specify the key exchange, so this function
++// returns `NID_kx_any`.
+ OPENSSL_EXPORT int SSL_CIPHER_get_kx_nid(const SSL_CIPHER *cipher);
+ 
+ // SSL_CIPHER_get_auth_nid returns the NID for `cipher`'s authentication
+diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
+index f4b348481..0a01b2456 100644
+--- a/include/openssl/tls1.h
++++ b/include/openssl/tls1.h
+@@ -189,14 +189,20 @@ extern "C" {
+ #define TLS1_CK_ECDHE_PSK_WITH_AES_256_CBC_SHA 0x0300C036
+ #define TLS1_CK_RSA_WITH_AES_128_SHA 0x0300002F
+ #define TLS1_CK_RSA_WITH_AES_256_SHA 0x03000035
++#define TLS1_CK_RSA_WITH_AES_128_SHA256 0x0300003C
++#define TLS1_CK_RSA_WITH_AES_256_SHA256 0x0300003D
+ #define TLS1_CK_RSA_WITH_AES_128_GCM_SHA256 0x0300009C
+ #define TLS1_CK_RSA_WITH_AES_256_GCM_SHA384 0x0300009D
++#define TLS1_CK_ECDHE_ECDSA_WITH_DES_192_CBC3_SHA 0x0300C008
+ #define TLS1_CK_ECDHE_ECDSA_WITH_AES_128_CBC_SHA 0x0300C009
+ #define TLS1_CK_ECDHE_ECDSA_WITH_AES_256_CBC_SHA 0x0300C00A
++#define TLS1_CK_ECDHE_RSA_WITH_DES_192_CBC3_SHA 0x0300C012
+ #define TLS1_CK_ECDHE_RSA_WITH_AES_128_CBC_SHA 0x0300C013
+ #define TLS1_CK_ECDHE_RSA_WITH_AES_256_CBC_SHA 0x0300C014
+ #define TLS1_CK_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 0x0300C023
++#define TLS1_CK_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 0x0300C024
+ #define TLS1_CK_ECDHE_RSA_WITH_AES_128_CBC_SHA256 0x0300C027
++#define TLS1_CK_ECDHE_RSA_WITH_AES_256_SHA384 0x0300C028
+ #define TLS1_CK_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 0x0300C02B
+ #define TLS1_CK_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 0x0300C02C
+ #define TLS1_CK_ECDHE_RSA_WITH_AES_128_GCM_SHA256 0x0300C02F
+@@ -223,14 +229,20 @@ extern "C" {
+ #define TLS1_TXT_ECDHE_PSK_WITH_AES_256_CBC_SHA "ECDHE-PSK-AES256-CBC-SHA"
+ #define TLS1_TXT_RSA_WITH_AES_128_SHA "AES128-SHA"
+ #define TLS1_TXT_RSA_WITH_AES_256_SHA "AES256-SHA"
++#define TLS1_TXT_RSA_WITH_AES_128_SHA256 "AES128-SHA256"
++#define TLS1_TXT_RSA_WITH_AES_256_SHA256 "AES256-SHA256"
+ #define TLS1_TXT_RSA_WITH_AES_128_GCM_SHA256 "AES128-GCM-SHA256"
+ #define TLS1_TXT_RSA_WITH_AES_256_GCM_SHA384 "AES256-GCM-SHA384"
++#define TLS1_TXT_ECDHE_ECDSA_WITH_DES_192_CBC3_SHA "ECDHE-ECDSA-DES-CBC3-SHA"
+ #define TLS1_TXT_ECDHE_ECDSA_WITH_AES_128_CBC_SHA "ECDHE-ECDSA-AES128-SHA"
+ #define TLS1_TXT_ECDHE_ECDSA_WITH_AES_256_CBC_SHA "ECDHE-ECDSA-AES256-SHA"
++#define TLS1_TXT_ECDHE_RSA_WITH_DES_192_CBC3_SHA "ECDHE-RSA-DES-CBC3-SHA"
+ #define TLS1_TXT_ECDHE_RSA_WITH_AES_128_CBC_SHA "ECDHE-RSA-AES128-SHA"
+ #define TLS1_TXT_ECDHE_RSA_WITH_AES_256_CBC_SHA "ECDHE-RSA-AES256-SHA"
+ #define TLS1_TXT_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 "ECDHE-ECDSA-AES128-SHA256"
++#define TLS1_TXT_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 "ECDHE-ECDSA-AES256-SHA384"
+ #define TLS1_TXT_ECDHE_RSA_WITH_AES_128_CBC_SHA256 "ECDHE-RSA-AES128-SHA256"
++#define TLS1_TXT_ECDHE_RSA_WITH_AES_256_CBC_SHA384 "ECDHE-RSA-AES256-SHA384"
+ #define TLS1_TXT_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 \
+   "ECDHE-ECDSA-AES128-GCM-SHA256"
+ #define TLS1_TXT_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 \
+@@ -256,6 +268,24 @@ extern "C" {
+ #define TLS_CT_ECDSA_FIXED_ECDH 66
+ 
+ 
++// Cipher 33
++#define TLS1_TXT_DHE_RSA_WITH_AES_128_SHA "DHE-RSA-AES128-SHA"
++
++// Cipher 39
++#define TLS1_TXT_DHE_RSA_WITH_AES_256_SHA "DHE-RSA-AES256-SHA"
++
++// Cipher 67
++#define TLS1_TXT_DHE_RSA_WITH_AES_128_SHA256 "DHE-RSA-AES128-SHA256"
++
++// Cipher 6B
++#define TLS1_TXT_DHE_RSA_WITH_AES_256_SHA256 "DHE-RSA-AES256-SHA256"
++
++// Cipher 9E
++#define TLS1_TXT_DHE_RSA_WITH_AES_128_GCM_SHA256 "DHE-RSA-AES128-GCM-SHA256"
++
++// Cipher 9F
++#define TLS1_TXT_DHE_RSA_WITH_AES_256_GCM_SHA384 "DHE-RSA-AES256-GCM-SHA384"
++
+ #ifdef __cplusplus
+ }  // extern C
+ #endif
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index a4a53cda6..3b95a869c 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -23,9 +23,11 @@
+ #include <algorithm>
+ #include <utility>
+ 
++#include <../crypto/fipsmodule/dh/internal.h>
+ #include <openssl/aead.h>
+ #include <openssl/bn.h>
+ #include <openssl/bytestring.h>
++#include <openssl/dh.h>
+ #include <openssl/ec_key.h>
+ #include <openssl/ecdsa.h>
+ #include <openssl/err.h>
+@@ -1051,7 +1053,29 @@ static enum ssl_hs_wait_t do_read_server_key_exchange(SSL_HANDSHAKE *hs) {
+     hs->peer_psk_identity_hint.reset(raw);
+   }
+ 
+-  if (alg_k & SSL_kECDHE) {
++  // BoringSSL removed finite-field DHE client handling in
++  // https://github.com/google/boringssl/commit/7e06de5d2d1b53c57c0c81e8d6ba4122b64cf626.
++  // Keep this branch aligned with the implementation before that removal.
++  if (alg_k & SSL_kDHE) {
++    CBS dh_p, dh_g, dh_Ys;
++    if (!CBS_get_u16_length_prefixed(&server_key_exchange, &dh_p) ||
++        CBS_len(&dh_p) == 0 ||
++        !CBS_get_u16_length_prefixed(&server_key_exchange, &dh_g) ||
++        CBS_len(&dh_g) == 0 ||
++        !CBS_get_u16_length_prefixed(&server_key_exchange, &dh_Ys) ||
++        CBS_len(&dh_Ys) == 0) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_DECODE_ERROR);
++      ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
++      return ssl_hs_error;
++    }
++    if (!hs->dh_p.CopyFrom(dh_p) || !hs->dh_g.CopyFrom(dh_g)) {
++      return ssl_hs_error;
++    }
++    /* Save the peer public key for later. */
++    if (!hs->peer_key.CopyFrom(dh_Ys)) {
++      return ssl_hs_error;
++    }
++  } else if (alg_k & SSL_kECDHE) {
+     // Parse the server parameters.
+     uint8_t group_type;
+     uint16_t group_id;
+@@ -1474,6 +1498,62 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
+         !CBB_flush(&body)) {
+       return ssl_hs_error;
+     }
++  } else if (alg_k & SSL_kDHE) {
++    DH *dh = DH_new();
++    if (dh == nullptr) {
++      return ssl_hs_error;
++    }
++    BIGNUM *dh_p = BN_bin2bn(hs->dh_p.data(), hs->dh_p.size(), nullptr);
++    BIGNUM *dh_g = BN_bin2bn(hs->dh_g.data(), hs->dh_g.size(), nullptr);
++    if (dh_p == nullptr || dh_g == nullptr ||
++        !DH_set0_pqg(dh, dh_p, nullptr, dh_g)) {
++      BN_free(dh_p);
++      BN_free(dh_g);
++      DH_free(dh);
++      return ssl_hs_error;
++    }
++    unsigned bits = BN_num_bits(DH_get0_p(dh));
++    if (bits < 1024) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_DH_P_LENGTH);
++      DH_free(dh);
++      return ssl_hs_error;
++    } else if (bits > 4096) {
++      /* Overly large DHE groups are prohibitively expensive, so enforce a limit
++       * to prevent a server from causing us to perform too expensive of a
++       * computation. */
++      OPENSSL_PUT_ERROR(SSL, SSL_R_DH_P_TOO_LONG);
++      DH_free(dh);
++      return ssl_hs_error;
++    }
++
++    CBB child;
++    if (!CBB_add_u16_length_prefixed(&body, &child)) {
++      DH_free(dh);
++      return ssl_hs_error;
++    }
++    if (!DH_generate_key(dh) ||
++        !BN_bn2cbb_padded(&child, BN_num_bytes(DH_get0_p(dh)),
++                          DH_get0_pub_key(dh))) {
++      DH_free(dh);
++      ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_INTERNAL_ERROR);
++      return ssl_hs_error;
++    }
++    int secret_len = 0;
++    BIGNUM *peer_point =
++        BN_bin2bn(hs->peer_key.data(), hs->peer_key.size(), nullptr);
++    if (peer_point == nullptr || !pms.InitForOverwrite(DH_size(dh)) ||
++        (secret_len = DH_compute_key(pms.data(), peer_point, dh)) <= 0) {
++      BN_free(peer_point);
++      DH_free(dh);
++      ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_INTERNAL_ERROR);
++      return ssl_hs_error;
++    }
++    pms.Shrink(secret_len);
++    BN_free(peer_point);
++    DH_free(dh);
++    hs->dh_p.Reset();
++    hs->dh_g.Reset();
++    hs->peer_key.Reset();
+   } else if (alg_k & SSL_kECDHE) {
+     CBB child;
+     if (!CBB_add_u8_length_prefixed(&body, &child)) {
+diff --git a/ssl/internal.h b/ssl/internal.h
+index fab6c0423..bb7cdfeca 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -218,10 +218,11 @@ BSSL_NAMESPACE_BEGIN
+ 
+ // Bits for `algorithm_mkey` (key exchange algorithm).
+ #define SSL_kRSA 0x00000001u
+-#define SSL_kECDHE 0x00000002u
++#define SSL_kDHE 0x00000002u
++#define SSL_kECDHE 0x00000004u
+ // SSL_kPSK is only set for plain PSK, not ECDHE_PSK.
+-#define SSL_kPSK 0x00000004u
+-#define SSL_kGENERIC 0x00000008u
++#define SSL_kPSK 0x00000008u
++#define SSL_kGENERIC 0x00000010u
+ 
+ // Bits for `algorithm_auth` (server authentication).
+ #define SSL_aRSA_SIGN 0x00000001u
+@@ -246,8 +247,9 @@ BSSL_NAMESPACE_BEGIN
+ // Bits for `algorithm_mac` (symmetric authentication).
+ #define SSL_SHA1 0x00000001u
+ #define SSL_SHA256 0x00000002u
++#define SSL_SHA384 0x00000004u
+ // SSL_AEAD is set for all AEADs.
+-#define SSL_AEAD 0x00000004u
++#define SSL_AEAD 0x00000008u
+ 
+ // Bits for `algorithm_prf` (handshake digest).
+ #define SSL_HANDSHAKE_MAC_DEFAULT 0x1
+@@ -2150,6 +2152,12 @@ struct SSL_HANDSHAKE {
+   // pake_verifier is the PAKE context for a server.
+   UniquePtr<spake2plus::Verifier> pake_verifier;
+ 
++  // dh_p and dh_g are the Diffie-Hellman parameters from a ServerKeyExchange in
++  // a TLS 1.2 handshake. They are only used for the legacy handshake and are
++  // not used in TLS 1.3 or with ECDHE key exchanges.
++  Array<uint8_t> dh_p;
++  Array<uint8_t> dh_g;
++
+   // offered_client_cert_types, for a client, is a list of client certificate
+   // types (`TLSEXT_cert_type_*` values) that were sent in the
+   // client_certificate_type extension in the ClientHello.
+diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
+index 7799d79f9..d612ddf28 100644
+--- a/ssl/ssl_cipher.cc
++++ b/ssl/ssl_cipher.cc
+@@ -63,6 +63,18 @@ static constexpr SSL_CIPHER kCiphers[] = {
+         SSL_HANDSHAKE_MAC_DEFAULT,
+     },
+ 
++    // Cipher 33
++    {
++        TLS1_TXT_DHE_RSA_WITH_AES_128_SHA,
++        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
++        SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA,
++        SSL_kDHE,
++        SSL_aRSA_SIGN,
++        SSL_AES128,
++        SSL_SHA1,
++        SSL_HANDSHAKE_MAC_DEFAULT,
++    },
++
+     // Cipher 35
+     {
+         TLS1_TXT_RSA_WITH_AES_256_SHA,
+@@ -75,6 +87,74 @@ static constexpr SSL_CIPHER kCiphers[] = {
+         SSL_HANDSHAKE_MAC_DEFAULT,
+     },
+ 
++    // Cipher 39
++    {
++        TLS1_TXT_DHE_RSA_WITH_AES_256_SHA,
++        "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
++        SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA,
++        SSL_kDHE,
++        SSL_aRSA_SIGN,
++        SSL_AES256,
++        SSL_SHA1,
++        SSL_HANDSHAKE_MAC_DEFAULT,
++    },
++
++    // Ciphers 3C, 3D were removed in
++    // https://boringssl-review.googlesource.com/c/boringssl/+/27944/
++    // and restored here for older browser profiles. The AEAD and constant-time
++    // record verifier are kept in this patch so both suites can negotiate and
++    // carry TLS 1.2 application data.
++
++    // TLS v1.2 ciphersuites
++
++    // Cipher 3C
++    {
++        TLS1_TXT_RSA_WITH_AES_128_SHA256,
++        "TLS_RSA_WITH_AES_128_CBC_SHA256",
++        SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA256,
++        SSL_kRSA,
++        SSL_aRSA_DECRYPT,
++        SSL_AES128,
++        SSL_SHA256,
++        SSL_HANDSHAKE_MAC_SHA256,
++    },
++
++    // Cipher 3D
++    {
++        TLS1_TXT_RSA_WITH_AES_256_SHA256,
++        "TLS_RSA_WITH_AES_256_CBC_SHA256",
++        SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA256,
++        SSL_kRSA,
++        SSL_aRSA_DECRYPT,
++        SSL_AES256,
++        SSL_SHA256,
++        SSL_HANDSHAKE_MAC_SHA256,
++    },
++
++    // Cipher 67
++    {
++        TLS1_TXT_DHE_RSA_WITH_AES_128_SHA256,
++        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA256",
++        SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA256,
++        SSL_kDHE,
++        SSL_aRSA_SIGN,
++        SSL_AES128,
++        SSL_SHA256,
++        SSL_HANDSHAKE_MAC_SHA256,
++    },
++
++    // Cipher 6B
++    {
++        TLS1_TXT_DHE_RSA_WITH_AES_256_SHA256,
++        "TLS_DHE_RSA_WITH_AES_256_CBC_SHA256",
++        SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA256,
++        SSL_kDHE,
++        SSL_aRSA_SIGN,
++        SSL_AES256,
++        SSL_SHA256,
++        SSL_HANDSHAKE_MAC_SHA256,
++    },
++
+     // PSK cipher suites.
+ 
+     // Cipher 8C
+@@ -127,6 +207,30 @@ static constexpr SSL_CIPHER kCiphers[] = {
+         SSL_HANDSHAKE_MAC_SHA384,
+     },
+ 
++    // Cipher 9E
++    {
++        TLS1_TXT_DHE_RSA_WITH_AES_128_GCM_SHA256,
++        "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256",
++        SSL_CIPHER_DHE_RSA_WITH_AES_128_GCM_SHA256,
++        SSL_kDHE,
++        SSL_aRSA_SIGN,
++        SSL_AES128GCM,
++        SSL_AEAD,
++        SSL_HANDSHAKE_MAC_SHA256,
++    },
++
++    // Cipher 9F
++    {
++        TLS1_TXT_DHE_RSA_WITH_AES_256_GCM_SHA384,
++        "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
++        SSL_CIPHER_DHE_RSA_WITH_AES_256_GCM_SHA384,
++        SSL_kDHE,
++        SSL_aRSA_SIGN,
++        SSL_AES256GCM,
++        SSL_AEAD,
++        SSL_HANDSHAKE_MAC_SHA384,
++    },
++
+     // TLS 1.3 suites.
+ 
+     // Cipher 1301
+@@ -165,6 +269,18 @@ static constexpr SSL_CIPHER kCiphers[] = {
+         SSL_HANDSHAKE_MAC_SHA256,
+     },
+ 
++    // Cipher C008
++    {
++        TLS1_TXT_ECDHE_ECDSA_WITH_DES_192_CBC3_SHA,
++        "TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA",
++        SSL_CIPHER_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
++        SSL_kECDHE,
++        SSL_aECDSA,
++        SSL_3DES,
++        SSL_SHA1,
++        SSL_HANDSHAKE_MAC_DEFAULT,
++    },
++
+     // Cipher C009
+     {
+         TLS1_TXT_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+@@ -189,6 +305,18 @@ static constexpr SSL_CIPHER kCiphers[] = {
+         SSL_HANDSHAKE_MAC_DEFAULT,
+     },
+ 
++    // Cipher C012
++    {
++        TLS1_TXT_ECDHE_RSA_WITH_DES_192_CBC3_SHA,
++        "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
++        SSL_CIPHER_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
++        SSL_kECDHE,
++        SSL_aRSA_SIGN,
++        SSL_3DES,
++        SSL_SHA1,
++        SSL_HANDSHAKE_MAC_DEFAULT,
++    },
++
+     // Cipher C013
+     {
+         TLS1_TXT_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+@@ -227,6 +355,18 @@ static constexpr SSL_CIPHER kCiphers[] = {
+         SSL_HANDSHAKE_MAC_SHA256,
+     },
+ 
++    // Cipher C024 (deprecated)
++    {
++        TLS1_TXT_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
++        "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
++        SSL_CIPHER_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
++        SSL_kECDHE,
++        SSL_aECDSA,
++        SSL_AES256,
++        SSL_SHA384,
++        SSL_HANDSHAKE_MAC_SHA384,
++    },
++
+     // Cipher C027 (deprecated)
+     {
+         TLS1_TXT_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+@@ -239,6 +379,18 @@ static constexpr SSL_CIPHER kCiphers[] = {
+         SSL_HANDSHAKE_MAC_SHA256,
+     },
+ 
++    // Cipher C028 (deprecated)
++    {
++        TLS1_TXT_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
++        "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
++        SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
++        SSL_kECDHE,
++        SSL_aRSA_SIGN,
++        SSL_AES256,
++        SSL_SHA384,
++        SSL_HANDSHAKE_MAC_SHA384,
++    },
++
+     // GCM based TLS v1.2 ciphersuites from RFC 5289
+ 
+     // Cipher C02B
+@@ -411,6 +563,13 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+     // multiple key exchange algs according to the RFCs.
+     {"kRSA", SSL_kRSA, ~0u, ~0u, ~0u, 0},
+ 
++    // Finite-field DHE support was removed in
++    // https://github.com/google/boringssl/commit/7e06de5d2d1b53c57c0c81e8d6ba4122b64cf626.
++    // Keep the legacy OpenSSL aliases for the client support restored here.
++    {"kDHE", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"kEDH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"DH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++
+     {"kECDHE", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"kEECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"ECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+@@ -424,6 +583,8 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+     {"aPSK", ~0u, SSL_aPSK, ~0u, ~0u, 0},
+ 
+     // aliases combining key exchange and server authentication
++    {"DHE", SSL_kDHE, ~0u, ~0u, ~0u, 0},
++    {"EDH", SSL_kDHE, ~0u, ~0u, ~0u, 0},
+     {"ECDHE", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"EECDH", SSL_kECDHE, ~0u, ~0u, ~0u, 0},
+     {"RSA", SSL_kRSA, SSL_aRSA_SIGN | SSL_aRSA_DECRYPT, ~0u, ~0u, 0},
+@@ -454,6 +615,11 @@ static const CIPHER_ALIAS kCipherAliases[] = {
+     // Legacy strength classes.
+     {"HIGH", ~0u, ~0u, ~0u, ~0u, 0},
+     {"FIPS", ~0u, ~0u, ~0u, ~0u, 0},
++
++    // Legacy aliases corresponding to restored SHA-2 CBC cipher rules.
++    // Keep these aligned with the patch-owned cipher inventory.
++    {"SHA256", ~0u, ~0u, ~0u, SSL_SHA256, 0},
++    {"SHA384", ~0u, ~0u, ~0u, SSL_SHA384, 0},
+ };
+ 
+ static const size_t kCipherAliasesLen = std::size(kCipherAliases);
+@@ -523,11 +689,19 @@ bool ssl_cipher_get_evp_aead(const EVP_AEAD **out_aead,
+   } else if (cipher->algorithm_mac == SSL_SHA256) {
+     if (cipher->algorithm_enc == SSL_AES128) {
+       *out_aead = EVP_aead_aes_128_cbc_sha256_tls();
++    } else if (cipher->algorithm_enc == SSL_AES256) {
++      *out_aead = EVP_aead_aes_256_cbc_sha256_tls();
+     } else {
+       return false;
+     }
+ 
+     *out_mac_secret_len = SHA256_DIGEST_LENGTH;
++  } else if (cipher->algorithm_mac == SSL_SHA384) {
++    if (cipher->algorithm_enc != SSL_AES256) {
++      return false;
++    }
++    *out_aead = EVP_aead_aes_256_cbc_sha384_tls();
++    *out_mac_secret_len = SHA384_DIGEST_LENGTH;
+   } else {
+     return false;
+   }
+@@ -1031,6 +1205,8 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+       SSL_CIPHER_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
+   };
+   static const uint16_t kLegacyCiphers[] = {
++      SSL_CIPHER_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
++      SSL_CIPHER_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+       SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+       SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+       SSL_CIPHER_ECDHE_PSK_WITH_AES_128_CBC_SHA,
+@@ -1038,14 +1214,24 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+       SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+       SSL_CIPHER_ECDHE_PSK_WITH_AES_256_CBC_SHA,
+       SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
++      SSL_CIPHER_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
+       SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
++      SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+       SSL_CIPHER_RSA_WITH_AES_128_GCM_SHA256,
+       SSL_CIPHER_RSA_WITH_AES_256_GCM_SHA384,
+       SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA,
++      SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA256,
+       SSL_CIPHER_PSK_WITH_AES_128_CBC_SHA,
+       SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA,
++      SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA256,
+       SSL_CIPHER_PSK_WITH_AES_256_CBC_SHA,
+       SSL_CIPHER_RSA_WITH_3DES_EDE_CBC_SHA,
++      SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA,
++      SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA,
++      SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA256,
++      SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA256,
++      SSL_CIPHER_DHE_RSA_WITH_AES_128_GCM_SHA256,
++      SSL_CIPHER_DHE_RSA_WITH_AES_256_GCM_SHA384,
+   };
+ 
+   // Set up a linked list of ciphers.
+@@ -1168,7 +1354,7 @@ bool ssl_cipher_uses_certificate_auth(const SSL_CIPHER *cipher) {
+ bool ssl_cipher_requires_server_key_exchange(const SSL_CIPHER *cipher) {
+   // Ephemeral Diffie-Hellman key exchanges require a ServerKeyExchange. It is
+   // optional or omitted in all others.
+-  return (cipher->algorithm_mkey & SSL_kECDHE) != 0;
++  return (cipher->algorithm_mkey & (SSL_kDHE | SSL_kECDHE)) != 0;
+ }
+ 
+ size_t ssl_cipher_get_record_split_len(const SSL_CIPHER *cipher) {
+@@ -1274,6 +1460,8 @@ int SSL_CIPHER_get_digest_nid(const SSL_CIPHER *cipher) {
+       return NID_sha1;
+     case SSL_SHA256:
+       return NID_sha256;
++    case SSL_SHA384:
++      return NID_sha384;
+   }
+   assert(0);
+   return NID_undef;
+@@ -1283,6 +1471,8 @@ int SSL_CIPHER_get_kx_nid(const SSL_CIPHER *cipher) {
+   switch (cipher->algorithm_mkey) {
+     case SSL_kRSA:
+       return NID_kx_rsa;
++    case SSL_kDHE:
++      return NID_kx_dhe;
+     case SSL_kECDHE:
+       return NID_kx_ecdhe;
+     case SSL_kPSK:
+@@ -1381,6 +1571,10 @@ const char *SSL_CIPHER_get_kx_name(const SSL_CIPHER *cipher) {
+     case SSL_kRSA:
+       return "RSA";
+ 
++    case SSL_kDHE:
++      assert(cipher->algorithm_auth == SSL_aRSA_SIGN);
++      return "DHE_RSA";
++
+     case SSL_kECDHE:
+       switch (cipher->algorithm_auth) {
+         case SSL_aECDSA:
+@@ -1460,6 +1654,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
+       kx = "RSA";
+       break;
+ 
++    case SSL_kDHE:
++      kx = "DH";
++      break;
++
+     case SSL_kECDHE:
+       kx = "ECDH";
+       break;
+@@ -1538,6 +1736,10 @@ const char *SSL_CIPHER_description(const SSL_CIPHER *cipher, char *buf,
+       mac = "SHA256";
+       break;
+ 
++    case SSL_SHA384:
++      mac = "SHA384";
++      break;
++
+     case SSL_AEAD:
+       mac = "AEAD";
+       break;
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index 49609464d..dd350d6b5 100644
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -217,6 +217,7 @@ static const CipherTest kCipherTests[] = {
+         "-kRSA:-ALL:"
+         "AESGCM+AES128+aRSA",
+         {
++            {SSL_CIPHER_DHE_RSA_WITH_AES_128_GCM_SHA256, 0},
+             {SSL_CIPHER_RSA_WITH_AES_128_GCM_SHA256, 0},
+             {SSL_CIPHER_ECDHE_RSA_WITH_AES_128_GCM_SHA256, 0},
+         },
+@@ -295,10 +296,17 @@ static const CipherTest kCipherTests[] = {
+         "aRSA",
+         {
+             {SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA, 0},
++            {SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA384, 0},
+             {SSL_CIPHER_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, 0},
+             {SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA, 0},
+             {SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA, 0},
++            {SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA256, 0},
++            {SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA, 0},
++            {SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA256, 0},
+             {SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA, 0},
++            {SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA256, 0},
++            {SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA, 0},
++            {SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA256, 0},
+         },
+         false,
+     },
+@@ -388,7 +396,9 @@ static const CipherTest kCipherTests[] = {
+             {SSL_CIPHER_RSA_WITH_AES_128_GCM_SHA256, 0},
+             {SSL_CIPHER_RSA_WITH_AES_256_GCM_SHA384, 0},
+             {SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA, 0},
++            {SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA256, 0},
+             {SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA, 0},
++            {SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA256, 0},
+         },
+         false,
+     },
+@@ -411,6 +421,8 @@ static const CipherTest kCipherTests[] = {
+     {
+         "3DES",
+         {
++            {SSL_CIPHER_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA, 0},
++            {SSL_CIPHER_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA, 0},
+             {SSL_CIPHER_RSA_WITH_3DES_EDE_CBC_SHA, 0},
+         },
+         false,
+@@ -424,14 +436,13 @@ static const CipherTest kCipherTests[] = {
+         },
+         false,
+     },
+-    // The cipher must still match all combined selectors, however. "ECDHE+3DES"
+-    // matches nothing because we do not implement
+-    // TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA. (The test includes
+-    // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 so the final list is not empty.)
++    // The cipher must still match all combined selectors.
+     {
+         "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:ECDHE+3DES",
+         {
+             {SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, 0},
++            {SSL_CIPHER_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA, 0},
++            {SSL_CIPHER_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA, 0},
+         },
+         false,
+     },
+@@ -450,8 +461,12 @@ static const CipherTest kCipherTests[] = {
+         {
+             {SSL_CIPHER_RSA_WITH_AES_256_GCM_SHA384, 0},
+             {SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA, 0},
++            {SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA256, 0},
+             {SSL_CIPHER_RSA_WITH_AES_128_GCM_SHA256, 0},
+             {SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA, 0},
++            {SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA256, 0},
++            {SSL_CIPHER_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA, 0},
++            {SSL_CIPHER_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA, 0},
+             {SSL_CIPHER_RSA_WITH_3DES_EDE_CBC_SHA, 0},
+         },
+         false,
+@@ -4217,36 +4232,39 @@ TEST(SSLTest, ClientHello) {
+     std::vector<uint8_t> expected;
+   } kTests[] = {
+       {TLS1_VERSION,
+-       {0x16, 0x03, 0x01, 0x00, 0x58, 0x01, 0x00, 0x00, 0x54, 0x03, 0x01, 0x00,
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0xc0, 0x09,
+-        0xc0, 0x13, 0xc0, 0x0a, 0xc0, 0x14, 0x00, 0x2f, 0x00, 0x35, 0x01, 0x00,
+-        0x00, 0x1f, 0x00, 0x17, 0x00, 0x00, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00,
+-        0x0a, 0x00, 0x08, 0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00,
++       {0x16, 0x03, 0x01, 0x00, 0x5c, 0x01, 0x00, 0x00, 0x58, 0x03, 0x01,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x10, 0xc0, 0x09, 0xc0, 0x13, 0xc0, 0x0a, 0xc0, 0x14, 0x00,
++        0x2f, 0x00, 0x35, 0x00, 0x33, 0x00, 0x39, 0x01, 0x00, 0x00, 0x1f,
++        0x00, 0x17, 0x00, 0x00, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0a,
++        0x00, 0x08, 0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00,
+         0x0b, 0x00, 0x02, 0x01, 0x00, 0x00, 0x23, 0x00, 0x00}},
+       {TLS1_1_VERSION,
+-       {0x16, 0x03, 0x01, 0x00, 0x58, 0x01, 0x00, 0x00, 0x54, 0x03, 0x02, 0x00,
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0xc0, 0x09,
+-        0xc0, 0x13, 0xc0, 0x0a, 0xc0, 0x14, 0x00, 0x2f, 0x00, 0x35, 0x01, 0x00,
+-        0x00, 0x1f, 0x00, 0x17, 0x00, 0x00, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00,
+-        0x0a, 0x00, 0x08, 0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00,
++       {0x16, 0x03, 0x01, 0x00, 0x5c, 0x01, 0x00, 0x00, 0x58, 0x03, 0x02,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x10, 0xc0, 0x09, 0xc0, 0x13, 0xc0, 0x0a, 0xc0, 0x14, 0x00,
++        0x2f, 0x00, 0x35, 0x00, 0x33, 0x00, 0x39, 0x01, 0x00, 0x00, 0x1f,
++        0x00, 0x17, 0x00, 0x00, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0a,
++        0x00, 0x08, 0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00,
+         0x0b, 0x00, 0x02, 0x01, 0x00, 0x00, 0x23, 0x00, 0x00}},
+       {TLS1_2_VERSION,
+-       {0x16, 0x03, 0x01, 0x00, 0x80, 0x01, 0x00, 0x00, 0x7c, 0x03, 0x03, 0x00,
++       {0x16, 0x03, 0x01, 0x00, 0x94, 0x01, 0x00, 0x00, 0x90, 0x03, 0x03, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0xcc, 0xa9,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xcc, 0xa9,
+         0xcc, 0xa8, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30, 0xc0, 0x09,
+-        0xc0, 0x13, 0xc0, 0x0a, 0xc0, 0x14, 0x00, 0x9c, 0x00, 0x9d, 0x00, 0x2f,
+-        0x00, 0x35, 0x01, 0x00, 0x00, 0x37, 0x00, 0x17, 0x00, 0x00, 0xff, 0x01,
+-        0x00, 0x01, 0x00, 0x00, 0x0a, 0x00, 0x08, 0x00, 0x06, 0x00, 0x1d, 0x00,
+-        0x17, 0x00, 0x18, 0x00, 0x0b, 0x00, 0x02, 0x01, 0x00, 0x00, 0x23, 0x00,
+-        0x00, 0x00, 0x0d, 0x00, 0x14, 0x00, 0x12, 0x04, 0x03, 0x08, 0x04, 0x04,
+-        0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01, 0x02,
+-        0x01}},
++        0xc0, 0x13, 0xc0, 0x0a, 0xc0, 0x14, 0xc0, 0x24, 0xc0, 0x28, 0x00, 0x9c,
++        0x00, 0x9d, 0x00, 0x2f, 0x00, 0x3c, 0x00, 0x35, 0x00, 0x3d, 0x00, 0x33,
++        0x00, 0x39, 0x00, 0x67, 0x00, 0x6b, 0x00, 0x9e, 0x00, 0x9f, 0x01, 0x00,
++        0x00, 0x37, 0x00, 0x17, 0x00, 0x00, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00,
++        0x0a, 0x00, 0x08, 0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00,
++        0x0b, 0x00, 0x02, 0x01, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00, 0x0d, 0x00,
++        0x14, 0x00, 0x12, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08,
++        0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01, 0x02, 0x01}},
+       // TODO(davidben): Add a change detector for TLS 1.3 once the spec and our
+       // implementation has settled enough that it won't change.
+   };

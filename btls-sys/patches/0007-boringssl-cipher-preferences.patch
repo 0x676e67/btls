@@ -1,0 +1,417 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index b48f8d498..41a2cb387 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5613,6 +5613,41 @@ OPENSSL_EXPORT void SSL_set_record_size_limit(SSL *ssl, uint16_t limit);
+ // send record size limit extension.
+ OPENSSL_EXPORT void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit);
+ 
++// SSL_CTX_set_preserve_tls13_cipher_list configures whether sockets on |ctx|
++// should preserve the TLS 1.3 cipher list order, retaining the original cipher
++// suite preferences. When enabled, it may prefer ChaCha20 over AES based on the
++// configured list. This is only relevant for TLS 1.3 and later, where ChaCha20
++// is not the default cipher suite.
++//
++// Note: This function must be called before |SSL_CTX_set_cipher_list| to take
++// effect.
++OPENSSL_EXPORT void SSL_CTX_set_preserve_tls13_cipher_list(
++    SSL_CTX *ctx, int preserve_tls13_cipher_list);
++
++// SSL_set_preserve_tls13_cipher_list configures whether sockets on |ctx| should
++// preserve the TLS 1.3 cipher list order, retaining the original cipher suite
++// preferences. When enabled, it may prefer ChaCha20 over AES based on the
++// configured list. This is only relevant for TLS 1.3 and later, where ChaCha20
++// is not the default cipher suite.
++//
++// Note: This function must be called before |SSL_set_cipher_list| to take
++// effect.
++OPENSSL_EXPORT void SSL_set_preserve_tls13_cipher_list(
++    SSL *ssl, int preserve_tls13_cipher_list);
++
++
++// SSL_CTX_set_aes_hw_override sets |override_value| to
++// override checking for aes hardware support. If |override_value|
++// is set to true, the library will behave as if aes hardware support is
++// present. If it is set to false, the library will behave as if aes hardware
++// support is not present.
++OPENSSL_EXPORT void SSL_CTX_set_aes_hw_override(SSL_CTX *ctx,
++                                                int override_value);
++
++// SSL_set_aes_hw_override acts the same as
++// |SSL_CTX_set_aes_override| but only configures a single |SSL*|.
++OPENSSL_EXPORT void SSL_set_aes_hw_override(SSL *ssl, int override_value);
++
+ // SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
+ // record with `ssl`.
+ OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
+@@ -6980,7 +7015,6 @@ OPENSSL_EXPORT void SSL_CTX_set_aes_hw_override_for_testing(
+ // `SSL_CTX_set_aes_override_for_testing` but only configures a single `SSL*`.
+ OPENSSL_EXPORT void SSL_set_aes_hw_override_for_testing(SSL *ssl,
+                                                         bool override_value);
+-
+ BSSL_NAMESPACE_END
+ 
+ }  // extern C++
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 298f04f9c..f52bff3c0 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -113,35 +113,52 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+   // Add TLS 1.3 ciphers. Order ChaCha20-Poly1305 relative to AES-GCM based on
+   // hardware support.
+   if (hs->max_version >= TLS1_3_VERSION) {
+-    static const uint16_t kCiphersNoAESHardware[] = {
+-        SSL_CIPHER_CHACHA20_POLY1305_SHA256,
+-        SSL_CIPHER_AES_128_GCM_SHA256,
+-        SSL_CIPHER_AES_256_GCM_SHA384,
+-    };
+-    static const uint16_t kCiphersAESHardware[] = {
+-        SSL_CIPHER_AES_128_GCM_SHA256,
+-        SSL_CIPHER_AES_256_GCM_SHA384,
+-        SSL_CIPHER_CHACHA20_POLY1305_SHA256,
+-    };
+-    static const uint16_t kCiphersCNSA[] = {
+-        SSL_CIPHER_AES_256_GCM_SHA384,
+-        SSL_CIPHER_AES_128_GCM_SHA256,
+-        SSL_CIPHER_CHACHA20_POLY1305_SHA256,
+-    };
+-
+-    const bool has_aes_hw = ssl->config->aes_hw_override
+-                                ? ssl->config->aes_hw_override_value
+-                                : EVP_has_aes_hardware();
+-    const bssl::Span<const uint16_t> ciphers =
+-        ssl->config->compliance_policy == ssl_compliance_policy_cnsa_202407
+-            ? bssl::Span<const uint16_t>(kCiphersCNSA)
+-            : (has_aes_hw ? bssl::Span<const uint16_t>(kCiphersAESHardware)
+-                          : bssl::Span<const uint16_t>(kCiphersNoAESHardware));
+-
+-    for (auto cipher : ciphers) {
+-      if (!ssl_add_tls13_cipher(&child, cipher,
+-                                ssl->config->compliance_policy)) {
+-        return false;
++    if (ssl->config->preserve_tls13_cipher_list &&
++        ssl->config->tls13_cipher_list &&
++        sk_SSL_CIPHER_num(ssl->config->tls13_cipher_list->ciphers.get()) >= 1) {
++      for (size_t i = 0;
++           i < sk_SSL_CIPHER_num(ssl->config->tls13_cipher_list->ciphers.get());
++           i++) {
++        const SSL_CIPHER *cipher = sk_SSL_CIPHER_value(
++            ssl->config->tls13_cipher_list->ciphers.get(), i);
++        uint16_t cipher_id = SSL_CIPHER_get_protocol_id(cipher);
++        if (!ssl_add_tls13_cipher(&child, cipher_id,
++                                  ssl->config->compliance_policy)) {
++          return false;
++        }
++      }
++    } else {
++      static const uint16_t kCiphersNoAESHardware[] = {
++          SSL_CIPHER_CHACHA20_POLY1305_SHA256,
++          SSL_CIPHER_AES_128_GCM_SHA256,
++          SSL_CIPHER_AES_256_GCM_SHA384,
++      };
++      static const uint16_t kCiphersAESHardware[] = {
++          SSL_CIPHER_AES_128_GCM_SHA256,
++          SSL_CIPHER_AES_256_GCM_SHA384,
++          SSL_CIPHER_CHACHA20_POLY1305_SHA256,
++      };
++      static const uint16_t kCiphersCNSA[] = {
++          SSL_CIPHER_AES_256_GCM_SHA384,
++          SSL_CIPHER_AES_128_GCM_SHA256,
++          SSL_CIPHER_CHACHA20_POLY1305_SHA256,
++      };
++
++      const bool has_aes_hw = ssl->config->aes_hw_override
++                                  ? ssl->config->aes_hw_override_value
++                                  : EVP_has_aes_hardware();
++      const bssl::Span<const uint16_t> ciphers =
++          ssl->config->compliance_policy == ssl_compliance_policy_cnsa_202407
++              ? bssl::Span<const uint16_t>(kCiphersCNSA)
++              : (has_aes_hw
++                     ? bssl::Span<const uint16_t>(kCiphersAESHardware)
++                     : bssl::Span<const uint16_t>(kCiphersNoAESHardware));
++
++      for (auto cipher : ciphers) {
++        if (!ssl_add_tls13_cipher(&child, cipher,
++                                  ssl->config->compliance_policy)) {
++          return false;
++        }
+       }
+     }
+   }
+diff --git a/ssl/internal.h b/ssl/internal.h
+index e9ba4e9b5..20f9dd461 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -333,6 +333,12 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+                             const bool has_aes_hw, const char *rule_str,
+                             bool strict);
+ 
++// ssl_create_preserve_tls13_cipher_list is like `ssl_create_cipher_list` but
++// only supports TLS 1.3 cipher suites.
++bool ssl_create_preserve_tls13_cipher_list(
++    UniquePtr<SSLCipherPreferenceList> *out_cipher_list, const char *rule_str,
++    bool strict);
++
+ // ssl_cipher_auth_mask_for_key returns the mask of cipher `algorithm_auth`
+ // values suitable for use with `key` in TLS 1.2 and below. `sign_ok` indicates
+ // whether `key` may be used for signing.
+@@ -3399,6 +3405,10 @@ struct SSL_CONFIG {
+   // crypto
+   UniquePtr<SSLCipherPreferenceList> cipher_list;
+ 
++  // tls13_cipher_list, if non-null, is the TLS 1.3 cipher ordering preserved
++  // from the configured cipher string.
++  UniquePtr<SSLCipherPreferenceList> tls13_cipher_list;
++
+   // This is used to hold the local certificate used (i.e. the server
+   // certificate for a server or the client certificate for a client).
+   UniquePtr<CERT> cert;
+@@ -3579,6 +3589,11 @@ struct SSL_CONFIG {
+   // supported by the client.
+   Array<uint16_t> delegated_credentials;
+ 
++  // preserve_tls13_cipher_list indicates that the TLS 1.3 cipher list order
++  // should be preserved, potentially preferring ChaCha20-Poly1305 over AES-GCM
++  // ciphers. It is only effective on the client side.
++  bool preserve_tls13_cipher_list : 1;
++
+   // server_padding_enabled is true iff the server is willing to send additional
+   // padding to clients that request it through the server padding extension.
+   bool server_padding_enabled : 1;
+@@ -4262,6 +4277,14 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+   // SSL_CTX_set_extension_order. An empty array leaves the order unset.
+   bssl::Array<uint16_t> extension_order;
+ 
++  // preserve_tls13_cipher_list indicates that the TLS 1.3 cipher list order
++  // should be preserved, potentially preferring ChaCha20-Poly1305 over AES-GCM
++  // ciphers. It is only effective on the client side.
++  bool preserve_tls13_cipher_list : 1;
++
++  // tls13_cipher_list, if non-null, is the list of ciphers to use in TLS 1.3
++  bssl::UniquePtr<bssl::SSLCipherPreferenceList> tls13_cipher_list;
++
+  private:
+   friend RefCounted;
+   ~SSLContext();
+diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
+index d612ddf28..1bc769332 100644
+--- a/ssl/ssl_cipher.cc
++++ b/ssl/ssl_cipher.cc
+@@ -1183,6 +1183,80 @@ static bool ssl_cipher_process_rulestr(const char *rule_str,
+   return true;
+ }
+ 
++bool ssl_create_preserve_tls13_cipher_list(
++    UniquePtr<SSLCipherPreferenceList> *out_cipher_list, const char *rule_str,
++    bool strict) {
++  if (out_cipher_list == nullptr || rule_str == nullptr) {
++    return false;
++  }
++
++  // TLS 1.3-only ciphers.
++  static const uint16_t kAESTLS13OnlyCiphers[] = {
++      TLS1_3_CK_AES_128_GCM_SHA256 & 0xffff,
++      TLS1_3_CK_AES_256_GCM_SHA384 & 0xffff,
++      TLS1_3_CK_CHACHA20_POLY1305_SHA256 & 0xffff,
++  };
++
++  constexpr size_t kNumAESTLS13OnlyCiphers =
++      sizeof(kAESTLS13OnlyCiphers) / sizeof(kAESTLS13OnlyCiphers[0]);
++
++  // Set up a linked list of ciphers.
++  CIPHER_ORDER co_list[kNumAESTLS13OnlyCiphers];
++  for (size_t i = 0; i < kNumAESTLS13OnlyCiphers; i++) {
++    co_list[i].next =
++        i + 1 < kNumAESTLS13OnlyCiphers ? &co_list[i + 1] : nullptr;
++    co_list[i].prev = i == 0 ? nullptr : &co_list[i - 1];
++    co_list[i].active = false;  // Do not pre-activate
++    co_list[i].in_group = false;
++  }
++  CIPHER_ORDER *head = &co_list[0];
++  CIPHER_ORDER *tail = &co_list[kNumAESTLS13OnlyCiphers - 1];
++
++  // Add TLS 1.3 ciphers to the list (but do not activate yet).
++  size_t num = 0;
++  for (uint16_t id : kAESTLS13OnlyCiphers) {
++    co_list[num++].cipher = SSL_get_cipher_by_value(id);
++    assert(co_list[num - 1].cipher != nullptr);
++    // Removed: co_list[num - 1].active = true;
++  }
++  assert(num == kNumAESTLS13OnlyCiphers);
++
++  // Apply rule_str to activate and order the ciphers.
++  if (!ssl_cipher_process_rulestr(rule_str, &head, &tail, strict)) {
++    return false;
++  }
++
++  // Allocate new "cipherstack" for the result.
++  UniquePtr<STACK_OF(SSL_CIPHER)> cipherstack(sk_SSL_CIPHER_new_null());
++  Array<bool> in_group_flags;
++  if (cipherstack == nullptr || !in_group_flags.Init(kNumAESTLS13OnlyCiphers)) {
++    return false;
++  }
++
++  // Add active ciphers to the stack in the order after applying rules.
++  size_t num_in_group_flags = 0;
++  for (CIPHER_ORDER *curr = head; curr != NULL; curr = curr->next) {
++    if (curr->active) {
++      if (!sk_SSL_CIPHER_push(cipherstack.get(), curr->cipher)) {
++        return false;
++      }
++      in_group_flags[num_in_group_flags++] = curr->in_group;
++    }
++  }
++
++  UniquePtr<SSLCipherPreferenceList> pref_list =
++      MakeUnique<SSLCipherPreferenceList>();
++  if (!pref_list ||
++      !pref_list->Init(
++          std::move(cipherstack),
++          MakeConstSpan(in_group_flags).subspan(0, num_in_group_flags))) {
++    return false;
++  }
++
++  *out_cipher_list = std::move(pref_list);
++  return true;
++}
++
+ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+                             const bool has_aes_hw, const char *rule_str,
+                             bool strict) {
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index c77e3c77c..0d93f5eba 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -401,7 +401,8 @@ bssl::SSLContext::SSLContext(const SSL_METHOD *ssl_method)
+       enable_early_data(false),
+       aes_hw_override(false),
+       aes_hw_override_value(false),
+-      resumption_across_names_enabled(false) {
++      resumption_across_names_enabled(false),
++      preserve_tls13_cipher_list(false) {
+   CRYPTO_new_ex_data(&ex_data);
+ }
+ 
+@@ -558,3 +559,11 @@ SSL *SSL_new(SSL_CTX *ctx) {
+   }
+ 
++  if (ctx_impl->tls13_cipher_list) {
++    ssl->config->tls13_cipher_list = MakeUnique<SSLCipherPreferenceList>();
++    if (!ssl->config->tls13_cipher_list ||
++        !ssl->config->tls13_cipher_list->Init(*ctx_impl->tls13_cipher_list)) {
++      return nullptr;
++    }
++  }
++
+   if (ctx_impl->psk_identity_hint) {
+@@ -576,6 +585,8 @@ SSL *SSL_new(SSL_CTX *ctx) {
+   ssl->config->handoff = ctx_impl->handoff;
+   ssl->quic_method = ctx_impl->quic_method;
+   ssl->config->record_size_limit = ctx_impl->record_size_limit;
++  ssl->config->preserve_tls13_cipher_list =
++      ctx_impl->preserve_tls13_cipher_list;
+ 
+   if (!ssl->method->ssl_new(ssl.get()) ||
+       !ssl->ctx->x509_method->ssl_new(ssl->s3->hs.get())) {
+@@ -599,6 +610,7 @@ SSL_CONFIG::SSL_CONFIG(SSLImpl *ssl_arg)
+       permute_extensions(false),
+       disable_second_keyshare(false),
+       alps_use_new_codepoint(true),
++      preserve_tls13_cipher_list(false),
+       server_padding_enabled(false) {
+   assert(ssl);
+ }
+@@ -2217,6 +2229,11 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
+   const bool has_aes_hw = ctx_impl->aes_hw_override
+                               ? ctx_impl->aes_hw_override_value
+                               : EVP_has_aes_hardware();
++  if (ctx_impl->preserve_tls13_cipher_list &&
++      !ssl_create_preserve_tls13_cipher_list(&ctx_impl->tls13_cipher_list, str,
++                                             false /* not strict */)) {
++    return 0;
++  }
+   return ssl_create_cipher_list(&ctx_impl->cipher_list, has_aes_hw, str,
+                                 false /* not strict */);
+ }
+@@ -2226,6 +2243,11 @@ int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
+   const bool has_aes_hw = ctx_impl->aes_hw_override
+                               ? ctx_impl->aes_hw_override_value
+                               : EVP_has_aes_hardware();
++  if (ctx_impl->preserve_tls13_cipher_list &&
++      !ssl_create_preserve_tls13_cipher_list(&ctx_impl->tls13_cipher_list, str,
++                                             true /* strict */)) {
++    return 0;
++  }
+   return ssl_create_cipher_list(&ctx_impl->cipher_list, has_aes_hw, str,
+                                 true /* strict */);
+ }
+@@ -2238,6 +2260,11 @@ int SSL_set_cipher_list(SSL *ssl, const char *str) {
+   const bool has_aes_hw = ssl_impl->config->aes_hw_override
+                               ? ssl_impl->config->aes_hw_override_value
+                               : EVP_has_aes_hardware();
++  if (ssl_impl->config->preserve_tls13_cipher_list &&
++      !ssl_create_preserve_tls13_cipher_list(
++          &ssl_impl->config->tls13_cipher_list, str, false /* not strict */)) {
++    return 0;
++  }
+   return ssl_create_cipher_list(&ssl_impl->config->cipher_list, has_aes_hw, str,
+                                 false /* not strict */);
+ }
+@@ -2250,6 +2277,11 @@ int SSL_set_strict_cipher_list(SSL *ssl, const char *str) {
+   const bool has_aes_hw = ssl_impl->config->aes_hw_override
+                               ? ssl_impl->config->aes_hw_override_value
+                               : EVP_has_aes_hardware();
++  if (ssl_impl->config->preserve_tls13_cipher_list &&
++      !ssl_create_preserve_tls13_cipher_list(
++          &ssl_impl->config->tls13_cipher_list, str, true /* strict */)) {
++    return 0;
++  }
+   return ssl_create_cipher_list(&ssl_impl->config->cipher_list, has_aes_hw, str,
+                                 true /* strict */);
+ }
+@@ -2331,6 +2363,45 @@ void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit) {
+   FromOpaque(ctx)->record_size_limit = limit;
+ }
+ 
++void SSL_CTX_set_preserve_tls13_cipher_list(SSL_CTX *ctx,
++                                            int preserve_tls13_cipher_list) {
++  if (!ctx) {
++    return;
++  }
++
++  FromOpaque(ctx)->preserve_tls13_cipher_list = !!preserve_tls13_cipher_list;
++}
++
++void SSL_set_preserve_tls13_cipher_list(SSL *ssl,
++                                        int preserve_tls13_cipher_list) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return;
++  }
++
++  ssl_impl->config->preserve_tls13_cipher_list = !!preserve_tls13_cipher_list;
++}
++
++void SSL_CTX_set_aes_hw_override(SSL_CTX *ctx, int override_value) {
++  if (!ctx) {
++    return;
++  }
++
++  auto *ctx_impl = FromOpaque(ctx);
++  ctx_impl->aes_hw_override = true;
++  ctx_impl->aes_hw_override_value = !!override_value;
++}
++
++void SSL_set_aes_hw_override(SSL *ssl, int override_value) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return;
++  }
++
++  ssl_impl->config->aes_hw_override = true;
++  ssl_impl->config->aes_hw_override_value = !!override_value;
++}
++
+ void SSL_get0_signed_cert_timestamp_list(const SSL *ssl, const uint8_t **out,
+                                          size_t *out_len) {
+   SSL_SESSION *session = SSL_get_session(ssl);
