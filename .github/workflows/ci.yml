@@ -623,13 +623,23 @@ jobs:
         run: |
           RC=0
           cargo ${{ matrix.bin }} build --target ${{ matrix.target }} >logs 2>&1 || RC=$?
-          if ! grep -Eq 'duplicate symbol|multiple definition of|LNK2005' logs; then
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # rustc may report ld64 collisions as warnings and still return zero.
+            if ! grep -Fq 'ld: duplicate symbol' logs ||
+              ! grep -Fq 'libbtls_sys-' logs ||
+              ! grep -Fq 'libopenssl_sys-' logs; then
+              cat logs
+              echo "macOS build did not report a BoringSSL/OpenSSL linker collision: $RC"
+              exit 1
+            fi
+          elif [[ "$RC" -eq 0 ]] ||
+            ! grep -Eq 'duplicate symbol|multiple definition of|LNK2005' logs; then
             cat logs
-            echo "Build did not report duplicate symbols: $RC"
+            echo "Unprefixed build did not fail with duplicate symbols: $RC"
             exit 1
           fi
           cat logs
-          echo "Duplicate symbols reported as expected: $RC"
+          echo "Duplicate symbols reported as expected on $RUNNER_OS: $RC"
       - name: Add prefix-symbols feature
         shell: bash
         run: cargo add btls-sys --path ../btls-sys/ -F prefix-symbols
