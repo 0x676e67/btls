@@ -531,6 +531,16 @@ jobs:
             bin: ""
             test: true
             custom_env: {}
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: ""
+            test: true
+            custom_env: {}
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            bin: ""
+            test: true
+            custom_env: {}
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             bin: ""
@@ -561,14 +571,22 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install golang
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: btls-sys/deps/boringssl/go.mod
+          cache-dependency-path: btls-sys/deps/boringssl/go.sum
       - name: Create test project
         working-directory: .
+        shell: bash
         run: |
           cargo init test-project
           cd test-project
           cargo add btls-sys --path ../btls-sys/
           cargo add openssl-sys -F vendored
-          echo "fn main() {btls_sys::init(); openssl_sys::init();}" > src/main.rs
+          echo 'fn main() { btls_sys::init(); openssl_sys::init(); unsafe { let ctx = btls_sys::SSL_CTX_new(btls_sys::TLS_method()); assert!(!ctx.is_null()); assert_eq!(btls_sys::SSL_CTX_set_extension_order(ctx, std::ptr::null(), 0), 1); btls_sys::SSL_CTX_free(ctx); } }' > src/main.rs
       - name: Install Rust toolchain
         shell: bash
         run: rustup target add ${{ matrix.target }}
@@ -584,7 +602,7 @@ jobs:
         run: |
           RC=0
           cargo ${{ matrix.bin }} build --target ${{ matrix.target }} >logs 2>&1 || RC=$?
-          if [[ $RC == 0 || (! $(cat logs | grep "lld: error: duplicate symbol") && ! $(cat logs | grep "multiple definition of")) ]]; then
+          if [[ $RC == 0 ]] || ! grep -Eq 'duplicate symbol|multiple definition of|LNK2005' logs; then
             cat logs
             echo "Build finished without duplicate symbols: $RC"
             exit 1
@@ -598,7 +616,12 @@ jobs:
         env: ${{ matrix.custom_env }}
         shell: bash
         run: cargo ${{ matrix.bin }} build --target ${{ matrix.target }}
-      - name: Check if the is no runtime failures
+      - name: Run symbol-prefix integration test
         if: matrix.test == true
         shell: bash
         run: cargo ${{ matrix.bin }} run --target ${{ matrix.target }}
+      - name: Verify packaged btls-sys with symbol prefixing
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        working-directory: btls-sys
+        shell: bash
+        run: cargo package --locked --features prefix-symbols
