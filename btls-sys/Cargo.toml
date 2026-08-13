@@ -77,8 +77,8 @@ allow-crl-extensions-bad-version = []
 underscore-wildcards = []
 
 # Build BoringSSL with its native symbol-prefixing support to prevent conflicts
-# with OpenSSL versions linked in the same process. This requires Go; supported
-# build combinations are determined by BoringSSL.
+# with OpenSSL versions linked in the same process. This requires Go and a
+# Clang executable; supported build combinations are determined by BoringSSL.
 prefix-symbols = []
 
 [build-dependencies]
