@@ -838,7 +838,10 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
     }
 
     if config.features.prefix_symbols {
-        builder = builder.parse_callbacks(Box::new(PrefixCallback));
+        builder = builder.parse_callbacks(Box::new(PrefixCallback::new(
+            &config.target_os,
+            &config.target_arch,
+        )));
     }
 
     let must_have_headers = [

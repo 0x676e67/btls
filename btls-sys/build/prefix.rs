@@ -11,14 +11,35 @@ pub(crate) static PREFIX: LazyLock<String> =
     LazyLock::new(|| env!("CARGO_PKG_NAME").replace('-', "_"));
 
 #[derive(Debug)]
-pub(crate) struct PrefixCallback;
+pub(crate) struct PrefixCallback {
+    symbol_prefix: &'static str,
+}
+
+impl PrefixCallback {
+    pub(crate) fn new(target_os: &str, target_arch: &str) -> Self {
+        // bindgen treats an overridden link name as fully mangled. Mach-O and
+        // 32-bit Windows C symbols include a leading underscore.
+        let symbol_prefix =
+            if is_macho_target(target_os) || (target_os == "windows" && target_arch == "x86") {
+                "_"
+            } else {
+                ""
+            };
+        Self { symbol_prefix }
+    }
+}
 
 impl bindgen::callbacks::ParseCallbacks for PrefixCallback {
     fn generated_link_name_override(
         &self,
         item_info: bindgen::callbacks::ItemInfo<'_>,
     ) -> Option<String> {
-        Some(format!("{}_{}", PREFIX.as_str(), item_info.name))
+        Some(format!(
+            "{}{}_{}",
+            self.symbol_prefix,
+            PREFIX.as_str(),
+            item_info.name
+        ))
     }
 }
 
@@ -200,10 +221,14 @@ fn object_file_format(target_os: &str) -> Option<&'static str> {
     match target_os {
         "android" | "dragonfly" | "freebsd" | "haiku" | "illumos" | "linux" | "netbsd"
         | "openbsd" | "solaris" => Some("elf"),
-        "ios" | "macos" | "tvos" | "visionos" | "watchos" => Some("macho"),
+        target_os if is_macho_target(target_os) => Some("macho"),
         "windows" => Some("pe"),
         _ => None,
     }
+}
+
+fn is_macho_target(target_os: &str) -> bool {
+    matches!(target_os, "ios" | "macos" | "tvos" | "visionos" | "watchos")
 }
 
 fn boringssl_source_root(source_path: &Path) -> io::Result<PathBuf> {
