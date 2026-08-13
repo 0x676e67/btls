@@ -79,7 +79,7 @@ fn peer_certificate() {
     let fingerprint = cert.digest(MessageDigest::sha1()).unwrap();
     assert_eq!(
         hex::encode(fingerprint),
-        "59172d9313e84459bcff27f967e79e6e9217e584"
+        "582f63a9d73ce9cd3df62fe26a6415ef5aceda30"
     );
 }
 

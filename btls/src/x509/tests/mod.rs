@@ -27,7 +27,7 @@ fn test_cert_loading() {
     let cert = X509::from_pem(cert).unwrap();
     let fingerprint = cert.digest(MessageDigest::sha1()).unwrap();
 
-    let hash_str = "59172d9313e84459bcff27f967e79e6e9217e584";
+    let hash_str = "582f63a9d73ce9cd3df62fe26a6415ef5aceda30";
     let hash_vec = Vec::from_hex(hash_str).unwrap();
 
     assert_eq!(hash_vec, &*fingerprint);
@@ -43,8 +43,8 @@ fn test_debug() {
     assert!(debugged.contains(r#"signature_algorithm: sha256WithRSAEncryption"#));
     assert!(debugged.contains(r#"countryName = "AU""#));
     assert!(debugged.contains(r#"stateOrProvinceName = "Some-State""#));
-    assert!(debugged.contains(r#"not_before: Aug 14 17:00:03 2016 GMT"#));
-    assert!(debugged.contains(r#"not_after: Aug 12 17:00:03 2026 GMT"#));
+    assert!(debugged.contains(r#"not_before: Aug 13 01:04:28 2026 GMT"#));
+    assert!(debugged.contains(r#"not_after: May  4 01:04:28 2049 GMT"#));
 }
 
 #[test]
@@ -54,8 +54,8 @@ fn test_cert_issue_validity() {
     let not_before = cert.not_before().to_string();
     let not_after = cert.not_after().to_string();
 
-    assert_eq!(not_before, "Aug 14 17:00:03 2016 GMT");
-    assert_eq!(not_after, "Aug 12 17:00:03 2026 GMT");
+    assert_eq!(not_before, "Aug 13 01:04:28 2026 GMT");
+    assert_eq!(not_after, "May  4 01:04:28 2049 GMT");
 }
 
 #[test]
@@ -395,11 +395,11 @@ fn test_stack_from_pem() {
     assert_eq!(certs.len(), 2);
     assert_eq!(
         hex::encode(certs[0].digest(MessageDigest::sha1()).unwrap()),
-        "59172d9313e84459bcff27f967e79e6e9217e584"
+        "582f63a9d73ce9cd3df62fe26a6415ef5aceda30"
     );
     assert_eq!(
         hex::encode(certs[1].digest(MessageDigest::sha1()).unwrap()),
-        "c0cbdf7cdd03c9773e5468e1f6d2da7d5cbb1875"
+        "345131cbb40a5afed959d0c8ce537d235fe422c5"
     );
 }
 
@@ -421,13 +421,13 @@ fn signature() {
     let signature = cert.signature();
     assert_eq!(
         hex::encode(signature.as_slice()),
-        "4af607b889790b43470442cfa551cdb8b6d0b0340d2958f76b9e3ef6ad4992230cead6842587f0ecad5\
-         78e6e11a221521e940187e3d6652de14e84e82f6671f097cc47932e022add3c0cb54a26bf27fa84c107\
-         4971caa6bee2e42d34a5b066c427f2d452038082b8073993399548088429de034fdd589dcfb0dd33be7\
-         ebdfdf698a28d628a89568881d658151276bde333600969502c4e62e1d3470a683364dfb241f78d310a\
-         89c119297df093eb36b7fd7540224f488806780305d1e79ffc938fe2275441726522ab36d88348e6c51\
-         f13dcc46b5e1cdac23c974fd5ef86aa41e91c9311655090a52333bc79687c748d833595d4c5f987508f\
-         e121997410d37c"
+        "988f1702931aa8c6cab05efa22eac03f29e9c774d3c154fe6008d29bc4823bf9966070fabe45dcbd\
+         87084cac1393fb583fe41fbb8afcef598dc38a8a11fe5fe37a8431e1e24d51e032ae885ed16ed9b9\
+         6b255dc4eb3886567992313f62b63d89449455c8856eea5b68a6a6282cf275a2c1242e68824182d9\
+         514c1de1781fd743118fbaa1f892ca9ffba0a395fc53c9c3497e539a3cc4dae05fe0604499d56cdb\
+         a61740ef63da1043ae5a39778b7303a383f439cf40337e81dc7e1b98736f7414dfe51a1a328d3661\
+         5691759417501fbec2c08e2c1c305aeaf06b36f341f86d63e69b8e176d5aa1432df81b41b6428901\
+         7b2fe52a436ab5515eea3a4517f159ca"
     );
     let algorithm = cert.signature_algorithm();
     assert_eq!(algorithm.object().nid(), Nid::SHA256WITHRSAENCRYPTION);
