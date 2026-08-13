@@ -150,6 +150,8 @@ fn prepare_generator_workspace(source_root: &Path, generator_root: &Path) -> io:
 }
 
 fn prefix_build_json(source_root: &Path) -> io::Result<String> {
+    // pregenerate's prefix task consumes Hdrs before expanding globs, so each
+    // public header must be listed explicitly.
     let mut headers = Vec::new();
     for entry in fs::read_dir(source_root.join("include/openssl"))? {
         let entry = entry?;
