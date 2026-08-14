@@ -1,3 +1,30 @@
+From eb8bf52677a2ab18eda63f82f2e78f4cd3465d4d Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:41 +0800
+Subject: [PATCH 04/10] boringssl: add extension ordering controls
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ include/openssl/ssl.h   |  7 +++
+ ssl/extensions.cc       | 99 +++++++++++++++++++++++++++++++++++++++++
+ ssl/handshake_client.cc |  2 +-
+ ssl/internal.h          |  9 ++++
+ ssl/ssl_lib.cc          | 14 ++++++
+ ssl/ssl_test.cc         | 49 ++++++++++++++++++++
+ 6 files changed, 179 insertions(+), 1 deletion(-)
+
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 index f962a4d0b..b5c5993e7 100644
 --- a/include/openssl/ssl.h
@@ -167,7 +194,7 @@ index bb7cdfeca..506775b90 100644
    friend RefCounted;
    ~SSLContext();
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index 081276f72..d60c8c588 100644
+index d78bd4dda..7a1a0cf2d 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -3292,6 +3292,20 @@ void SSL_set_permute_extensions(SSL *ssl, int enabled) {
@@ -192,7 +219,7 @@ index 081276f72..d60c8c588 100644
    return FromOpaque(ssl)->s3->ticket_age_skew;
  }
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
-index dd350d6b5..1fbe2c643 100644
+index dd350d6b5..7f35da040 100644
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
 @@ -10201,6 +10201,55 @@ TEST(SSLTest, PermuteExtensions) {
