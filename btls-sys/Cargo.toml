@@ -76,8 +76,9 @@ allow-crl-extensions-bad-version = []
 # `BORING_BSSL{,_FIPS}_SOURCE_PATH`.
 underscore-wildcards = []
 
-# Add a prefix to all symbols in libcrypto and libssl to prevent conflicts
-# with OpenSSL versions that might be linked in the same process.
+# Build BoringSSL with its native symbol-prefixing support to prevent conflicts
+# with OpenSSL versions linked in the same process. This requires Go and a
+# Clang executable; supported build combinations are determined by BoringSSL.
 prefix-symbols = []
 
 [build-dependencies]

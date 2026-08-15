@@ -48,8 +48,9 @@ rpk = ["credential", "btls-sys/rpk"]
 # `BORING_BSSL{,_FIPS}_ASSUME_PATCHED`.
 underscore-wildcards = ["btls-sys/underscore-wildcards"]
 
-# Add a prefix to all symbols in libcrypto and libssl to prevent conflicts
-# with OpenSSL versions that might be linked in the same process.
+# Build BoringSSL with its native symbol-prefixing support to prevent conflicts
+# with OpenSSL versions linked in the same process. Supported build combinations
+# are determined by BoringSSL.
 prefix-symbols = ["btls-sys/prefix-symbols"]
 
 # **DO NOT USE** This will be removed without warning in future releases.

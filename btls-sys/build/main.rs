@@ -10,7 +10,9 @@ use std::process::{Command, Output};
 use std::sync::OnceLock;
 
 use crate::config::Config;
-use crate::prefix::{prefix_symbols, PrefixCallback};
+use crate::prefix::{
+    audit_prefixed_symbols, find_crypto_archive, regenerate_prefix_symbols, PrefixCallback, PREFIX,
+};
 
 mod cache;
 mod config;
@@ -216,6 +218,10 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     // google/benchmark runs feature checks during BoringSSL configuration. Keep
     // dependency builds from treating MSVC STL warnings as fatal in those probes.
     boringssl_cmake.define("BENCHMARK_ENABLE_WERROR", "OFF");
+
+    if config.features.prefix_symbols {
+        boringssl_cmake.define("BORINGSSL_PREFIX", PREFIX.as_str());
+    }
 
     if config.env.cmake_toolchain_file.is_some() {
         return boringssl_cmake;
@@ -689,25 +695,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     emit_rerun_if_changed();
     ensure_patches_applied(&config)?;
-    if !config.env.docs_rs {
-        emit_link_directives(&config);
+
+    if config.features.prefix_symbols && !config.env.docs_rs && config.env.path.is_none() {
+        regenerate_prefix_symbols(get_boringssl_source_path(&config), &config.out_dir)
+            .map_err(|e| format!("could not generate BoringSSL's prefixed symbol list: {e}"))?;
     }
 
-    if config.features.prefix_symbols {
-        match config.target_os.as_str() {
-            "macos" | "ios" | "windows" => {
-                println!(
-                    "cargo:warning=The `prefix_symbols` feature is not supported on macOS/iOS or Windows targets. Skipping symbol prefixing."
-                );
-            }
-            _ => {
-                // Symbol prefixing requires the 'nm' tool which is not available in the docs.rs
-                // build environment. When building documentation, symbol prefixing is skipped.
-                // For regular builds, this operation is costly and only performed when necessary.
-                if !config.env.docs_rs {
-                    prefix_symbols(&config)
-                }
-            }
+    if !config.env.docs_rs {
+        emit_link_directives(&config);
+        if config.features.prefix_symbols && config.env.path.is_none() {
+            let bssl_dir = build_boringssl_or_get_prebuilt(&config);
+            let crypto_archive =
+                find_crypto_archive(bssl_dir, &config.target_env, msvc_lib_subdir(&config))?;
+            audit_prefixed_symbols(
+                get_boringssl_source_path(&config),
+                &crypto_archive,
+                &config.target_os,
+            )
+            .map_err(|e| format!("BoringSSL's prefixed symbol audit failed: {e}"))?;
         }
     }
     generate_bindings(&config).map_err(|e| format!("could not generate bindings: {e}"))?;
@@ -833,7 +838,10 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
     }
 
     if config.features.prefix_symbols {
-        builder = builder.parse_callbacks(Box::new(PrefixCallback));
+        builder = builder.parse_callbacks(Box::new(PrefixCallback::new(
+            &config.target_os,
+            &config.target_arch,
+        )));
     }
 
     let must_have_headers = [
