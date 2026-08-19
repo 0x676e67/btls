@@ -748,6 +748,15 @@ impl SslSignatureAlgorithm {
         SslSignatureAlgorithm(ffi::SSL_SIGN_RSA_PSS_RSAE_SHA512 as _);
 
     pub const ED25519: SslSignatureAlgorithm = SslSignatureAlgorithm(ffi::SSL_SIGN_ED25519 as _);
+
+    pub const ML_DSA_44: SslSignatureAlgorithm =
+        SslSignatureAlgorithm(ffi::SSL_SIGN_ML_DSA_44 as _);
+
+    pub const ML_DSA_65: SslSignatureAlgorithm =
+        SslSignatureAlgorithm(ffi::SSL_SIGN_ML_DSA_65 as _);
+
+    pub const ML_DSA_87: SslSignatureAlgorithm =
+        SslSignatureAlgorithm(ffi::SSL_SIGN_ML_DSA_87 as _);
 }
 
 impl From<u16> for SslSignatureAlgorithm {

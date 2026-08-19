@@ -560,6 +560,26 @@ fn boringssl_patch_allows_duplicate_signature_algorithms() {
 }
 
 #[test]
+fn set_sigalgs_list_accepts_mldsa_algorithms() {
+    let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
+    ctx.set_sigalgs_list("mldsa44:mldsa65:mldsa87:ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256")
+        .expect("BoringSSL should accept ML-DSA signature algorithms");
+
+    assert_eq!(
+        SslSignatureAlgorithm::ML_DSA_44,
+        SslSignatureAlgorithm::from(ffi::SSL_SIGN_ML_DSA_44 as u16),
+    );
+    assert_eq!(
+        SslSignatureAlgorithm::ML_DSA_65,
+        SslSignatureAlgorithm::from(ffi::SSL_SIGN_ML_DSA_65 as u16),
+    );
+    assert_eq!(
+        SslSignatureAlgorithm::ML_DSA_87,
+        SslSignatureAlgorithm::from(ffi::SSL_SIGN_ML_DSA_87 as u16),
+    );
+}
+
+#[test]
 fn boringssl_patch_preserves_tls13_cipher_order_in_clienthello() {
     let client_ciphers = Arc::new(Mutex::new(None));
 
