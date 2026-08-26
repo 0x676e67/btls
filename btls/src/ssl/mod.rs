@@ -622,7 +622,7 @@ impl From<u16> for ExtensionType {
 }
 
 /// An SSL/TLS/DTLS protocol version.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct SslVersion(u16);
 
 impl SslVersion {
@@ -1144,6 +1144,15 @@ impl SslContextBuilder {
         }
     }
 
+    /// Configures whether resumed client sessions use the custom verification callback.
+    ///
+    /// This only applies to [`Self::set_custom_verify_callback`] and is incompatible with
+    /// [`SslVerifyMode::NONE`].
+    #[corresponds(SSL_CTX_set_reverify_on_resume)]
+    pub fn set_reverify_on_resume(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_CTX_set_reverify_on_resume(self.as_ptr(), enabled as _) }
+    }
+
     /// Configures the server name indication (SNI) callback for new connections.
     ///
     /// SNI is used to allow a single server to handle requests for multiple domains, each of which
@@ -1376,14 +1385,11 @@ impl SslContextBuilder {
         unsafe { cvt(ffi::SSL_CTX_add_client_CA(self.as_ptr(), cacert.as_ptr())) }
     }
 
-    /// Set the context identifier for sessions.
+    /// Sets the application-defined context identifier for sessions.
     ///
-    /// This value identifies the server's session cache to clients, telling them when they're
-    /// able to reuse sessions. It should be set to a unique value per server, unless multiple
-    /// servers share a session cache.
-    ///
-    /// This value should be set when using client certificates, or each request will fail its
-    /// handshake and need to be restarted.
+    /// A session is only used by a connection with the same identifier. Clients can use it to
+    /// isolate compatible contexts in an external cache; servers must set it when peer
+    /// verification is enabled.
     #[corresponds(SSL_CTX_set_session_id_context)]
     pub fn set_session_id_context(&mut self, sid_ctx: &[u8]) -> Result<(), ErrorStack> {
         unsafe {
@@ -1969,6 +1975,15 @@ impl SslContextBuilder {
             let bits = ffi::SSL_CTX_set_session_cache_mode(self.as_ptr(), mode.bits());
             SslSessionCacheMode::from_bits_retain(bits)
         }
+    }
+
+    /// Sets the lifetime of TLS 1.2 and earlier sessions created by this context.
+    ///
+    /// Returns the previous timeout in seconds. TLS 1.3 session lifetimes are configured
+    /// separately by BoringSSL.
+    #[corresponds(SSL_CTX_set_timeout)]
+    pub fn set_session_timeout(&mut self, timeout: u32) -> u32 {
+        unsafe { ffi::SSL_CTX_set_timeout(self.as_ptr(), timeout) }
     }
 
     /// Sets the extra data at the specified index.
@@ -2785,6 +2800,28 @@ impl SslSessionRef {
     #[must_use]
     pub fn timeout(&self) -> u32 {
         unsafe { ffi::SSL_SESSION_get_timeout(self.as_ptr()) }
+    }
+
+    /// Returns whether an external cache should consume this session after one lookup.
+    ///
+    /// Single-use TLS 1.3 tickets prevent connection correlation; see
+    /// [RFC 8446 Appendix C.4](https://datatracker.ietf.org/doc/html/rfc8446#appendix-C.4).
+    #[corresponds(SSL_SESSION_should_be_single_use)]
+    #[must_use]
+    pub fn should_be_single_use(&self) -> bool {
+        unsafe { ffi::SSL_SESSION_should_be_single_use(self.as_ptr()) != 0 }
+    }
+
+    /// Returns an owned session with early data disabled.
+    ///
+    /// BoringSSL may return the same session with an increased reference count when early data is
+    /// already disabled.
+    #[corresponds(SSL_SESSION_copy_without_early_data)]
+    pub fn copy_without_early_data(&self) -> Result<SslSession, ErrorStack> {
+        unsafe {
+            cvt_p(ffi::SSL_SESSION_copy_without_early_data(self.as_ptr()))
+                .map(|session| SslSession::from_ptr(session))
+        }
     }
 
     /// Returns the session's TLS protocol version.
@@ -3612,8 +3649,12 @@ impl SslRef {
     ///
     /// # Safety
     ///
-    /// The caller of this method is responsible for ensuring that the session is associated
-    /// with the same `SslContext` as this `Ssl`.
+    /// The caller must ensure:
+    ///
+    /// - the handshake has not started;
+    /// - the session authenticates the intended peer under the current verification and client
+    ///   authentication policies; and
+    /// - the session ID context, protocol, and cipher configuration are compatible.
     #[corresponds(SSL_set_session)]
     pub unsafe fn set_session(&mut self, session: &SslSessionRef) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::SSL_set_session(self.as_ptr(), session.as_ptr())) }
