@@ -34,6 +34,8 @@ include = [
     "/deps/boringssl/crypto/err/*.errordata",
     "/deps/boringssl/**/*.bzl",
     "/deps/boringssl/**/*.cc",
+    "/deps/boringssl/**/*.cpp",
+    "/deps/boringssl/**/*.in",
     "/deps/boringssl/**/CMakeLists.txt",
     "/deps/boringssl/**/sources.cmake",
     "/deps/boringssl/**/util/go_tests.txt",
@@ -44,7 +46,7 @@ include = [
 ]
 
 [package.metadata.docs.rs]
-features = ["underscore-wildcards"]
+features = ["rpk", "underscore-wildcards", "mlkem"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
@@ -56,8 +58,15 @@ rustdoc-args = ["--cfg", "docsrs"]
 # for instructions and more details on the boringssl FIPS flag.
 fips = []
 
+# Enables Raw public key API (https://datatracker.ietf.org/doc/html/rfc7250)
+rpk = []
+
 # Require mlkem.h
 mlkem = []
+
+# Violate RFC 5280 5.1.2.1 and allow certs with CRL extensions in X.509 version 1.
+# This feature is not guaranteed to be supported in future minor releases.
+allow-crl-extensions-bad-version = []
 
 # Applies a patch (`patches/underscore-wildcards.patch`) to enable
 # `ffi::X509_CHECK_FLAG_UNDERSCORE_WILDCARDS`. This feature is necessary in

@@ -11,99 +11,9 @@ use foreign_types::ForeignTypeRef;
 use super::server::Server;
 use crate::ffi;
 use crate::ssl::{
-    ExtensionType, SslCipher, SslConnector, SslMethod, SslSignatureAlgorithm, SslVersion,
+    ExtensionType, SslConnector, SslMethod, SslOptions, SslSession, SslSessionCacheMode,
+    SslSignatureAlgorithm, SslVersion,
 };
-
-struct AddedCipher {
-    id: u16,
-    rule_name: &'static str,
-    name: &'static str,
-    standard_name: &'static str,
-}
-
-// Regression inventory for cipher suites restored by boringssl.patch. This is
-// intentionally our fork-patch list, not upstream BoringSSL's native cipher
-// list, so future patch migrations must keep every entry here working.
-const BORINGSSL_PATCH_ADDED_CIPHERS: &[AddedCipher] = &[
-    AddedCipher {
-        id: ffi::SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA as u16,
-        rule_name: "DHE-RSA-AES128-SHA",
-        name: "DHE-RSA-AES128-SHA",
-        standard_name: "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA as u16,
-        rule_name: "DHE-RSA-AES256-SHA",
-        name: "DHE-RSA-AES256-SHA",
-        standard_name: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_RSA_WITH_AES_128_CBC_SHA256 as u16,
-        rule_name: "AES128-SHA256",
-        name: "AES128-SHA256",
-        standard_name: "TLS_RSA_WITH_AES_128_CBC_SHA256",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA256 as u16,
-        rule_name: "AES256-SHA256",
-        name: "AES256-SHA256",
-        standard_name: "TLS_RSA_WITH_AES_256_CBC_SHA256",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_DHE_RSA_WITH_AES_128_CBC_SHA256 as u16,
-        rule_name: "DHE-RSA-AES128-SHA256",
-        name: "DHE-RSA-AES128-SHA256",
-        standard_name: "TLS_DHE_RSA_WITH_AES_128_CBC_SHA256",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_DHE_RSA_WITH_AES_256_CBC_SHA256 as u16,
-        rule_name: "DHE-RSA-AES256-SHA256",
-        name: "DHE-RSA-AES256-SHA256",
-        standard_name: "TLS_DHE_RSA_WITH_AES_256_CBC_SHA256",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_DHE_RSA_WITH_AES_128_GCM_SHA256 as u16,
-        rule_name: "DHE-RSA-AES128-GCM-SHA256",
-        name: "DHE-RSA-AES128-GCM-SHA256",
-        standard_name: "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_DHE_RSA_WITH_AES_256_GCM_SHA384 as u16,
-        rule_name: "DHE-RSA-AES256-GCM-SHA384",
-        name: "DHE-RSA-AES256-GCM-SHA384",
-        standard_name: "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA as u16,
-        rule_name: "ECDHE-ECDSA-DES-CBC3-SHA",
-        name: "ECDHE-ECDSA-DES-CBC3-SHA",
-        standard_name: "TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA as u16,
-        rule_name: "ECDHE-RSA-DES-CBC3-SHA",
-        name: "ECDHE-RSA-DES-CBC3-SHA",
-        standard_name: "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 as u16,
-        rule_name: "ECDHE-ECDSA-AES128-SHA256",
-        name: "ECDHE-ECDSA-AES128-SHA256",
-        standard_name: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 as u16,
-        rule_name: "ECDHE-ECDSA-AES256-SHA384",
-        name: "ECDHE-ECDSA-AES256-SHA384",
-        standard_name: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
-    },
-    AddedCipher {
-        id: ffi::SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA384 as u16,
-        rule_name: "ECDHE-RSA-AES256-SHA384",
-        name: "ECDHE-RSA-AES256-SHA384",
-        standard_name: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
-    },
-];
 
 fn u16_list(bytes: &[u8]) -> Vec<u16> {
     bytes
@@ -294,143 +204,143 @@ fn boringssl_patch_ffdhe_named_groups_are_advertised() {
 }
 
 #[test]
-fn boringssl_patch_added_cipher_rules_are_advertised_individually() {
-    // Each entry here is a cipher-suite compatibility name restored by
-    // boringssl.patch, not an assertion that upstream BoringSSL natively
-    // negotiates the suite. The server intentionally has no shared old cipher:
-    // the regression target is that every patch-owned rule can independently
-    // produce the expected ClientHello cipher id for future patch migration.
-    for cipher in BORINGSSL_PATCH_ADDED_CIPHERS {
-        let client_ciphers = Arc::new(Mutex::new(None));
-
+fn boringssl_patch_ffdhe_named_groups_negotiate_tls13() {
+    // Upstream BoringSSL does not implement these FFDHE key shares. Require
+    // both sides to use each group so boringssl.patch must generate, validate,
+    // and derive a shared secret from the RFC 7919 public values.
+    for (configured_name, expected_name, expected_id) in [
+        ("ffdhe2048", "dhe2048", ffi::SSL_GROUP_FFDHE2048 as u16),
+        ("ffdhe3072", "dhe3072", ffi::SSL_GROUP_FFDHE3072 as u16),
+    ] {
         let mut server = Server::builder();
-        server.should_error();
         server
             .ctx()
-            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
         server
             .ctx()
-            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
-        server
-            .ctx()
-            .set_cipher_list("ECDHE-RSA-AES128-GCM-SHA256")
-            .unwrap();
-        server.ctx().set_select_certificate_callback({
-            let client_ciphers = Arc::clone(&client_ciphers);
-            move |client_hello| {
-                *client_ciphers.lock().unwrap() = Some(client_hello.ciphers().to_vec());
-                Ok(())
-            }
-        });
+        server.ctx().set_curves_list(configured_name).unwrap();
         let server = server.build();
 
         let mut client = server.client_with_root_ca();
         client
             .ctx()
-            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
         client
             .ctx()
-            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
-        client.ctx().set_cipher_list(cipher.rule_name).unwrap();
+        client.ctx().set_curves_list(configured_name).unwrap();
 
-        let _ = client.connect_err();
-
-        let cipher_ids = u16_list(&client_ciphers.lock().unwrap().clone().unwrap());
-        assert!(
-            cipher_ids.contains(&cipher.id),
-            "ClientHello did not advertise individual boringssl.patch cipher {} ({:#06x})",
-            cipher.rule_name,
-            cipher.id,
-        );
+        let stream = client.connect();
+        assert_eq!(stream.ssl().version2(), Some(SslVersion::TLS1_3));
+        assert_eq!(stream.ssl().curve(), Some(expected_id));
+        assert_eq!(stream.ssl().curve_name(), Some(expected_name));
     }
 }
 
 #[test]
-fn boringssl_patch_added_cipher_list_is_complete_and_advertised() {
-    let client_ciphers = Arc::new(Mutex::new(None));
-    let mut advertised_cipher_list = BORINGSSL_PATCH_ADDED_CIPHERS
-        .iter()
-        .map(|cipher| cipher.rule_name)
-        .collect::<Vec<_>>()
-        .join(":");
-    advertised_cipher_list.push_str(":ECDHE-RSA-AES128-GCM-SHA256");
-
-    // Each boringssl.patch cipher must remain discoverable by IANA id, parseable
-    // by its rule-string name, and visible in a real ClientHello. That catches
-    // missed cipher migration even for legacy compatibility ciphers which are
-    // only intended to be advertised.
-    for cipher in BORINGSSL_PATCH_ADDED_CIPHERS {
-        let looked_up = SslCipher::from_value(cipher.id).unwrap_or_else(|| {
-            panic!(
-                "boringssl.patch cipher {} ({:#06x}) is missing",
-                cipher.rule_name, cipher.id
-            )
-        });
-        assert_eq!(looked_up.name(), cipher.name);
-        assert_eq!(looked_up.standard_name(), Some(cipher.standard_name));
-
-        let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
-        ctx.set_cipher_list(cipher.rule_name)
-            .unwrap_or_else(|_| panic!("cipher rule {} should parse", cipher.rule_name));
-    }
+fn boringssl_patch_no_psk_dhe_ke_omits_psk_on_resumption() {
+    let session = Arc::new(Mutex::new(None));
+    let extensions = Arc::new(Mutex::new(Vec::new()));
 
     let mut server = Server::builder();
+    server.expected_connections_count(2);
     server
         .ctx()
-        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
     server
         .ctx()
-        .set_max_proto_version(Some(SslVersion::TLS1_2))
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
-    server
-        .ctx()
-        .set_cipher_list("ECDHE-RSA-AES128-GCM-SHA256")
-        .unwrap();
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(server.ctx().as_ptr(), 1) };
     server.ctx().set_select_certificate_callback({
-        let client_ciphers = Arc::clone(&client_ciphers);
+        let extensions = Arc::clone(&extensions);
         move |client_hello| {
-            *client_ciphers.lock().unwrap() = Some(client_hello.ciphers().to_vec());
+            extensions.lock().unwrap().push((
+                client_hello
+                    .get_extension(ExtensionType::PRE_SHARED_KEY)
+                    .is_some(),
+                client_hello
+                    .get_extension(ExtensionType::PSK_KEY_EXCHANGE_MODES)
+                    .is_some(),
+                client_hello
+                    .get_extension(ExtensionType::EARLY_DATA)
+                    .is_some(),
+            ));
             Ok(())
         }
     });
     let server = server.build();
 
-    let mut client = server.client_with_root_ca();
-    client
+    let mut first_client = server.client_with_root_ca();
+    first_client
         .ctx()
-        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
-    client
+    first_client
         .ctx()
-        .set_max_proto_version(Some(SslVersion::TLS1_2))
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
-    client
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(first_client.ctx().as_ptr(), 1) };
+    first_client
         .ctx()
-        .set_cipher_list(&advertised_cipher_list)
-        .unwrap();
+        .set_session_cache_mode(SslSessionCacheMode::CLIENT);
+    first_client.ctx().set_new_session_callback({
+        let session = Arc::clone(&session);
+        move |_, new_session| {
+            let mut session = session.lock().unwrap();
+            if session.is_none() {
+                *session = Some(new_session.to_der().unwrap());
+            }
+        }
+    });
+    let first_stream = first_client.connect();
+    assert!(!first_stream.ssl().session_reused());
 
-    let stream = client.connect();
-    let cipher = stream.ssl().current_cipher().unwrap();
-    assert_eq!(stream.ssl().version2(), Some(SslVersion::TLS1_2));
+    let session = SslSession::from_der(
+        session
+            .lock()
+            .unwrap()
+            .as_deref()
+            .expect("TLS 1.3 server did not issue a session ticket"),
+    )
+    .unwrap();
     assert_eq!(
-        cipher.standard_name(),
-        Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+        unsafe { ffi::SSL_SESSION_early_data_capable(session.as_ref().as_ptr()) },
+        1,
+        "the resumed handshake must exercise an early-data-capable session",
     );
 
-    let cipher_ids = u16_list(&client_ciphers.lock().unwrap().clone().unwrap());
-    for cipher in BORINGSSL_PATCH_ADDED_CIPHERS {
-        assert!(
-            cipher_ids.contains(&cipher.id),
-            "ClientHello did not advertise {} ({:#06x})",
-            cipher.rule_name,
-            cipher.id,
-        );
-    }
+    let mut resumed_client = server.client_with_root_ca();
+    resumed_client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    resumed_client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(resumed_client.ctx().as_ptr(), 1) };
+    resumed_client.ctx().set_options(SslOptions::NO_PSK_DHE_KE);
+    let mut resumed_client = resumed_client.build().builder();
+    unsafe { resumed_client.ssl().set_session(&session).unwrap() };
+
+    let resumed_stream = resumed_client.connect();
+    assert!(!resumed_stream.ssl().session_reused());
+    assert_eq!(
+        unsafe { ffi::SSL_in_early_data(resumed_stream.ssl().as_ptr()) },
+        0
+    );
+
+    let extensions = extensions.lock().unwrap();
+    assert_eq!(extensions.len(), 2);
+    assert_eq!(extensions[0], (false, true, false));
+    assert_eq!(extensions[1], (false, false, false));
 }
 
 #[test]
@@ -508,6 +418,37 @@ fn boringssl_patch_clienthello_extensions_are_sent() {
         delegated_credential.lock().unwrap().as_deref(),
         Some(&[0x00, 0x04, 0x08, 0x04, 0x04, 0x03][..]),
     );
+}
+
+#[test]
+fn boringssl_patch_partial_extension_order_can_handshake() {
+    // boringssl.patch adds explicit ClientHello extension ordering. Unknown
+    // and duplicate entries are ignored, and the unlisted extensions are
+    // shuffled after the configured prefix.
+    let server = Server::builder().build();
+    let mut client = server.client_with_root_ca();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_extension_permutation(&[
+            ExtensionType::SUPPORTED_VERSIONS,
+            ExtensionType::from(0xffff),
+            ExtensionType::SUPPORTED_VERSIONS,
+            ExtensionType::KEY_SHARE,
+            ExtensionType::SUPPORTED_GROUPS,
+            ExtensionType::PSK_KEY_EXCHANGE_MODES,
+            ExtensionType::SIGNATURE_ALGORITHMS,
+        ])
+        .unwrap();
+
+    client.connect();
 }
 
 #[test]
