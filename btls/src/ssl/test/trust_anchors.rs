@@ -1,64 +1,98 @@
-use crate::ssl::test::server::Server;
+use std::sync::{Arc, Mutex};
 
-// A wire-format trust anchor ID list containing a single 3-byte anchor ID ("abc"):
-// one 8-bit length-prefixed string, per draft-ietf-tls-trust-anchor-ids-00 Section 3.
-static TRUST_ANCHOR_IDS: &[u8] = b"\x03abc";
+use crate::ssl::{ExtensionType, Ssl, SslContext, SslMethod, SslVersion};
 
-#[test]
-fn set_requested_trust_anchors_nonempty() {
-    let server = Server::builder().build();
+use super::Server;
 
-    let mut client = server.client_with_root_ca().build().builder();
-    client
-        .ssl()
-        .set_requested_trust_anchors(TRUST_ANCHOR_IDS)
+fn capture_trust_anchors_extension(
+    context_ids: Option<&[u8]>,
+    ssl_ids: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let captured = Arc::new(Mutex::new(None));
+    let mut server = Server::builder();
+    server
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
-    client.ssl().set_hostname("foobar.com").unwrap();
+    server
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    server.ctx().set_select_certificate_callback({
+        let captured = Arc::clone(&captured);
+        move |client_hello| {
+            let extension = client_hello
+                .get_extension(ExtensionType::TRUST_ANCHORS)
+                .map(ToOwned::to_owned);
+            *captured.lock().unwrap() = Some(extension);
+            Ok(())
+        }
+    });
+    let server = server.build();
 
-    let ssl_stream = client.connect();
-    assert!(ssl_stream.ssl().peer_certificate().is_some());
-}
-
-#[test]
-fn set_requested_trust_anchors_empty() {
-    // An empty slice is meaningful: the trust_anchors extension is still sent in
-    // ClientHello, signalling support for the retry flow without requesting specific
-    // trust anchors. It must reach the C function and not be collapsed to a no-op.
-    let server = Server::builder().build();
-
-    let mut client = server.client_with_root_ca().build().builder();
-    client.ssl().set_requested_trust_anchors(&[]).unwrap();
-    client.ssl().set_hostname("foobar.com").unwrap();
-
-    let ssl_stream = client.connect();
-    assert!(ssl_stream.ssl().peer_certificate().is_some());
-}
-
-#[test]
-fn set_ctx_requested_trust_anchors_nonempty() {
-    let server = Server::builder().build();
-
-    let mut client = server.client_with_root_ca();
+    let mut client = server.client();
     client
         .ctx()
-        .set_requested_trust_anchors(TRUST_ANCHOR_IDS)
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
-    let mut client = client.build().builder();
-    client.ssl().set_hostname("foobar.com").unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    if let Some(ids) = context_ids {
+        let ids = ids.to_vec();
+        client.ctx().set_requested_trust_anchors(&ids).unwrap();
+    }
 
-    let ssl_stream = client.connect();
-    assert!(ssl_stream.ssl().peer_certificate().is_some());
+    let client = client.build();
+    let mut connection = client.builder();
+    if let Some(ids) = ssl_ids {
+        let ids = ids.to_vec();
+        connection.ssl().set_requested_trust_anchors(&ids).unwrap();
+    }
+    connection.connect();
+
+    let extension = captured.lock().unwrap().clone();
+    extension.expect("select-certificate callback was not called")
 }
 
 #[test]
-fn set_ctx_requested_trust_anchors_empty() {
-    let server = Server::builder().build();
+fn requested_trust_anchors_are_omitted_by_default() {
+    assert_eq!(capture_trust_anchors_extension(None, None), None);
+}
 
-    let mut client = server.client_with_root_ca();
-    client.ctx().set_requested_trust_anchors(&[]).unwrap();
-    let mut client = client.build().builder();
-    client.ssl().set_hostname("foobar.com").unwrap();
+#[test]
+fn context_requested_trust_anchors_are_copied_and_sent() {
+    assert_eq!(
+        capture_trust_anchors_extension(Some(b"\x03ctx"), None),
+        Some(b"\x00\x04\x03ctx".to_vec())
+    );
+}
 
-    let ssl_stream = client.connect();
-    assert!(ssl_stream.ssl().peer_certificate().is_some());
+#[test]
+fn ssl_requested_trust_anchors_override_context_configuration() {
+    assert_eq!(
+        capture_trust_anchors_extension(Some(b"\x03ctx"), Some(b"\x03ssl")),
+        Some(b"\x00\x04\x03ssl".to_vec())
+    );
+}
+
+#[test]
+fn empty_requested_trust_anchors_still_send_the_extension() {
+    assert_eq!(
+        capture_trust_anchors_extension(None, Some(b"")),
+        Some(b"\x00\x00".to_vec())
+    );
+}
+
+#[test]
+fn malformed_requested_trust_anchors_are_rejected() {
+    for ids in [&b"\x00"[..], &b"\x04abc"[..]] {
+        let mut context = SslContext::builder(SslMethod::tls()).unwrap();
+        assert!(context.set_requested_trust_anchors(ids).is_err());
+
+        let context = SslContext::builder(SslMethod::tls()).unwrap().build();
+        let mut ssl = Ssl::new(&context).unwrap();
+        assert!(ssl.set_requested_trust_anchors(ids).is_err());
+    }
 }
