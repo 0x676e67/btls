@@ -1,0 +1,105 @@
+From c40c54b4581767db035d6114ae59b4bd8ca3d78a Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:40 +0800
+Subject: [PATCH 03/10] boringssl: add TLS compatibility options
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ include/openssl/ssl.h   |  8 +++++++-
+ ssl/extensions.cc       | 12 +++++++++---
+ ssl/handshake_client.cc |  7 +++++++
+ 3 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index c7c596ddf..f962a4d0b 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -631,6 +631,12 @@ OPENSSL_EXPORT int SSL_version(const SSL *ssl);
+ #define SSL_OP_NO_DTLSv1 SSL_OP_NO_TLSv1
+ #define SSL_OP_NO_DTLSv1_2 SSL_OP_NO_TLSv1_2
+ 
++// SSL_OP_NO_PSK_DHE_KE disables PSK-DHE-KE, TLS 1.3 PSK resumption, and 0-RTT.
++#define SSL_OP_NO_PSK_DHE_KE 0x40000000L
++
++// SSL_OP_NO_RENEGOTIATION disables renegotiation. This is not recommended.
++#define SSL_OP_NO_RENEGOTIATION 0x80000000L
++
+ // SSL_CTX_set_options enables all options set in `options` (which should be one
+ // or more of the `SSL_OP_*` values, ORed together) in `ctx`. It returns a
+ // bitmask representing the resulting enabled options.
+@@ -5964,7 +5970,7 @@ DEFINE_STACK_OF(SSL_COMP)
+ #define SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG 0
+ #define SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG 0
+ #define SSL_OP_NO_COMPRESSION 0
+-#define SSL_OP_NO_RENEGOTIATION 0  // ssl_renegotiate_never is the default
++// #define SSL_OP_NO_RENEGOTIATION 0  // ssl_renegotiate_never is the default
+ #define SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION 0
+ #define SSL_OP_NO_SSLv2 0
+ #define SSL_OP_NO_SSLv3 0
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 56de76e37..e44af9b12 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -706,7 +706,8 @@ static bool ext_ri_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+   const SSLImpl *const ssl = hs->ssl;
+   // Renegotiation indication is not necessary in TLS 1.3.
+   if (hs->min_version >= TLS1_3_VERSION ||  //
+-      type == ssl_client_hello_inner) {
++      type == ssl_client_hello_inner ||
++      (ssl->options & SSL_OP_NO_RENEGOTIATION)) {
+     return true;
+   }
+ 
+@@ -1981,7 +1982,11 @@ static bool should_offer_psk(const SSL_HANDSHAKE *hs,
+   // PSK, at least when we offer early data? Otherwise ClientHelloOuter will
+   // contain an early_data extension without a pre_shared_key extension and
+   // potentially break the recovery flow.
+-  return hs->max_version >= TLS1_3_VERSION && !hs->pre_shared_keys.empty() &&
++  // BoringSSL only implements PSK-DHE-KE. If that mode is disabled, omitting
++  // the PSK also keeps pre_shared_key and psk_key_exchange_modes consistent as
++  // required by RFC 8446, Section 4.2.9.
++  return !(SSL_get_options(hs->ssl) & SSL_OP_NO_PSK_DHE_KE) &&
++         hs->max_version >= TLS1_3_VERSION && !hs->pre_shared_keys.empty() &&
+          type != ssl_client_hello_outer;
+ }
+ 
+@@ -2269,7 +2274,8 @@ bool ssl_ext_pre_shared_key_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+ static bool ext_psk_key_exchange_modes_add_clienthello(
+     const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
+     ssl_client_hello_type_t type) {
+-  if (hs->max_version < TLS1_3_VERSION) {
++  if (hs->max_version < TLS1_3_VERSION ||
++      (SSL_get_options(hs->ssl) & SSL_OP_NO_PSK_DHE_KE)) {
+     return true;
+   }
+   // We do not support resumption with PAKEs, so do not offer any PSK key
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 3b95a869c..46e16cb8b 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -290,6 +290,13 @@ static ssl_early_data_reason_t should_offer_early_data(
+     return ssl_early_data_protocol_version;
+   }
+ 
++  // BoringSSL only implements PSK-DHE-KE, so this option also suppresses the
++  // pre_shared_key extension. Early data cannot be offered without that
++  // extension. See RFC 8446, Sections 4.2.10 and 4.2.11.
++  if (SSL_get_options(ssl) & SSL_OP_NO_PSK_DHE_KE) {
++    return ssl_early_data_no_session_offered;
++  }
++
+   if (ssl->session == nullptr) {
+     return ssl_early_data_no_session_offered;
+   }
