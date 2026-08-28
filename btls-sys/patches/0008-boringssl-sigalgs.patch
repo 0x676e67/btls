@@ -1,5 +1,28 @@
+From 837623ae7cc267f4d23869ca8db59af8a909d988 Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:45 +0800
+Subject: [PATCH 08/10] boringssl: allow duplicate signature algorithms
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ ssl/ssl_privkey.cc | 21 +++------------------
+ ssl/ssl_test.cc    | 19 +++++++++++++------
+ 2 files changed, 16 insertions(+), 24 deletions(-)
+
 diff --git a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
-index 2e04fa4a5..15c4099f7 100644
+index 2e04fa4a5..af40dd514 100644
 --- a/ssl/ssl_privkey.cc
 +++ b/ssl/ssl_privkey.cc
 @@ -573,24 +573,9 @@ int SSL_is_signature_algorithm_rsa_pss(uint16_t sigalg) {
@@ -31,7 +54,7 @@ index 2e04fa4a5..15c4099f7 100644
  }
  
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
-index 1fbe2c643..2079cd7d9 100644
+index 7f35da040..4d0f3252c 100644
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
 @@ -7063,7 +7063,9 @@ TEST(SSLTest, SigAlgs) {

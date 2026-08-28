@@ -1,3 +1,25 @@
+From e3a5f9482d149bfe02509687b6fb9fa133ba0aea Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:46 +0800
+Subject: [PATCH 09/10] boringssl: export Zstd certificate compression
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ include/openssl/tls1.h | 1 +
+ 1 file changed, 1 insertion(+)
+
 diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
 index 611b202e1..66484b786 100644
 --- a/include/openssl/tls1.h

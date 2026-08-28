@@ -1,3 +1,27 @@
+From c40c54b4581767db035d6114ae59b4bd8ca3d78a Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:40 +0800
+Subject: [PATCH 03/10] boringssl: add TLS compatibility options
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ include/openssl/ssl.h   |  8 +++++++-
+ ssl/extensions.cc       | 12 +++++++++---
+ ssl/handshake_client.cc |  7 +++++++
+ 3 files changed, 23 insertions(+), 4 deletions(-)
+
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 index c7c596ddf..f962a4d0b 100644
 --- a/include/openssl/ssl.h

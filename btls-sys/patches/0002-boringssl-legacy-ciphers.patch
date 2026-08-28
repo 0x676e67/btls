@@ -1,3 +1,37 @@
+From 74613c81583c31d721aa9e2072c0169737846fe2 Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:39 +0800
+Subject: [PATCH 02/10] boringssl: restore legacy cipher suites
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ crypto/cipher/e_tls.cc   |  60 ++++++++++++
+ crypto/cipher/tls_cbc.cc | 154 +++++++++++++++++++++++++++++
+ crypto/obj/obj_dat.h     |   5 +-
+ crypto/obj/obj_mac.num   |   1 +
+ crypto/obj/objects.txt   |   1 +
+ include/openssl/aead.h   |   2 +
+ include/openssl/nid.h    |   4 +
+ include/openssl/ssl.h    |  30 +++++-
+ include/openssl/tls1.h   |  30 ++++++
+ ssl/handshake_client.cc  |  82 +++++++++++++++-
+ ssl/internal.h           |  16 ++-
+ ssl/ssl_cipher.cc        | 204 ++++++++++++++++++++++++++++++++++++++-
+ ssl/ssl_test.cc          |  72 ++++++++------
+ 13 files changed, 624 insertions(+), 37 deletions(-)
+
 diff --git a/crypto/cipher/e_tls.cc b/crypto/cipher/e_tls.cc
 index 0edf61a24..5cfdf5d9b 100644
 --- a/crypto/cipher/e_tls.cc

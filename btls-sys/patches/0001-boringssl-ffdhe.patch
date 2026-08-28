@@ -1,3 +1,31 @@
+From 3fab509b5e3922d30f758efffeb7088bea5071b2 Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:38 +0800
+Subject: [PATCH 01/10] boringssl: add FFDHE groups
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ crypto/obj/obj_dat.h   |   8 +-
+ crypto/obj/obj_mac.num |   2 +
+ crypto/obj/objects.txt |   4 +
+ include/openssl/nid.h  |   6 ++
+ include/openssl/ssl.h  |   3 +
+ ssl/internal.h         |   2 +-
+ ssl/ssl_key_share.cc   | 183 +++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 206 insertions(+), 2 deletions(-)
+
 diff --git a/crypto/obj/obj_dat.h b/crypto/obj/obj_dat.h
 index 40b5278fc..b0033f6d8 100644
 --- a/crypto/obj/obj_dat.h

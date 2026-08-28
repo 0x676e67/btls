@@ -1,3 +1,29 @@
+From 7cb4fd6963c9dca43be60cb1397fa54d18f7052d Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:42 +0800
+Subject: [PATCH 05/10] boringssl: add record size limit
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ include/openssl/ssl.h  |  8 ++++++++
+ include/openssl/tls1.h |  3 +++
+ ssl/extensions.cc      | 39 +++++++++++++++++++++++++++++++++++++++
+ ssl/internal.h         |  6 ++++++
+ ssl/ssl_lib.cc         | 13 +++++++++++++
+ 5 files changed, 69 insertions(+)
+
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 index b5c5993e7..b7e670765 100644
 --- a/include/openssl/ssl.h
@@ -113,7 +139,7 @@ index 506775b90..1f524fa90 100644
    // SSL_CTX_set_extension_order. An empty array leaves the order unset.
    bssl::Array<uint16_t> extension_order;
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index d60c8c588..e50b5f85b 100644
+index 7a1a0cf2d..16e280a2f 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -573,6 +573,7 @@ SSL *SSL_new(SSL_CTX *ctx) {

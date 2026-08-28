@@ -39,6 +39,7 @@ mod verify;
 static ROOT_CERT: &[u8] = include_bytes!("../../../test/root-ca.pem");
 static CERT: &[u8] = include_bytes!("../../../test/cert.pem");
 static KEY: &[u8] = include_bytes!("../../../test/key.pem");
+const TEST_CERT_DIGEST: &str = "585e3a58acfd3b4e5e2825659407244ddd93539c";
 
 #[test]
 fn get_ctx_options() {
@@ -77,10 +78,7 @@ fn peer_certificate() {
     let s = server.client().connect();
     let cert = s.ssl().peer_certificate().unwrap();
     let fingerprint = cert.digest(MessageDigest::sha1()).unwrap();
-    assert_eq!(
-        hex::encode(fingerprint),
-        "582f63a9d73ce9cd3df62fe26a6415ef5aceda30"
-    );
+    assert_eq!(hex::encode(fingerprint), TEST_CERT_DIGEST);
 }
 
 #[test]
