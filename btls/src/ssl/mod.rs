@@ -2107,7 +2107,16 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
-    /// Sets whether the context should enable delegated credentials.
+    /// Enables server delegated credentials and advertises the specified
+    /// signature algorithm list, as defined by [RFC 9345].
+    ///
+    /// The list is encoded in the order provided. Advertised algorithms remain
+    /// subject to TLS version and key compatibility checks. It is separate from
+    /// the normal signature algorithm list, which controls the certificate
+    /// key's signature over the credential. Delegated credentials are disabled
+    /// by default and only apply to TLS 1.3 and DTLS 1.3.
+    ///
+    /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_delegated_credentials)]
     pub fn set_delegated_credentials(&mut self, sigalgs: &str) -> Result<(), ErrorStack> {
@@ -3366,6 +3375,20 @@ impl SslRef {
         } else {
             Some(SslSignatureAlgorithm(sigalg))
         }
+    }
+
+    /// Returns whether the peer authenticated with an [RFC 9345] delegated
+    /// credential in the most recent handshake.
+    ///
+    /// This becomes `true` only after the credential and the peer's
+    /// CertificateVerify signature have both been validated.
+    ///
+    /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_used_delegated_credential)]
+    #[must_use]
+    pub fn used_delegated_credential(&self) -> bool {
+        unsafe { ffi::SSL_used_delegated_credential(self.as_ptr()) != 0 }
     }
 
     /// Returns the signature algorithm this side used to sign the current TLS handshake,
