@@ -2107,14 +2107,17 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
-    /// Enables server delegated credentials and advertises the specified
-    /// signature algorithm list, as defined by [RFC 9345].
+    /// Configures client connections to request and verify delegated
+    /// credentials presented by servers, using the specified signature
+    /// algorithm list, as defined by [RFC 9345].
     ///
     /// The list is encoded in the order provided. Advertised algorithms remain
     /// subject to TLS version and key compatibility checks. It is separate from
     /// the normal signature algorithm list, which controls the certificate
-    /// key's signature over the credential. Delegated credentials are disabled
-    /// by default and only apply to TLS 1.3 and DTLS 1.3.
+    /// key's signature over the credential. Server-side use requires a
+    /// separately configured delegated credential; this setting does not make
+    /// a server select or send one. Client support is disabled by default and
+    /// only applies to TLS 1.3 and DTLS 1.3 handshakes.
     ///
     /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
