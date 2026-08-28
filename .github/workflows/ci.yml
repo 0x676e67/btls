@@ -64,9 +64,9 @@ jobs:
           path: target
           key: clippy-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
       - name: Run clippy
-        run: cargo clippy --all --all-targets --features mlkem,prf,rpk,underscore-wildcards -- -D warnings
+        run: cargo clippy --all --all-targets --features mldsa,mlkem,prf,relax-cert-validation,rpk,underscore-wildcards -- -D warnings
       - name: Check docs
-        run: cargo doc --no-deps -p btls -p btls-sys --features rpk,underscore-wildcards,mlkem
+        run: cargo doc --no-deps -p btls -p btls-sys --features mldsa,mlkem,rpk,underscore-wildcards
         env:
           CARGO_BUILD_RUSTDOCFLAGS: "--cfg=docsrs"
           RUSTC_BOOTSTRAP: 1
@@ -95,6 +95,8 @@ jobs:
           - aarch64-ios
           - aarch64-ios-sim
           - x86_64-ios
+          - aarch64-tvos
+          - aarch64-tvos-sim
           - i686-linux
           - arm-linux
           - aarch64-linux
@@ -154,6 +156,18 @@ jobs:
             check_only: true
             custom_env:
               IPHONEOS_DEPLOYMENT_TARGET: 17.5
+          - thing: aarch64-tvos
+            target: aarch64-apple-tvos
+            os: macos-latest
+            check_only: true
+            custom_env:
+              TVOS_DEPLOYMENT_TARGET: 17.5
+          - thing: aarch64-tvos-sim
+            target: aarch64-apple-tvos-sim
+            os: macos-latest
+            check_only: true
+            custom_env:
+              TVOS_DEPLOYMENT_TARGET: 17.5
           - thing: i686-linux
             target: i686-unknown-linux-gnu
             rust: stable
@@ -420,7 +434,8 @@ jobs:
           0009-boringssl-zstd-cert-compression.patch \
           0010-boringssl-build-compat.patch \
           boringssl-loongarch.patch \
-          underscore-wildcards.patch; do
+          underscore-wildcards.patch \
+          relax-cert-validation.patch; do
           echo "Applying $p"
           patch -p1 < "../../patches/$p"
         done
@@ -493,6 +508,10 @@ jobs:
         run: cargo test --features rpk,underscore-wildcards -- --skip badssl_ciphers_negotiate
       - name: Run `allow-crl-extensions-bad-version` tests
         run: cargo test -p btls-sys --features allow-crl-extensions-bad-version
+      - name: Run `mldsa` tests
+        run: cargo test -p btls --features mldsa
+      - name: Run `relax-cert-validation` tests
+        run: cargo test -p btls --features relax-cert-validation
 
   crates:
     name: crates

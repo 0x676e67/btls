@@ -21,7 +21,7 @@ fn should_use_cmake_cross_compilation(config: &Config) -> bool {
         return false;
     }
     match config.target_os.as_str() {
-        "macos" | "ios" => {
+        "macos" | "ios" | "tvos" => {
             // Cross-compiling for Apple platforms on macOS is supported using the normal Xcode
             // tools, along with the settings from `cmake_params_apple`.
             !config.host.ends_with("-darwin")
@@ -70,6 +70,31 @@ const CMAKE_PARAMS_APPLE: &[(&str, &[(&str, &str)])] = &[
         &[
             ("CMAKE_OSX_ARCHITECTURES", "x86_64"),
             ("CMAKE_OSX_SYSROOT", "iphonesimulator"),
+            ("CMAKE_MACOSX_BUNDLE", "OFF"),
+        ],
+    ),
+    // tvOS
+    (
+        "aarch64-apple-tvos",
+        &[
+            ("CMAKE_OSX_ARCHITECTURES", "arm64"),
+            ("CMAKE_OSX_SYSROOT", "appletvos"),
+            ("CMAKE_MACOSX_BUNDLE", "OFF"),
+        ],
+    ),
+    (
+        "aarch64-apple-tvos-sim",
+        &[
+            ("CMAKE_OSX_ARCHITECTURES", "arm64"),
+            ("CMAKE_OSX_SYSROOT", "appletvsimulator"),
+            ("CMAKE_MACOSX_BUNDLE", "OFF"),
+        ],
+    ),
+    (
+        "x86_64-apple-tvos",
+        &[
+            ("CMAKE_OSX_ARCHITECTURES", "x86_64"),
+            ("CMAKE_OSX_SYSROOT", "appletvsimulator"),
             ("CMAKE_MACOSX_BUNDLE", "OFF"),
         ],
     ),
@@ -316,6 +341,15 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
             boringssl_cmake.cflag(&cflag);
         }
 
+        "tvos" => {
+            // Unlike the `ios` arm above, no bitcode flag: bitcode was deprecated in
+            // Xcode 14 and the tvOS targets postdate it, so the SDK never wants it.
+            for (name, value) in cmake_params_apple(config) {
+                eprintln!("tvos arch={} add {}={}", config.target_arch, name, value);
+                boringssl_cmake.define(name, value);
+            }
+        }
+
         "windows" if config.host.contains("windows") => {
             // BoringSSL's CMakeLists.txt isn't set up for cross-compiling using Visual Studio.
             // Disable assembly support so that it at least builds.
@@ -368,7 +402,7 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
 }
 
 fn pick_best_android_ndk_toolchain(toolchains_dir: &Path) -> io::Result<OsString> {
-    let toolchains = std::fs::read_dir(toolchains_dir)?.collect::<Result<Vec<_>, _>>()?;
+    let toolchains = fs::read_dir(toolchains_dir)?.collect::<Result<Vec<_>, _>>()?;
     // First look for one of the toolchains that Google has documented.
     // https://developer.android.com/ndk/guides/other_build_systems
     for known_toolchain in ["linux-x86_64", "darwin-x86_64", "windows-x86_64"] {
@@ -388,8 +422,8 @@ fn pick_best_android_ndk_toolchain(toolchains_dir: &Path) -> io::Result<OsString
         return Ok(toolchain.file_name());
     }
     // Finally give up.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
         "no subdirectories at given path",
     ))
 }
@@ -399,7 +433,7 @@ fn get_extra_clang_args_for_bindgen(config: &Config) -> Vec<String> {
 
     // Add platform-specific parameters.
     match &*config.target_os {
-        "ios" | "macos" => {
+        "ios" | "macos" | "tvos" => {
             // When cross-compiling for Apple targets, tell bindgen to use SDK sysroot,
             // and *don't* use system headers of the host macOS.
             let sdk = get_apple_sdk_name(config);
@@ -452,12 +486,14 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         );
         return Ok(());
     } else if config.env.source_path.is_some()
-        && (config.features.rpk || config.features.underscore_wildcards)
+        && (config.features.rpk
+            || config.features.underscore_wildcards
+            || config.features.relax_cert_validation)
     {
         panic!(
             "BORING_BSSL_ASSUME_PATCHED must be set when setting
                BORING_BSSL_SOURCE_PATH and using any of the following
-               features: rpk, underscore-wildcards"
+               features: rpk, underscore-wildcards, relax-cert-validation"
         );
     }
 
@@ -514,6 +550,11 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         apply_patch(config, "underscore-wildcards.patch")?;
     }
 
+    if config.features.relax_cert_validation {
+        println!("cargo:warning=applying RSA key-usage enforcement relaxation patch");
+        apply_patch(config, "relax-cert-validation.patch")?;
+    }
+
     Ok(())
 }
 
@@ -557,8 +598,8 @@ fn run_command(command: &mut Command) -> io::Result<Output> {
         )
     })?;
 
-    std::io::stderr().write_all(&out.stderr)?;
-    std::io::stdout().write_all(&out.stdout)?;
+    io::stderr().write_all(&out.stderr)?;
+    io::stdout().write_all(&out.stdout)?;
 
     if !out.status.success() {
         let err = match out.status.code() {
@@ -624,7 +665,7 @@ fn get_cpp_runtime_lib(config: &Config) -> Option<String> {
     }
 
     match &*config.target_os {
-        "macos" | "ios" | "freebsd" | "openbsd" | "android" => Some("c++".into()),
+        "macos" | "ios" | "tvos" | "freebsd" | "openbsd" | "android" => Some("c++".into()),
         _ if config.unix || config.target_env == "gnu" => Some("stdc++".into()),
         // TODO(rmehra): figure out how to do this for windows
         _ => None,
@@ -862,6 +903,7 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         "hrss.h",
         "md4.h",
         "md5.h",
+        "mldsa.h",
         "mlkem.h",
         "obj_mac.h",
         "objects.h",

@@ -61,8 +61,8 @@ fn callback_receives_correct_certificate() {
     // but client doesn't load the root as trusted.
     // So we expect an error.
     let mut client = server.client();
-    let leaf_sha1 = "582f63a9d73ce9cd3df62fe26a6415ef5aceda30";
-    let root_sha1 = "345131cbb40a5afed959d0c8ce537d235fe422c5";
+    let leaf_sha1 = "585e3a58acfd3b4e5e2825659407244ddd93539c";
+    let root_sha1 = "1b1ad6250902865aea72bc1e843d45b769e6c553";
     client.ctx().set_verify(SslVerifyMode::PEER);
     client.ctx().set_cert_verify_callback(move |x509| {
         assert!(!x509.verify_cert().unwrap());
@@ -110,8 +110,8 @@ fn callback_receives_correct_certificate() {
 fn callback_receives_correct_chain() {
     let server = Server::builder().build();
     let mut client = server.client_with_root_ca();
-    let leaf_sha1 = "582f63a9d73ce9cd3df62fe26a6415ef5aceda30";
-    let root_sha1 = "345131cbb40a5afed959d0c8ce537d235fe422c5";
+    let leaf_sha1 = "585e3a58acfd3b4e5e2825659407244ddd93539c";
+    let root_sha1 = "1b1ad6250902865aea72bc1e843d45b769e6c553";
     client.ctx().set_verify(SslVerifyMode::PEER);
     client.ctx().set_cert_verify_callback(move |x509| {
         assert!(x509.verify_cert().unwrap());
