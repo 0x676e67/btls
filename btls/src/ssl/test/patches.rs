@@ -12,7 +12,8 @@ use foreign_types::ForeignTypeRef;
 use super::server::Server;
 use crate::ffi;
 use crate::ssl::{
-    ExtensionType, SslConnector, SslContextBuilder, SslMethod, SslSignatureAlgorithm, SslVersion,
+    ExtensionType, SslConnector, SslContextBuilder, SslMethod, SslOptions, SslSession,
+    SslSessionCacheMode, SslSignatureAlgorithm, SslVersion,
 };
 
 type RecordHeaders = Arc<Mutex<Vec<[u8; 5]>>>;
@@ -118,8 +119,8 @@ fn connect_badssl_with_ciphers(host: &str, cipher_list: &str, expected_ciphers: 
     };
 
     // These public badssl endpoints intentionally require legacy ciphers that
-    // boringssl.patch restores for compatibility. Keep the cipher lists fixed:
-    // future patch migrations should fail here if any listed suite disappears.
+    // 0002-boringssl-legacy-ciphers.patch restores. Keep the cipher lists fixed so
+    // future patch migrations fail if any listed suite disappears.
     let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
     connector
         .set_min_proto_version(Some(SslVersion::TLS1_2))
@@ -195,7 +196,7 @@ fn boring_pq_p256_kyber_group_can_negotiate() {
 fn boringssl_patch_ffdhe_named_groups_are_advertised() {
     let supported_groups = Arc::new(Mutex::new(None));
 
-    // boringssl.patch adds ffdhe2048/ffdhe3072 as NamedGroup entries. TLS 1.2
+    // 0001-boringssl-ffdhe.patch adds ffdhe2048/ffdhe3072 as NamedGroup entries. TLS 1.2
     // DHE sessions do not expose a negotiated group id through SSL_get_curve_id,
     // so this verifies the patch-owned behavior directly: name parsing,
     // group-name lookup, and ClientHello supported_groups emission.
@@ -236,7 +237,7 @@ fn boringssl_patch_ffdhe_named_groups_are_advertised() {
         assert_eq!(
             unsafe { CStr::from_ptr(ptr).to_str().unwrap() },
             expected_name,
-            "{configured_name} should map to the boringssl.patch group name",
+            "{configured_name} should map to the 0001-boringssl-ffdhe.patch group name",
         );
     }
 
@@ -250,9 +251,149 @@ fn boringssl_patch_ffdhe_named_groups_are_advertised() {
     ] {
         assert!(
             groups.contains(&expected_id),
-            "ClientHello did not advertise boringssl.patch NamedGroup {configured_name}",
+            "ClientHello did not advertise 0001-boringssl-ffdhe.patch NamedGroup {configured_name}",
         );
     }
+}
+
+#[test]
+fn boringssl_patch_ffdhe_named_groups_negotiate_tls13() {
+    // Upstream BoringSSL does not implement these FFDHE key shares. Require
+    // both sides to use each group so 0001-boringssl-ffdhe.patch must generate,
+    // validate, and derive a shared secret from the RFC 7919 public values.
+    for (configured_name, expected_name, expected_id) in [
+        ("ffdhe2048", "dhe2048", ffi::SSL_GROUP_FFDHE2048 as u16),
+        ("ffdhe3072", "dhe3072", ffi::SSL_GROUP_FFDHE3072 as u16),
+    ] {
+        let mut server = Server::builder();
+        server
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        server
+            .ctx()
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        server.ctx().set_curves_list(configured_name).unwrap();
+        let server = server.build();
+
+        let mut client = server.client_with_root_ca();
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client
+            .ctx()
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client.ctx().set_curves_list(configured_name).unwrap();
+
+        let stream = client.connect();
+        assert_eq!(stream.ssl().version2(), Some(SslVersion::TLS1_3));
+        assert_eq!(stream.ssl().curve(), Some(expected_id));
+        assert_eq!(stream.ssl().curve_name(), Some(expected_name));
+    }
+}
+
+#[test]
+fn boringssl_patch_no_psk_dhe_ke_omits_psk_on_resumption() {
+    let session = Arc::new(Mutex::new(None));
+    let extensions = Arc::new(Mutex::new(Vec::new()));
+
+    let mut server = Server::builder();
+    server.expected_connections_count(2);
+    server
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    server
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(server.ctx().as_ptr(), 1) };
+    server.ctx().set_select_certificate_callback({
+        let extensions = Arc::clone(&extensions);
+        move |client_hello| {
+            extensions.lock().unwrap().push((
+                client_hello
+                    .get_extension(ExtensionType::PRE_SHARED_KEY)
+                    .is_some(),
+                client_hello
+                    .get_extension(ExtensionType::PSK_KEY_EXCHANGE_MODES)
+                    .is_some(),
+                client_hello
+                    .get_extension(ExtensionType::EARLY_DATA)
+                    .is_some(),
+            ));
+            Ok(())
+        }
+    });
+    let server = server.build();
+
+    let mut first_client = server.client_with_root_ca();
+    first_client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    first_client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(first_client.ctx().as_ptr(), 1) };
+    first_client
+        .ctx()
+        .set_session_cache_mode(SslSessionCacheMode::CLIENT);
+    first_client.ctx().set_new_session_callback({
+        let session = Arc::clone(&session);
+        move |_, new_session| {
+            let mut session = session.lock().unwrap();
+            if session.is_none() {
+                *session = Some(new_session.to_der().unwrap());
+            }
+        }
+    });
+    let first_stream = first_client.connect();
+    assert!(!first_stream.ssl().session_reused());
+
+    let session = SslSession::from_der(
+        session
+            .lock()
+            .unwrap()
+            .as_deref()
+            .expect("TLS 1.3 server did not issue a session ticket"),
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { ffi::SSL_SESSION_early_data_capable(session.as_ref().as_ptr()) },
+        1,
+        "the resumed handshake must exercise an early-data-capable session",
+    );
+
+    let mut resumed_client = server.client_with_root_ca();
+    resumed_client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    resumed_client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    unsafe { ffi::SSL_CTX_set_early_data_enabled(resumed_client.ctx().as_ptr(), 1) };
+    resumed_client.ctx().set_options(SslOptions::NO_PSK_DHE_KE);
+    let mut resumed_client = resumed_client.build().builder();
+    unsafe { resumed_client.ssl().set_session(&session).unwrap() };
+
+    let resumed_stream = resumed_client.connect();
+    assert!(!resumed_stream.ssl().session_reused());
+    assert_eq!(
+        unsafe { ffi::SSL_in_early_data(resumed_stream.ssl().as_ptr()) },
+        0
+    );
+
+    let extensions = extensions.lock().unwrap();
+    assert_eq!(extensions.len(), 2);
+    assert_eq!(extensions[0], (false, true, false));
+    assert_eq!(extensions[1], (false, false, false));
 }
 
 #[test]
@@ -286,9 +427,9 @@ fn boringssl_patch_clienthello_extensions_are_sent() {
     let record_size_limit = Arc::new(Mutex::new(None));
     let delegated_credential = Arc::new(Mutex::new(None));
 
-    // boringssl.patch adds these ClientHello knobs to our fork. The expected
-    // bytes here document patch-owned extension encoding, not upstream
-    // BoringSSL's native extension surface.
+    // 0005-record-size-limit.patch and 0006-delegated-credentials.patch add these
+    // ClientHello knobs. The expected bytes document patch-owned extension
+    // encoding, not upstream BoringSSL's native extension surface.
     let mut server = Server::builder();
     server.ctx().set_select_certificate_callback({
         let record_size_limit = Arc::clone(&record_size_limit);
@@ -432,7 +573,7 @@ fn assert_record_size_limit_records(
 
 #[test]
 fn record_size_limit_patch_tls12_is_asymmetric() {
-    // record-size-limit.patch implements the RFC 8449 record behavior that
+    // 0005-record-size-limit.patch implements the RFC 8449 record behavior that
     // upstream BoringSSL does not provide. TLS 1.2 AES-GCM adds an 8-byte
     // explicit nonce and a 16-byte tag after applying the peer's plaintext
     // limit.
@@ -481,9 +622,9 @@ fn record_size_limit_patch_requires_negotiation() {
 
 #[test]
 fn boringssl_patch_partial_extension_order_can_handshake() {
-    // boringssl.patch adds explicit ClientHello extension ordering. Unknown
-    // and duplicate entries are ignored, and the unlisted extensions are
-    // shuffled after the configured prefix.
+    // 0004-boringssl-extension-order.patch adds explicit ClientHello extension
+    // ordering. Unknown and duplicate entries are ignored, and the unlisted
+    // extensions are shuffled after the configured prefix.
     let server = Server::builder().build();
     let mut client = server.client_with_root_ca();
     client
@@ -514,12 +655,12 @@ fn boringssl_patch_partial_extension_order_can_handshake() {
 fn boringssl_patch_allows_duplicate_signature_algorithms() {
     let signature_algorithms = Arc::new(Mutex::new(None));
 
-    // boringssl.patch removes BoringSSL's sigalgs_unique rejection. Duplicate
-    // signature algorithms are a compatibility behavior from our patch, not a
-    // guarantee from upstream BoringSSL's native policy.
+    // 0008-boringssl-sigalgs.patch removes BoringSSL's sigalgs_unique rejection.
+    // Duplicate signature algorithms are a compatibility behavior from our
+    // patch, not a guarantee from upstream BoringSSL's native policy.
     let mut ctx = crate::ssl::SslContext::builder(crate::ssl::SslMethod::tls()).unwrap();
     ctx.set_sigalgs_list("RSA+SHA256:RSA+SHA256")
-        .expect("boringssl.patch should allow duplicate signing algorithm prefs");
+        .expect("0008-boringssl-sigalgs.patch should allow duplicate signing algorithm prefs");
 
     let mut server = Server::builder();
     server.ctx().set_select_certificate_callback({
@@ -544,7 +685,7 @@ fn boringssl_patch_allows_duplicate_signature_algorithms() {
             SslSignatureAlgorithm::RSA_PKCS1_SHA256,
             SslSignatureAlgorithm::RSA_PKCS1_SHA256,
         ])
-        .expect("boringssl.patch should allow duplicate verify algorithm prefs");
+        .expect("0008-boringssl-sigalgs.patch should allow duplicate verify algorithm prefs");
 
     client.connect();
 
@@ -555,7 +696,7 @@ fn boringssl_patch_allows_duplicate_signature_algorithms() {
             .filter(|&&sigalg| sigalg == ffi::SSL_SIGN_RSA_PKCS1_SHA256 as u16)
             .count(),
         2,
-        "ClientHello did not preserve the duplicated boringssl.patch signature algorithm",
+        "ClientHello did not preserve the duplicated 0008-boringssl-sigalgs.patch algorithm",
     );
 }
 
@@ -563,9 +704,9 @@ fn boringssl_patch_allows_duplicate_signature_algorithms() {
 fn boringssl_patch_preserves_tls13_cipher_order_in_clienthello() {
     let client_ciphers = Arc::new(Mutex::new(None));
 
-    // boringssl.patch adds preserve_tls13_cipher_list to keep our configured
-    // TLS 1.3 cipher order in ClientHello instead of upstream BoringSSL's
-    // native default ordering.
+    // 0007-boringssl-cipher-preferences.patch adds preserve_tls13_cipher_list to
+    // keep our configured TLS 1.3 cipher order in ClientHello instead of
+    // upstream BoringSSL's native default ordering.
     let mut server = Server::builder();
     server.ctx().set_select_certificate_callback({
         let client_ciphers = Arc::clone(&client_ciphers);

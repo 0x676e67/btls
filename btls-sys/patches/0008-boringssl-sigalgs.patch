@@ -1,0 +1,100 @@
+From 837623ae7cc267f4d23869ca8db59af8a909d988 Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Fri, 14 Aug 2026 17:03:45 +0800
+Subject: [PATCH 08/10] boringssl: allow duplicate signature algorithms
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ ssl/ssl_privkey.cc | 21 +++------------------
+ ssl/ssl_test.cc    | 19 +++++++++++++------
+ 2 files changed, 16 insertions(+), 24 deletions(-)
+
+diff --git a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
+index 2e04fa4a5..af40dd514 100644
+--- a/ssl/ssl_privkey.cc
++++ b/ssl/ssl_privkey.cc
+@@ -573,24 +573,9 @@ int SSL_is_signature_algorithm_rsa_pss(uint16_t sigalg) {
+   return alg != nullptr && alg->is_rsa_pss;
+ }
+ 
+-static bool sigalgs_unique(Span<const uint16_t> in_sigalgs) {
+-  if (in_sigalgs.size() < 2) {
+-    return true;
+-  }
+-
+-  Array<uint16_t> sigalgs;
+-  if (!sigalgs.CopyFrom(in_sigalgs)) {
+-    return false;
+-  }
+-
+-  std::sort(sigalgs.begin(), sigalgs.end());
+-  for (size_t i = 1; i < sigalgs.size(); i++) {
+-    if (sigalgs[i - 1] == sigalgs[i]) {
+-      OPENSSL_PUT_ERROR(SSL, SSL_R_DUPLICATE_SIGNATURE_ALGORITHM);
+-      return false;
+-    }
+-  }
+-
++static bool sigalgs_unique(Span<const uint16_t> /*in_sigalgs*/) {
++  // boringssl.patch accepts duplicate signature algorithms for legacy client
++  // compatibility. Older Safari 15 variants can send duplicate preferences.
+   return true;
+ }
+ 
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index 7f35da040..4d0f3252c 100644
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -7063,7 +7063,9 @@ TEST(SSLTest, SigAlgs) {
+       {{1}, false, {}},
+       {{1, 2, 3}, false, {}},
+       {{NID_sha256, EVP_PKEY_ED25519}, false, {}},
+-      {{NID_sha256, EVP_PKEY_RSA, NID_sha256, EVP_PKEY_RSA}, false, {}},
++      {{NID_sha256, EVP_PKEY_RSA, NID_sha256, EVP_PKEY_RSA},
++       true,
++       {SSL_SIGN_RSA_PKCS1_SHA256, SSL_SIGN_RSA_PKCS1_SHA256}},
+       {{NID_sha256, EVP_PKEY_ML_DSA_44}, false, {}},
+ 
+       {{NID_sha256, EVP_PKEY_RSA}, true, {SSL_SIGN_RSA_PKCS1_SHA256}},
+@@ -7118,8 +7120,13 @@ TEST(SSLTest, SigAlgsList) {
+       {":RSA+SHA256+:", false, {}},
+       {"!", false, {}},
+       {"\x01", false, {}},
+-      {"RSA+SHA256:RSA+SHA384:RSA+SHA256", false, {}},
+-      {"RSA-PSS+SHA256:rsa_pss_rsae_sha256", false, {}},
++      {"RSA+SHA256:RSA+SHA384:RSA+SHA256",
++       true,
++       {SSL_SIGN_RSA_PKCS1_SHA256, SSL_SIGN_RSA_PKCS1_SHA384,
++        SSL_SIGN_RSA_PKCS1_SHA256}},
++      {"RSA-PSS+SHA256:rsa_pss_rsae_sha256",
++       true,
++       {SSL_SIGN_RSA_PSS_RSAE_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256}},
+ 
+       {"RSA+SHA256", true, {SSL_SIGN_RSA_PKCS1_SHA256}},
+       {"RSA+SHA256:ed25519",
+@@ -10951,10 +10958,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
+ 
+   static const uint16_t kDuplicatePrefs[] = {SSL_SIGN_RSA_PKCS1_SHA256,
+                                              SSL_SIGN_RSA_PKCS1_SHA256};
+-  EXPECT_FALSE(SSL_CTX_set_signing_algorithm_prefs(ctx.get(), kDuplicatePrefs,
+-                                                   std::size(kDuplicatePrefs)));
+-  EXPECT_FALSE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
++  EXPECT_TRUE(SSL_CTX_set_signing_algorithm_prefs(ctx.get(), kDuplicatePrefs,
+                                                   std::size(kDuplicatePrefs)));
++  EXPECT_TRUE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
++                                                 std::size(kDuplicatePrefs)));
+ }
+ 
+ TEST(SSLTest, InvalidGroups) {

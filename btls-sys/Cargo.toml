@@ -80,6 +80,12 @@ underscore-wildcards = []
 # with OpenSSL versions that might be linked in the same process.
 prefix-symbols = []
 
+# Restores the historical pre-TLS 1.3 client behaviour for RSA leaf certificates
+# whose keyUsage does not match the negotiated cipher suite. Enabling this
+# feature applies a build-time patch that makes those RSA mismatches non-fatal.
+# Non-RSA certificates, server validation, and TLS 1.3 are unaffected.
+relax-cert-validation = []
+
 [build-dependencies]
 bindgen = { workspace = true }
 cmake = { workspace = true }

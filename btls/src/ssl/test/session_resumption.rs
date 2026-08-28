@@ -4,11 +4,15 @@ use crate::ssl::HmacCtxRef;
 use crate::ssl::SslRef;
 use crate::ssl::SslSession;
 use crate::ssl::SslSessionCacheMode;
+use crate::ssl::SslVerifyError;
+use crate::ssl::SslVerifyMode;
+use crate::ssl::SslVersion;
 use crate::ssl::TicketKeyCallbackResult;
 use crate::symm::Cipher;
 use crate::symm::CipherCtxRef;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 static SUCCESS_ENCRYPTION_CALLED_BACK: AtomicU8 = AtomicU8::new(0);
 static SUCCESS_DECRYPTION_CALLED_BACK: AtomicU8 = AtomicU8::new(0);
@@ -49,6 +53,78 @@ fn resume_session() {
     let ssl_stream_2 = ssl_builder.connect();
 
     assert!(ssl_stream_2.ssl().session_reused());
+}
+
+#[test]
+fn client_session_cache_apis() {
+    let mut server = Server::builder();
+    server.expected_connections_count(2);
+    server
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    server
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    let server = server.build();
+
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let callback_sessions = Arc::clone(&sessions);
+    let verify_count = Arc::new(AtomicU8::new(0));
+    let callback_verify_count = Arc::clone(&verify_count);
+
+    let mut client = server.client();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
+    let _ = client.ctx().set_session_timeout(60);
+    assert_eq!(client.ctx().set_session_timeout(120), 60);
+    client.ctx().set_reverify_on_resume(true);
+    client
+        .ctx()
+        .set_custom_verify_callback(SslVerifyMode::PEER, move |_| {
+            callback_verify_count.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, SslVerifyError>(())
+        });
+    client.ctx().set_new_session_callback(move |_, session| {
+        callback_sessions.lock().unwrap().push(session);
+    });
+    let client = client.build();
+
+    let first = client.builder().connect();
+    assert!(!first.ssl().session_reused());
+    assert_eq!(verify_count.load(Ordering::SeqCst), 1);
+
+    let mut sessions = sessions.lock().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions
+        .iter()
+        .all(|session| session.should_be_single_use()));
+    let session = sessions.pop().unwrap();
+    drop(sessions);
+    assert!(session.should_be_single_use());
+    let session_without_early_data = session.copy_without_early_data().unwrap();
+    assert_eq!(
+        session.to_der().unwrap(),
+        session_without_early_data.to_der().unwrap()
+    );
+
+    let mut resumed = client.builder();
+    // SAFETY: The session was created by this client's SSL_CTX, and the new handshake has not
+    // started.
+    unsafe { resumed.ssl().set_session(&session).unwrap() };
+    let resumed = resumed.connect();
+    assert!(resumed.ssl().session_reused());
+    assert_eq!(verify_count.load(Ordering::SeqCst), 2);
 }
 
 #[test]
