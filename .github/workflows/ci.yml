@@ -376,7 +376,7 @@ jobs:
     name: Test FIPS integration
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         submodules: 'recursive'
     - name: Install Rust (rustup)
@@ -405,7 +405,7 @@ jobs:
     name: Test BoringSSL upstream test suite
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         submodules: 'recursive'
     - name: Install golang
