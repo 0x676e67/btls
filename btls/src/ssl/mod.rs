@@ -2090,6 +2090,17 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_enabled(self.as_ptr(), enabled as _) }
     }
 
+    /// Sets whether the context should include a GREASE value in `signature_algorithms`
+    /// extensions when sending ClientHello.
+    ///
+    /// See [RFC 8701].
+    ///
+    /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
+    #[corresponds(SSL_CTX_set_grease_sigalgs_enabled)]
+    pub fn set_grease_sigalgs_enabled(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_CTX_set_grease_sigalgs_enabled(self.as_ptr(), enabled as _) }
+    }
+
     /// Sets whether the context should enable record size limit.
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_record_size_limit)]
