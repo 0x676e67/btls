@@ -2228,19 +2228,27 @@ impl SslContextBuilder {
         unsafe { cvt_0i(ffi::SSL_CTX_set_compliance_policy(self.as_ptr(), policy.0)).map(|_| ()) }
     }
 
-    /// Configures the context to request a certificate issued by one of the trust anchors in
-    /// `ids`.
+    /// Configures client connections created from this context to send the TLS 1.3
+    /// `trust_anchors` extension when requesting a server certificate.
     ///
-    /// `ids` must be a list of trust anchor IDs in wire-format (a series of non-empty,
-    /// 8-bit length-prefixed strings). The list may describe the application's full list of
-    /// supported trust anchors, or a, possibly empty, subset.
+    /// This extension is defined by the [TLS Trust Anchor Identifiers Internet-Draft]. BoringSSL
+    /// currently uses a provisional extension codepoint and only implements the extension for
+    /// server certificates, not client certificates.
     ///
-    /// If `ids` is empty, the `trust_anchors` extension will still be sent in ClientHello. This
-    /// may be used by a client application to signal support for the retry flow without
-    /// requesting specific trust anchors.
+    /// `ids` is the inner `RequestedTrustAnchorList`: each non-empty trust anchor ID is prefixed
+    /// by its length as one byte, and the entries are concatenated. Do not include the outer
+    /// 16-bit vector length from the extension. The list may contain all supported trust anchors
+    /// or a subset selected using information such as a DNS hint.
     ///
-    /// This does not directly impact certificate verification, only the list of trust anchors
-    /// sent to the peer.
+    /// By default, BoringSSL omits the extension. An empty slice still sends an empty list, which
+    /// signals support for the retry flow without requesting a specific trust anchor. This
+    /// setting does not add trust anchors to the verifier or change certificate verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ids` is not a correctly encoded list or BoringSSL cannot copy it.
+    ///
+    /// [TLS Trust Anchor Identifiers Internet-Draft]: https://datatracker.ietf.org/doc/draft-ietf-tls-trust-anchor-ids/
     #[corresponds(SSL_CTX_set1_requested_trust_anchors)]
     pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
         // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
@@ -4238,9 +4246,10 @@ impl SslRef {
         }
     }
 
-    /// Like [`SslContextBuilder::set_requested_trust_anchors`].
+    /// Overrides [`SslContextBuilder::set_requested_trust_anchors`] for this connection.
     ///
-    /// [`SslContextBuilder::set_requested_trust_anchors`]: struct.SslContextBuilder.html#method.set_requested_trust_anchors
+    /// This method must be called before the handshake starts. See the context-level method for
+    /// the input format, protocol scope, and empty-list behavior.
     #[corresponds(SSL_set1_requested_trust_anchors)]
     pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
         // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
