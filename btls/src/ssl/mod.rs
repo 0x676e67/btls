@@ -590,9 +590,6 @@ impl ExtensionType {
     pub const STATUS_REQUEST: Self = Self(ffi::TLSEXT_TYPE_status_request as u16);
     pub const EC_POINT_FORMATS: Self = Self(ffi::TLSEXT_TYPE_ec_point_formats as u16);
     pub const SIGNATURE_ALGORITHMS: Self = Self(ffi::TLSEXT_TYPE_signature_algorithms as u16);
-    /// The Trust Anchor Identifiers extension.
-    ///
-    /// See [draft-ietf-tls-trust-anchor-ids](https://datatracker.ietf.org/doc/draft-ietf-tls-trust-anchor-ids/).
     pub const TRUST_ANCHORS: Self = Self(ffi::TLSEXT_TYPE_trust_anchors as u16);
     pub const SRTP: Self = Self(ffi::TLSEXT_TYPE_srtp as u16);
     pub const APPLICATION_LAYER_PROTOCOL_NEGOTIATION: Self =
