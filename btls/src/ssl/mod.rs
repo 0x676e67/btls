@@ -2228,27 +2228,20 @@ impl SslContextBuilder {
         unsafe { cvt_0i(ffi::SSL_CTX_set_compliance_policy(self.as_ptr(), policy.0)).map(|_| ()) }
     }
 
-    /// Configures client connections created from this context to send the TLS 1.3
-    /// `trust_anchors` extension when requesting a server certificate.
+    /// Configures client connections to send the TLS 1.3 `trust_anchors` extension.
     ///
-    /// This extension is defined by the [TLS Trust Anchor Identifiers Internet-Draft]. BoringSSL
-    /// currently uses a provisional extension codepoint and only implements the extension for
-    /// server certificates, not client certificates.
+    /// `ids` is a sequence of non-empty, one-byte length-prefixed trust anchor IDs, without the
+    /// extension's outer 16-bit length. See the [TLS Trust Anchor Identifiers draft].
     ///
-    /// `ids` is the inner `RequestedTrustAnchorList`: each non-empty trust anchor ID is prefixed
-    /// by its length as one byte, and the entries are concatenated. Do not include the outer
-    /// 16-bit vector length from the extension. The list may contain all supported trust anchors
-    /// or a subset selected using information such as a DNS hint.
-    ///
-    /// By default, BoringSSL omits the extension. An empty slice still sends an empty list, which
-    /// signals support for the retry flow without requesting a specific trust anchor. This
-    /// setting does not add trust anchors to the verifier or change certificate verification.
+    /// The extension is omitted by default, while an empty slice still sends it. This setting
+    /// guides server certificate selection and does not change certificate verification.
+    /// BoringSSL currently uses a provisional codepoint and supports only server certificates.
     ///
     /// # Errors
     ///
     /// Returns an error if `ids` is not a correctly encoded list or BoringSSL cannot copy it.
     ///
-    /// [TLS Trust Anchor Identifiers Internet-Draft]: https://datatracker.ietf.org/doc/draft-ietf-tls-trust-anchor-ids/
+    /// [TLS Trust Anchor Identifiers draft]: https://datatracker.ietf.org/doc/draft-ietf-tls-trust-anchor-ids/
     #[corresponds(SSL_CTX_set1_requested_trust_anchors)]
     pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
         // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
@@ -4247,9 +4240,7 @@ impl SslRef {
     }
 
     /// Overrides [`SslContextBuilder::set_requested_trust_anchors`] for this connection.
-    ///
-    /// This method must be called before the handshake starts. See the context-level method for
-    /// the input format, protocol scope, and empty-list behavior.
+    /// Call this method before the handshake starts.
     #[corresponds(SSL_set1_requested_trust_anchors)]
     pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
         // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
