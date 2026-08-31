@@ -13,6 +13,7 @@ use crate::x509::extension::{
 };
 use crate::x509::store::X509StoreBuilder;
 use crate::x509::{X509Extension, X509Name, X509Req, X509StoreContext, X509};
+const TEST_CERT_DIGEST: &str = "585e3a58acfd3b4e5e2825659407244ddd93539c";
 
 mod trusted_first;
 
@@ -27,8 +28,7 @@ fn test_cert_loading() {
     let cert = X509::from_pem(cert).unwrap();
     let fingerprint = cert.digest(MessageDigest::sha1()).unwrap();
 
-    let hash_str = "582f63a9d73ce9cd3df62fe26a6415ef5aceda30";
-    let hash_vec = Vec::from_hex(hash_str).unwrap();
+    let hash_vec = Vec::from_hex(TEST_CERT_DIGEST).unwrap();
 
     assert_eq!(hash_vec, &*fingerprint);
 }
@@ -43,8 +43,8 @@ fn test_debug() {
     assert!(debugged.contains(r#"signature_algorithm: sha256WithRSAEncryption"#));
     assert!(debugged.contains(r#"countryName = "AU""#));
     assert!(debugged.contains(r#"stateOrProvinceName = "Some-State""#));
-    assert!(debugged.contains(r#"not_before: Aug 13 01:04:28 2026 GMT"#));
-    assert!(debugged.contains(r#"not_after: May  4 01:04:28 2049 GMT"#));
+    assert!(debugged.contains(r#"not_before: Aug 12 21:37:58 2026 GMT"#));
+    assert!(debugged.contains(r#"not_after: Aug  9 21:37:58 2036 GMT"#));
 }
 
 #[test]
@@ -54,8 +54,8 @@ fn test_cert_issue_validity() {
     let not_before = cert.not_before().to_string();
     let not_after = cert.not_after().to_string();
 
-    assert_eq!(not_before, "Aug 13 01:04:28 2026 GMT");
-    assert_eq!(not_after, "May  4 01:04:28 2049 GMT");
+    assert_eq!(not_before, "Aug 12 21:37:58 2026 GMT");
+    assert_eq!(not_after, "Aug  9 21:37:58 2036 GMT");
 }
 
 #[test]
@@ -395,11 +395,11 @@ fn test_stack_from_pem() {
     assert_eq!(certs.len(), 2);
     assert_eq!(
         hex::encode(certs[0].digest(MessageDigest::sha1()).unwrap()),
-        "582f63a9d73ce9cd3df62fe26a6415ef5aceda30"
+        "585e3a58acfd3b4e5e2825659407244ddd93539c"
     );
     assert_eq!(
         hex::encode(certs[1].digest(MessageDigest::sha1()).unwrap()),
-        "345131cbb40a5afed959d0c8ce537d235fe422c5"
+        "1b1ad6250902865aea72bc1e843d45b769e6c553"
     );
 }
 
@@ -421,13 +421,13 @@ fn signature() {
     let signature = cert.signature();
     assert_eq!(
         hex::encode(signature.as_slice()),
-        "988f1702931aa8c6cab05efa22eac03f29e9c774d3c154fe6008d29bc4823bf9966070fabe45dcbd\
-         87084cac1393fb583fe41fbb8afcef598dc38a8a11fe5fe37a8431e1e24d51e032ae885ed16ed9b9\
-         6b255dc4eb3886567992313f62b63d89449455c8856eea5b68a6a6282cf275a2c1242e68824182d9\
-         514c1de1781fd743118fbaa1f892ca9ffba0a395fc53c9c3497e539a3cc4dae05fe0604499d56cdb\
-         a61740ef63da1043ae5a39778b7303a383f439cf40337e81dc7e1b98736f7414dfe51a1a328d3661\
-         5691759417501fbec2c08e2c1c305aeaf06b36f341f86d63e69b8e176d5aa1432df81b41b6428901\
-         7b2fe52a436ab5515eea3a4517f159ca"
+        "73a2bbd9e91b011f11d18a75e247b09b3288dcc837900ee38ce36f4b8fcef2dbc201db032f5d0206e990f64\
+          e22a5445d559d91dc52797a6a9115cb2325eb79ca4a2c036ac8bb4aae54b2f0c285efc80d404b1c703e\
+          bca56ce85e3a64173853b45d243cb023e8b4fe2ae02ebf59f415938295ce41970a583f147a2f83592cd\
+          0ae639c2da9cd4f04a521b1eada862a2142774aedcc9bb7f4e5019443ba01b50174abc2373566a6e91aa\
+          8ba1e4ddffbec5d308575fa9bd160555965a718dee775568dde57808f0b45794562ab9095fe6242af85f\
+          4c2da698c8b219a3f2054b1c505a526f176ebcee4b16f0ad76b341ba0ddaad7bea1ac97076ed37041fa\
+          45d58b0c"
     );
     let algorithm = cert.signature_algorithm();
     assert_eq!(algorithm.object().nid(), Nid::SHA256WITHRSAENCRYPTION);

@@ -371,14 +371,13 @@ index e05f91bd9..07e6ff069 100644
  namespace fips202205 {
  
  // (References are to SP 800-52r2):
-@@ -3537,7 +3549,9 @@ namespace fips202205 {
+@@ -3537,7 +3549,8 @@ namespace fips202205 {
  // Section 3.3.1
  // "The server shall be configured to only use cipher suites that are
  // composed entirely of NIST approved algorithms"
 -static const uint16_t kGroups[] = {SSL_GROUP_SECP256R1, SSL_GROUP_SECP384R1};
-+static const uint16_t kGroups[] = {
-+    SSL_GROUP_P256_KYBER768_DRAFT00,
-+    SSL_GROUP_SECP256R1, SSL_GROUP_SECP384R1};
++static const uint16_t kGroups[] = {SSL_GROUP_P256_KYBER768_DRAFT00,
++                                   SSL_GROUP_SECP256R1, SSL_GROUP_SECP384R1};
  
  static const uint16_t kSigAlgs[] = {
      SSL_SIGN_RSA_PKCS1_SHA256,
@@ -545,3 +544,20 @@ index 1f2b19965..a69d90aca 100644
        fprintf(stderr, "Failed to load root certificates.\n");
        ERR_print_errors_fp(stderr);
        return false;
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index 88b81e35a..4d0f3252c 100644
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -2359,9 +2374,9 @@ TEST(SSLTest, SetGroupIdsWithEqualPreference) {
+ // Test that the SSL group flags are defaulted to zero when zero groups are set
+ // (i.e. using the default groups).
+ TEST(SSLTest, SetGroupIdsWithFlags_DefaultGroups) {
+-  const uint16_t kDefaultGroups[] = {SSL_GROUP_X25519_MLKEM768,
+-                                     SSL_GROUP_X25519, SSL_GROUP_SECP256R1,
+-                                     SSL_GROUP_SECP384R1};
++  const uint16_t kDefaultGroups[] = {
++      SSL_GROUP_X25519_MLKEM768, SSL_GROUP_P256_KYBER768_DRAFT00,
++      SSL_GROUP_X25519, SSL_GROUP_SECP256R1, SSL_GROUP_SECP384R1};
+   const uint32_t kBogusFlags[] = {SSL_GROUP_FLAG_EQUAL_PREFERENCE_WITH_NEXT,
+                                   SSL_GROUP_FLAG_EQUAL_PREFERENCE_WITH_NEXT, 0};
+   bssl::UniquePtr<SSL_CTX> server_ctx =
