@@ -383,7 +383,7 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
       shell: bash
     - name: Install golang
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: '>=1.22.0'
     - name: Run tests
@@ -409,7 +409,7 @@ jobs:
       with:
         submodules: 'recursive'
     - name: Install golang
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: '>=1.22.0'
     - name: Install build tools (clang, cmake)
