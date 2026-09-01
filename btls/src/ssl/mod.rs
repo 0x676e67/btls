@@ -590,6 +590,7 @@ impl ExtensionType {
     pub const STATUS_REQUEST: Self = Self(ffi::TLSEXT_TYPE_status_request as u16);
     pub const EC_POINT_FORMATS: Self = Self(ffi::TLSEXT_TYPE_ec_point_formats as u16);
     pub const SIGNATURE_ALGORITHMS: Self = Self(ffi::TLSEXT_TYPE_signature_algorithms as u16);
+    pub const TRUST_ANCHORS: Self = Self(ffi::TLSEXT_TYPE_trust_anchors as u16);
     pub const SRTP: Self = Self(ffi::TLSEXT_TYPE_srtp as u16);
     pub const APPLICATION_LAYER_PROTOCOL_NEGOTIATION: Self =
         Self(ffi::TLSEXT_TYPE_application_layer_protocol_negotiation as u16);
@@ -2225,6 +2226,33 @@ impl SslContextBuilder {
     #[corresponds(SSL_CTX_set_compliance_policy)]
     pub fn set_compliance_policy(&mut self, policy: CompliancePolicy) -> Result<(), ErrorStack> {
         unsafe { cvt_0i(ffi::SSL_CTX_set_compliance_policy(self.as_ptr(), policy.0)).map(|_| ()) }
+    }
+
+    /// Configures client connections to send the TLS 1.3 `trust_anchors` extension.
+    ///
+    /// `ids` is a sequence of non-empty, one-byte length-prefixed trust anchor IDs, without the
+    /// extension's outer 16-bit length. See the [TLS Trust Anchor Identifiers draft].
+    ///
+    /// The extension is omitted by default, while an empty slice still sends it. This setting
+    /// guides server certificate selection and does not change certificate verification.
+    /// BoringSSL currently uses a provisional codepoint and supports only server certificates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ids` is not a correctly encoded list or BoringSSL cannot copy it.
+    ///
+    /// [TLS Trust Anchor Identifiers draft]: https://datatracker.ietf.org/doc/draft-ietf-tls-trust-anchor-ids/
+    #[corresponds(SSL_CTX_set1_requested_trust_anchors)]
+    pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
     }
 
     /// Sets the context's info callback.
@@ -4206,6 +4234,21 @@ impl SslRef {
                 self.as_ptr(),
                 key_shares.as_ptr() as *const _,
                 key_shares.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Overrides [`SslContextBuilder::set_requested_trust_anchors`] for this connection.
+    /// Call this method before the handshake starts.
+    #[corresponds(SSL_set1_requested_trust_anchors)]
+    pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
+        unsafe {
+            cvt_0i(ffi::SSL_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
             ))
             .map(|_| ())
         }
