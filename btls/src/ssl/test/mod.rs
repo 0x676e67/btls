@@ -29,12 +29,14 @@ mod cert_verify;
 mod custom_verify;
 mod delegated_credentials;
 mod ech;
+mod grease_sigalgs;
 mod patch_ciphers;
 mod patches;
 mod private_key_method;
 mod server;
 mod session;
 mod session_resumption;
+mod trust_anchors;
 mod verify;
 
 static ROOT_CERT: &[u8] = include_bytes!("../../../test/root-ca.pem");

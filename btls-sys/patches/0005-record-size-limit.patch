@@ -30,8 +30,8 @@ limitations under the License.
  ssl/handoff.cc                   |   6 +-
  ssl/handshake_server.cc          |   2 +
  ssl/internal.h                   |  66 ++++
- ssl/record_size_limit.cc         | 353 ++++++++++++++++++++
- ssl/record_size_limit_test.cc    | 680 +++++++++++++++++++++++++++++++++++++++
+ ssl/record_size_limit.cc         | 361 ++++++++++++++++++++
+ ssl/record_size_limit_test.cc    | 852 +++++++++++++++++++++++++++++++++++++++
  ssl/s3_both.cc                   |   7 +-
  ssl/s3_pkt.cc                    |   2 +-
  ssl/ssl_asn1.cc                  |  26 ++
@@ -40,7 +40,7 @@ limitations under the License.
  ssl/tls13_server.cc              |   1 +
  ssl/tls_method.cc                |   2 +
  ssl/tls_record.cc                |  14 +-
- 23 files changed, 1274 insertions(+), 19 deletions(-)
+ 23 files changed, 1454 insertions(+), 19 deletions(-)
  create mode 100644 ssl/record_size_limit.cc
  create mode 100644 ssl/record_size_limit_test.cc
 
@@ -581,10 +581,10 @@ index 506775b90..a76cd41a8 100644
    // resumptions. For the current connection's ALPN protocol, see
 diff --git a/ssl/record_size_limit.cc b/ssl/record_size_limit.cc
 new file mode 100644
-index 000000000..217dd5789
+index 000000000..ca8c2912f
 --- /dev/null
 +++ b/ssl/record_size_limit.cc
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,361 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -860,6 +860,14 @@ index 000000000..217dd5789
 +    return true;
 +  }
 +
++  // Rejected 0-RTT uses the previous session's keys and limits. Let trial
++  // decryption discard it before applying the new handshake's limit (RFC
++  // 8446 section 4.2.10). Successfully decrypted records still pass through
++  // ssl_record_size_limit_check_plaintext before they can be processed.
++  if (ssl->s3->skip_early_data) {
++    return true;
++  }
++
 +  const uint16_t version = ssl_protocol_version(ssl);
 +  if (version < TLS1_3_VERSION &&
 +      limit == record_size_limit_max_for_version(version)) {
@@ -940,10 +948,10 @@ index 000000000..217dd5789
 +}
 diff --git a/ssl/record_size_limit_test.cc b/ssl/record_size_limit_test.cc
 new file mode 100644
-index 000000000..3254e9919
+index 000000000..7a01a33cf
 --- /dev/null
 +++ b/ssl/record_size_limit_test.cc
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,852 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1468,6 +1476,85 @@ index 000000000..3254e9919
 +  }
 +}
 +
++// Observe the patch's RFC 8449 behavior on the wire. In TLS 1.3 the first
++// protected server record carries the start of EncryptedExtensions, before
++// the client knows whether its advertised receive limit was accepted.
++// https://www.rfc-editor.org/rfc/rfc8449.html#section-4
++static void CaptureProtectedRecordLengths(int is_write, int, int content_type,
++                                          const void *buf, size_t len, SSL *,
++                                          void *arg) {
++  if (!is_write || content_type != SSL3_RT_HEADER ||
++      len != SSL3_RT_HEADER_LENGTH) {
++    return;
++  }
++  const auto *header = static_cast<const uint8_t *>(buf);
++  if (header[0] == SSL3_RT_APPLICATION_DATA) {
++    auto *lengths = static_cast<std::vector<uint16_t> *>(arg);
++    lengths->push_back((static_cast<uint16_t>(header[3]) << 8) | header[4]);
++  }
++}
++
++TEST(RecordSizeLimitTest, FragmentsFirstTls13ProtectedFlight) {
++  UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_3_VERSION);
++  UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_3_VERSION);
++  ASSERT_TRUE(client_ctx);
++  ASSERT_TRUE(server_ctx);
++  SSL_CTX_set_record_size_limit(client_ctx.get(), 64);
++  SSL_CTX_set_record_size_limit(server_ctx.get(), 96);
++  SSL_CTX_set_options(server_ctx.get(), SSL_OP_NO_TICKET);
++
++  std::vector<uint16_t> lengths;
++  SSL_CTX_set_msg_callback(server_ctx.get(), CaptureProtectedRecordLengths);
++  SSL_CTX_set_msg_callback_arg(server_ctx.get(), &lengths);
++  UniquePtr<SSL> client, server;
++  ASSERT_TRUE(CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
++  ASSERT_TRUE(CompleteHandshakes(client.get(), server.get()));
++
++  // The 64-byte limit includes the inner content type. All enabled TLS 1.3
++  // ciphers add a 16-byte tag; record headers are not counted here.
++  ASSERT_GT(lengths.size(), 1u);
++  EXPECT_LE(lengths.front(), 64u + 16u);
++  for (uint16_t length : lengths) {
++    EXPECT_LE(length, 64u + 16u);
++  }
++  EXPECT_EQ(FromOpaque(client.get())->s3->read_record_size_limit, 64);
++  EXPECT_EQ(FromOpaque(server.get())->s3->write_record_size_limit, 64);
++}
++
++TEST(RecordSizeLimitTest, AllowsOversizedFirstTls13RecordWithoutNegotiation) {
++  UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_3_VERSION);
++  UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_3_VERSION);
++  ASSERT_TRUE(client_ctx);
++  ASSERT_TRUE(server_ctx);
++  SSL_CTX_set_record_size_limit(client_ctx.get(), 64);
++  SSL_CTX_set_options(server_ctx.get(), SSL_OP_NO_TICKET);
++
++  std::vector<uint16_t> lengths;
++  SSL_CTX_set_msg_callback(server_ctx.get(), CaptureProtectedRecordLengths);
++  SSL_CTX_set_msg_callback_arg(server_ctx.get(), &lengths);
++  UniquePtr<SSL> client, server;
++  ASSERT_TRUE(CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
++  ASSERT_TRUE(CompleteHandshakes(client.get(), server.get()));
++
++  // The offer alone must not reject the record containing the server's
++  // refusal. Check the first record, not merely the largest in the flight.
++  ASSERT_FALSE(lengths.empty());
++  EXPECT_GT(lengths.front(), 64u + 16u);
++  for (SSL *ssl : {client.get(), server.get()}) {
++    const SSL3_STATE *state = FromOpaque(ssl)->s3;
++    EXPECT_EQ(state->read_record_size_limit, 0);
++    EXPECT_EQ(state->write_record_size_limit, 0);
++    EXPECT_EQ(state->unconfirmed_read_record_size_limit, 0);
++    EXPECT_FALSE(state->unconfirmed_read_record_size_limit_exceeded);
++  }
++  std::array<uint8_t, 200> sent = {0x5a};
++  std::array<uint8_t, 200> received = {};
++  ASSERT_EQ(SSL_write(server.get(), sent.data(), sent.size()),
++            static_cast<int>(sent.size()));
++  ASSERT_TRUE(ReadExact(client.get(), received));
++  EXPECT_EQ(received, sent);
++}
++
 +TEST(RecordSizeLimitTest, RejectsOversizedFirstTls13ProtectedFlight) {
 +  UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_3_VERSION);
 +  UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_3_VERSION);
@@ -1485,6 +1572,10 @@ index 000000000..3254e9919
 +      },
 +      nullptr);
 +
++  SSL_CTX_set_options(server_ctx.get(), SSL_OP_NO_TICKET);
++  std::vector<uint16_t> lengths;
++  SSL_CTX_set_msg_callback(server_ctx.get(), CaptureProtectedRecordLengths);
++  SSL_CTX_set_msg_callback_arg(server_ctx.get(), &lengths);
 +  UniquePtr<SSL> client, server;
 +  ASSERT_TRUE(CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
 +  int ret = SSL_do_handshake(client.get());
@@ -1492,10 +1583,19 @@ index 000000000..3254e9919
 +  ret = SSL_do_handshake(server.get());
 +  ASSERT_TRUE(IsRetryableHandshakeError(SSL_get_error(server.get(), ret)));
 +
++  ASSERT_FALSE(lengths.empty());
++  ASSERT_GT(lengths.front(), 64u + 16u);
 +  ERR_clear_error();
 +  ret = SSL_do_handshake(client.get());
 +  EXPECT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_SSL);
 +  EXPECT_TRUE(ErrorQueueContains(SSL_R_DATA_LENGTH_TOO_LONG));
++  EXPECT_EQ(FromOpaque(client.get())->s3->send_alert[1],
++            SSL_AD_RECORD_OVERFLOW);
++
++  ERR_clear_error();
++  ret = SSL_do_handshake(server.get());
++  EXPECT_EQ(SSL_get_error(server.get(), ret), SSL_ERROR_SSL);
++  EXPECT_TRUE(ErrorQueueContains(SSL_R_TLSV1_ALERT_RECORD_OVERFLOW));
 +}
 +
 +TEST(RecordSizeLimitTest, EarlyDataUsesTheSessionEpochLimits) {
@@ -1565,6 +1665,86 @@ index 000000000..3254e9919
 +  EXPECT_EQ(FromOpaque(client.get())->s3->write_record_size_limit, 64);
 +  EXPECT_EQ(FromOpaque(server.get())->s3->read_record_size_limit, 64);
 +  EXPECT_EQ(FromOpaque(server.get())->s3->write_record_size_limit, 80);
++}
++
++TEST(RecordSizeLimitTest, RejectedEarlyDataDoesNotUseNewEpochLimit) {
++  // RFC 8446 section 4.2.10 requires rejected early data to be discarded.
++  // The patch must not apply the new RFC 8449 limit to those old-epoch records.
++  // https://www.rfc-editor.org/rfc/rfc8446.html#section-4.2.10
++  for (uint16_t old_limit : {0, 512}) {
++    SCOPED_TRACE(old_limit);
++    auto client_ctx = CreateContext(false, TLS1_3_VERSION);
++    auto server_ctx = CreateContext(true, TLS1_3_VERSION);
++    ASSERT_TRUE(client_ctx);
++    ASSERT_TRUE(server_ctx);
++    SSL_CTX_set_session_cache_mode(client_ctx.get(), SSL_SESS_CACHE_BOTH);
++    SSL_CTX_set_session_cache_mode(server_ctx.get(), SSL_SESS_CACHE_BOTH);
++    SSL_CTX_set_early_data_enabled(client_ctx.get(), 1);
++    SSL_CTX_set_early_data_enabled(server_ctx.get(), 1);
++    SSL_CTX_set_record_size_limit(client_ctx.get(), 96);
++    SSL_CTX_set_record_size_limit(server_ctx.get(), old_limit);
++    auto session = CreateClientSession(client_ctx.get(), server_ctx.get());
++    ASSERT_TRUE(session);
++    ASSERT_TRUE(SSL_SESSION_early_data_capable(session.get()));
++
++    SSL_CTX_set_record_size_limit(server_ctx.get(), 64);
++    UniquePtr<SSL> client, server;
++    ASSERT_TRUE(CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
++    ASSERT_TRUE(SSL_set_session(client.get(), session.get()));
++    SSL_set_early_data_enabled(server.get(), 0);
++    ASSERT_EQ(SSL_do_handshake(client.get()), 1);
++    ASSERT_TRUE(SSL_in_early_data(client.get()));
++    std::array<uint8_t, 200> sent = {0x5a};
++    ASSERT_EQ(SSL_write(client.get(), sent.data(), sent.size()),
++              static_cast<int>(sent.size()));
++
++    int ret = SSL_do_handshake(server.get());
++    ASSERT_EQ(SSL_get_error(server.get(), ret), SSL_ERROR_WANT_READ);
++    ASSERT_TRUE(FromOpaque(server.get())->s3->skip_early_data);
++    ret = SSL_do_handshake(client.get());
++    ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_EARLY_DATA_REJECTED);
++    SSL_reset_early_data_reject(client.get());
++    ASSERT_TRUE(CompleteHandshakes(client.get(), server.get()));
++    EXPECT_TRUE(SSL_session_reused(client.get()));
++    EXPECT_FALSE(SSL_early_data_accepted(server.get()));
++    EXPECT_FALSE(FromOpaque(server.get())->s3->skip_early_data);
++    EXPECT_EQ(FromOpaque(server.get())->s3->read_record_size_limit, 64);
++    EXPECT_EQ(FromOpaque(client.get())->s3->write_record_size_limit, 64);
++
++    // Only the new application data may reach the server, not the discarded
++    // early data. It must now be fragmented using the new, smaller limit.
++    sent.fill(0xa5);
++    ASSERT_EQ(SSL_write(client.get(), sent.data(), sent.size()),
++              static_cast<int>(sent.size()));
++    std::array<uint8_t, 200> received = {};
++    ASSERT_TRUE(ReadExact(server.get(), received));
++    EXPECT_EQ(received, sent);
++  }
++}
++
++TEST(RecordSizeLimitTest, TrialDecryptionStillEnforcesAuthenticatedRecordLimit) {
++  auto client_ctx = CreateContext(false, TLS1_3_VERSION);
++  auto server_ctx = CreateContext(true, TLS1_3_VERSION);
++  ASSERT_TRUE(client_ctx);
++  ASSERT_TRUE(server_ctx);
++  SSL_CTX_set_record_size_limit(client_ctx.get(), 96);
++  SSL_CTX_set_record_size_limit(server_ctx.get(), 64);
++  UniquePtr<SSL> client, server;
++  ASSERT_TRUE(CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
++  ASSERT_TRUE(CompleteHandshakes(client.get(), server.get()));
++
++  // Isolate the trial-decryption state with a record authenticated by the
++  // current keys. Skipping the ciphertext check must not bypass the limit.
++  FromOpaque(server.get())->s3->skip_early_data = true;
++  FromOpaque(client.get())->s3->write_record_size_limit = 0;
++  std::array<uint8_t, 200> data = {};
++  ASSERT_EQ(SSL_write(client.get(), data.data(), data.size()),
++            static_cast<int>(data.size()));
++  ERR_clear_error();
++  const int ret = SSL_read(server.get(), data.data(), data.size());
++  EXPECT_EQ(SSL_get_error(server.get(), ret), SSL_ERROR_SSL);
++  EXPECT_TRUE(ErrorQueueContains(SSL_R_DATA_LENGTH_TOO_LONG));
++  EXPECT_EQ(FromOpaque(server.get())->s3->send_alert[1], SSL_AD_RECORD_OVERFLOW);
 +}
 +
 +TEST(RecordSizeLimitTest, Tls12CbcMaximumAllowsLegalExtraPadding) {
