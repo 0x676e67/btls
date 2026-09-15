@@ -25,11 +25,11 @@ limitations under the License.
  5 files changed, 250 insertions(+), 31 deletions(-)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 8e7177810..d78663878 100644
+index 8eb4d2945..af635baa3 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5614,6 +5614,41 @@ OPENSSL_EXPORT void SSL_set_record_size_limit(SSL *ssl, uint16_t limit);
- // send record size limit extension.
+@@ -5674,6 +5674,41 @@ OPENSSL_EXPORT void SSL_set_record_size_limit(SSL *ssl, uint16_t limit);
+ // connections created from |ctx|.
  OPENSSL_EXPORT void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit);
  
 +// SSL_CTX_set_preserve_tls13_cipher_list configures whether sockets on |ctx|
@@ -70,7 +70,7 @@ index 8e7177810..d78663878 100644
  // SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
  // record with `ssl`.
  OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
-@@ -6926,7 +6961,6 @@ OPENSSL_EXPORT void SSL_CTX_set_aes_hw_override_for_testing(
+@@ -6986,7 +7020,6 @@ OPENSSL_EXPORT void SSL_CTX_set_aes_hw_override_for_testing(
  // `SSL_CTX_set_aes_override_for_testing` but only configures a single `SSL*`.
  OPENSSL_EXPORT void SSL_set_aes_hw_override_for_testing(SSL *ssl,
                                                          bool override_value);
@@ -165,7 +165,7 @@ index 298f04f9c..f52bff3c0 100644
      }
    }
 diff --git a/ssl/internal.h b/ssl/internal.h
-index e9ba4e9b5..20f9dd461 100644
+index 036af1422..f3abc3ab6 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -333,6 +333,12 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
@@ -181,7 +181,7 @@ index e9ba4e9b5..20f9dd461 100644
  // ssl_cipher_auth_mask_for_key returns the mask of cipher `algorithm_auth`
  // values suitable for use with `key` in TLS 1.2 and below. `sign_ok` indicates
  // whether `key` may be used for signing.
-@@ -3399,6 +3405,10 @@ struct SSL_CONFIG {
+@@ -3443,6 +3449,10 @@ struct SSL_CONFIG {
    // crypto
    UniquePtr<SSLCipherPreferenceList> cipher_list;
  
@@ -192,7 +192,7 @@ index e9ba4e9b5..20f9dd461 100644
    // This is used to hold the local certificate used (i.e. the server
    // certificate for a server or the client certificate for a client).
    UniquePtr<CERT> cert;
-@@ -3579,6 +3589,11 @@ struct SSL_CONFIG {
+@@ -3623,6 +3633,11 @@ struct SSL_CONFIG {
    // supported by the client.
    Array<uint16_t> delegated_credentials;
  
@@ -204,7 +204,7 @@ index e9ba4e9b5..20f9dd461 100644
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
-@@ -4262,6 +4277,14 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4317,6 +4332,14 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // SSL_CTX_set_extension_order. An empty array leaves the order unset.
    bssl::Array<uint16_t> extension_order;
  
@@ -305,7 +305,7 @@ index d612ddf28..1bc769332 100644
                              const bool has_aes_hw, const char *rule_str,
                              bool strict) {
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index 012022c74..ad3cd0767 100644
+index faba44366..52c602a4d 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -401,7 +401,8 @@ bssl::SSLContext::SSLContext(const SSL_METHOD *ssl_method)
@@ -398,8 +398,8 @@ index 012022c74..ad3cd0767 100644
    return ssl_create_cipher_list(&ssl_impl->config->cipher_list, has_aes_hw, str,
                                  true /* strict */);
  }
-@@ -2331,6 +2363,45 @@ void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit) {
-   FromOpaque(ctx)->record_size_limit = limit;
+@@ -2319,6 +2351,45 @@ void SSL_enable_ocsp_stapling(SSL *ssl) {
+   ssl_impl->config->ocsp_stapling_enabled = true;
  }
  
 +void SSL_CTX_set_preserve_tls13_cipher_list(SSL_CTX *ctx,
@@ -444,3 +444,5 @@ index 012022c74..ad3cd0767 100644
  void SSL_get0_signed_cert_timestamp_list(const SSL *ssl, const uint8_t **out,
                                           size_t *out_len) {
    SSL_SESSION *session = SSL_get_session(ssl);
+-- 
+2.51.0.windows.1
