@@ -2131,6 +2131,11 @@ impl SslContextBuilder {
     /// a server select or send one. Client support is disabled by default and
     /// only applies to TLS 1.3 and DTLS 1.3 handshakes.
     ///
+    /// RSA delegated keys are not supported because BoringSSL does not implement
+    /// the `rsa_pss_pss_*` signature schemes. RSA certificates can still sign
+    /// delegated credentials using `rsa_pss_rsae_*` with a supported non-RSA
+    /// delegated key.
+    ///
     /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_delegated_credentials)]
