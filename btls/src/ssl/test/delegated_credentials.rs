@@ -3,8 +3,9 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ptr::{self, NonNull};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use foreign_types::ForeignTypeRef;
 
@@ -17,7 +18,10 @@ use crate::nid::Nid;
 use crate::pkey::{PKey, Private};
 use crate::rsa::{Padding, Rsa};
 use crate::sign::{RsaPssSaltlen, Signer};
-use crate::ssl::{Ssl, SslContext, SslMethod, SslSignatureAlgorithm, SslVerifyMode, SslVersion};
+use crate::ssl::{
+    Ssl, SslContext, SslContextBuilder, SslMethod, SslSessionCacheMode, SslSignatureAlgorithm,
+    SslVerifyMode, SslVersion,
+};
 use crate::x509::extension::KeyUsage;
 use crate::x509::{X509Extension, X509NameBuilder, X509};
 
@@ -178,11 +182,7 @@ fn make_server_credential(
     credential
 }
 
-// This exercises negotiation added by 0006-delegated-credentials.patch, not
-// an upstream BoringSSL client capability. It also keeps the normal signature
-// list distinct from the delegated credential's CertificateVerify algorithm.
-#[test]
-fn patch_delegated_credential_is_verified_and_used() {
+fn delegated_credential_contexts() -> (SslContextBuilder, SslContextBuilder) {
     let now = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -208,17 +208,6 @@ fn patch_delegated_credential_is_verified_and_used() {
         unsafe { ffi::SSL_CTX_add1_credential(server_context.as_ptr(), credential.as_ptr()) },
         1,
     );
-    let server_context = server_context.build();
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let stream = listener.accept().unwrap().0;
-        let ssl = Ssl::new(&server_context).unwrap();
-        let mut stream = ssl.accept(stream).unwrap();
-        stream.write_all(&[0x2a]).unwrap();
-    });
-
     let mut client_context = SslContext::builder(SslMethod::tls()).unwrap();
     client_context
         .set_min_proto_version(Some(SslVersion::TLS1_3))
@@ -233,8 +222,57 @@ fn patch_delegated_credential_is_verified_and_used() {
     client_context
         .set_delegated_credentials("ecdsa_secp256r1_sha256")
         .unwrap();
+
+    (client_context, server_context)
+}
+
+fn accept_with_timeout(listener: &TcpListener) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                set_stream_timeouts(&stream);
+                return stream;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "timed out accepting test client");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to accept test client: {error}"),
+        }
+    }
+}
+
+fn set_stream_timeouts(stream: &TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+}
+
+fn assert_delegated_credential_handshake(
+    client_context: SslContextBuilder,
+    server_context: SslContextBuilder,
+) {
+    let server_context = server_context.build();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let stream = accept_with_timeout(&listener);
+        let ssl = Ssl::new(&server_context).unwrap();
+        let mut stream = ssl.accept(stream).unwrap();
+        stream.write_all(&[0x2a]).unwrap();
+    });
+
     let ssl = Ssl::new(&client_context.build()).unwrap();
-    let mut stream = ssl.connect(TcpStream::connect(address).unwrap()).unwrap();
+    assert!(!ssl.used_delegated_credential());
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(30)).unwrap();
+    set_stream_timeouts(&stream);
+    let mut stream = ssl.connect(stream).unwrap();
 
     let mut byte = [0];
     stream.read_exact(&mut byte).unwrap();
@@ -244,6 +282,101 @@ fn patch_delegated_credential_is_verified_and_used() {
         stream.ssl().peer_signature_algorithm(),
         Some(SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256),
     );
+    server.join().unwrap();
+}
+
+// This exercises negotiation added by 0006-delegated-credentials.patch, not
+// an upstream BoringSSL client capability. It also keeps the normal signature
+// list distinct from the delegated credential's CertificateVerify algorithm.
+#[test]
+fn patch_delegated_credential_is_verified_and_used() {
+    let (client_context, server_context) = delegated_credential_contexts();
+    assert_delegated_credential_handshake(client_context, server_context);
+}
+
+// Cover the Rust API's documented input errors, including NUL rejection before
+// FFI. An unsupported PSS-PSS name is not a request to use RSAE instead.
+#[test]
+fn patch_delegated_credential_rejects_invalid_algorithm_lists() {
+    for algorithms in [
+        "",
+        "unknown_signature_algorithm",
+        "ecdsa_secp256r1_sha256:unknown_signature_algorithm",
+        "ecdsa_secp256r1_sha256:",
+        "ecdsa_secp256r1_sha256\0:ecdsa_secp384r1_sha384",
+        "rsa_pss_pss_sha256",
+        "rsa_pss_pss_sha384",
+        "rsa_pss_pss_sha512",
+    ] {
+        let mut context = SslContext::builder(SslMethod::tls()).unwrap();
+        let error = context.set_delegated_credentials(algorithms).unwrap_err();
+        assert!(!error.errors().is_empty(), "input: {algorithms:?}");
+    }
+}
+
+#[test]
+fn patch_delegated_credential_empty_list_does_not_disable_support() {
+    let (mut client_context, server_context) = delegated_credential_contexts();
+    assert!(client_context.set_delegated_credentials("").is_err());
+    assert_delegated_credential_handshake(client_context, server_context);
+}
+
+// The public query describes authentication in this handshake, not the
+// original session's authentication. No expiry or clock manipulation is needed.
+#[test]
+fn patch_delegated_credential_usage_is_false_on_resumption() {
+    let (mut client_context, mut server_context) = delegated_credential_contexts();
+    server_context.set_session_cache_mode(SslSessionCacheMode::SERVER);
+    let server_context = server_context.build();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for resumed in [false, true] {
+            let stream = accept_with_timeout(&listener);
+            let ssl = Ssl::new(&server_context).unwrap();
+            let mut stream = ssl.accept(stream).unwrap();
+            assert_eq!(stream.ssl().session_reused(), resumed);
+            stream.write_all(&[0x2a]).unwrap();
+            let mut reply = [0];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(reply, [0x2a]);
+        }
+    });
+
+    let session = Arc::new(Mutex::new(None));
+    client_context
+        .set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
+    client_context.set_new_session_callback({
+        let session = Arc::clone(&session);
+        move |_, ticket| {
+            let mut session = session.lock().unwrap();
+            if session.is_none() {
+                *session = Some(ticket);
+            }
+        }
+    });
+    let client_context = client_context.build();
+
+    for resumed in [false, true] {
+        let mut ssl = Ssl::new(&client_context).unwrap();
+        assert!(!ssl.used_delegated_credential());
+        if resumed {
+            let ticket = session.lock().unwrap().take().expect("no session ticket");
+            // SAFETY: This session came from the same SSL_CTX, and the new
+            // connection has not started its handshake.
+            unsafe { ssl.set_session(&ticket).unwrap() };
+        }
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(30)).unwrap();
+        set_stream_timeouts(&stream);
+        let mut stream = ssl.connect(stream).unwrap();
+        assert_eq!(stream.ssl().session_reused(), resumed);
+        assert_eq!(stream.ssl().used_delegated_credential(), !resumed);
+        // Reading application data processes the preceding TLS 1.3 tickets.
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [0x2a]);
+        stream.write_all(&byte).unwrap();
+    }
     server.join().unwrap();
 }
 
