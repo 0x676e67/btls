@@ -2123,18 +2123,29 @@ impl SslContextBuilder {
     /// credentials presented by servers, using the specified signature
     /// algorithm list, as defined by [RFC 9345].
     ///
-    /// The list is encoded in the order provided. Advertised algorithms remain
-    /// subject to TLS version and key compatibility checks. It is separate from
+    /// Algorithm names are separated by colons, for example
+    /// `ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384`, and encoded in the order
+    /// provided. Advertised algorithms remain subject to TLS version and key
+    /// compatibility checks. This list is separate from
     /// the normal signature algorithm list, which controls the certificate
     /// key's signature over the credential. Server-side use requires a
     /// separately configured delegated credential; this setting does not make
     /// a server select or send one. Client support is disabled by default and
     /// only applies to TLS 1.3 and DTLS 1.3 handshakes.
     ///
+    /// Servers may still authenticate with an ordinary certificate. After a
+    /// successful handshake, use [`SslRef::used_delegated_credential`] to check
+    /// whether a delegated credential was used.
+    ///
     /// RSA delegated keys are not supported because BoringSSL does not implement
     /// the `rsa_pss_pss_*` signature schemes. RSA certificates can still sign
     /// delegated credentials using `rsa_pss_rsae_*` with a supported non-RSA
     /// delegated key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty list, an unrecognized algorithm name, or
+    /// an embedded NUL byte. An empty string does not disable this setting.
     ///
     /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
@@ -3427,8 +3438,12 @@ impl SslRef {
     /// Returns whether the peer authenticated with an [RFC 9345] delegated
     /// credential in the most recent handshake.
     ///
-    /// This becomes `true` only after the credential and the peer's
-    /// CertificateVerify signature have both been validated.
+    /// Read this after a successful handshake. The value becomes `true` once
+    /// the credential and the peer's CertificateVerify signature have both
+    /// been validated; it does not by itself indicate handshake completion.
+    ///
+    /// Returns `false` for session resumption, even if the original session
+    /// was authenticated with a delegated credential.
     ///
     /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
