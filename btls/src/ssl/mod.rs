@@ -2119,7 +2119,35 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
-    /// Sets whether the context should enable delegated credentials.
+    /// Configures client connections to request and verify delegated
+    /// credentials presented by servers, using the specified signature
+    /// algorithm list, as defined by [RFC 9345].
+    ///
+    /// Algorithm names are separated by colons, for example
+    /// `ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384`, and encoded in the order
+    /// provided. Advertised algorithms remain subject to TLS version and key
+    /// compatibility checks. This list is separate from
+    /// the normal signature algorithm list, which controls the certificate
+    /// key's signature over the credential. Server-side use requires a
+    /// separately configured delegated credential; this setting does not make
+    /// a server select or send one. Client support is disabled by default and
+    /// only applies to TLS 1.3 and DTLS 1.3 handshakes.
+    ///
+    /// Servers may still authenticate with an ordinary certificate. After a
+    /// successful handshake, use [`SslRef::used_delegated_credential`] to check
+    /// whether a delegated credential was used.
+    ///
+    /// RSA delegated keys are not supported because BoringSSL does not implement
+    /// the `rsa_pss_pss_*` signature schemes. RSA certificates can still sign
+    /// delegated credentials using `rsa_pss_rsae_*` with a supported non-RSA
+    /// delegated key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty list, an unrecognized algorithm name, or
+    /// an embedded NUL byte. An empty string does not disable this setting.
+    ///
+    /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_delegated_credentials)]
     pub fn set_delegated_credentials(&mut self, sigalgs: &str) -> Result<(), ErrorStack> {
@@ -3405,6 +3433,24 @@ impl SslRef {
         } else {
             Some(SslSignatureAlgorithm(sigalg))
         }
+    }
+
+    /// Returns whether the peer authenticated with an [RFC 9345] delegated
+    /// credential in the most recent handshake.
+    ///
+    /// Read this after a successful handshake. The value becomes `true` once
+    /// the credential and the peer's CertificateVerify signature have both
+    /// been validated; it does not by itself indicate handshake completion.
+    ///
+    /// Returns `false` for session resumption, even if the original session
+    /// was authenticated with a delegated credential.
+    ///
+    /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_used_delegated_credential)]
+    #[must_use]
+    pub fn used_delegated_credential(&self) -> bool {
+        unsafe { ffi::SSL_used_delegated_credential(self.as_ptr()) != 0 }
     }
 
     /// Returns the signature algorithm this side used to sign the current TLS handshake,
