@@ -1,0 +1,644 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Tue, 15 Sep 2026 12:00:00 -0700
+Subject: [PATCH] boringssl: add ECH GREASE parameter callback
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+diff --git a/build.json b/build.json
+index f9e3a7e094..ea09c19723 100644
+--- a/build.json
++++ b/build.json
+@@ -1027,6 +1027,7 @@
+     "ssl_test": {
+         "srcs": [
+             "crypto/test/gtest_main.cc",
++            "ssl/ech_grease_policy_test.cc",
+             "ssl/span_test.cc",
+             "ssl/ssl_c_test.c",
+             "ssl/ssl_internal_test.cc",
+diff --git a/gen/sources.bzl b/gen/sources.bzl
+index e85d7a747b..4ea4d441f6 100644
+--- a/gen/sources.bzl
++++ b/gen/sources.bzl
+@@ -2980,6 +2980,7 @@ ssl_internal_headers = [
+ 
+ ssl_test_sources = [
+     "crypto/test/gtest_main.cc",
++    "ssl/ech_grease_policy_test.cc",
+     "ssl/span_test.cc",
+     "ssl/ssl_c_test.c",
+     "ssl/ssl_internal_test.cc",
+diff --git a/gen/sources.cmake b/gen/sources.cmake
+index 117ba3ffbe..c186947273 100644
+--- a/gen/sources.cmake
++++ b/gen/sources.cmake
+@@ -3054,6 +3054,7 @@ set(
+   SSL_TEST_SOURCES
+ 
+   crypto/test/gtest_main.cc
++  ssl/ech_grease_policy_test.cc
+   ssl/span_test.cc
+   ssl/ssl_c_test.c
+   ssl/ssl_internal_test.cc
+diff --git a/gen/sources.gni b/gen/sources.gni
+index 5777c09a03..5dbea4d1e8 100644
+--- a/gen/sources.gni
++++ b/gen/sources.gni
+@@ -2980,6 +2980,7 @@ ssl_internal_headers = [
+ 
+ ssl_test_sources = [
+   "crypto/test/gtest_main.cc",
++  "ssl/ech_grease_policy_test.cc",
+   "ssl/span_test.cc",
+   "ssl/ssl_c_test.c",
+   "ssl/ssl_internal_test.cc",
+diff --git a/gen/sources.json b/gen/sources.json
+index 97b70e5544..4f1985093f 100644
+--- a/gen/sources.json
++++ b/gen/sources.json
+@@ -2964,6 +2964,7 @@
+   "ssl_test": {
+     "srcs": [
+       "crypto/test/gtest_main.cc",
++      "ssl/ech_grease_policy_test.cc",
+       "ssl/span_test.cc",
+       "ssl/ssl_c_test.c",
+       "ssl/ssl_internal_test.cc",
+diff --git a/gen/sources.mk b/gen/sources.mk
+index b7cb8ad004..bbe8ad3c86 100644
+--- a/gen/sources.mk
++++ b/gen/sources.mk
+@@ -2944,6 +2944,7 @@ boringssl_ssl_internal_headers := \
+ 
+ boringssl_ssl_test_sources := \
+   crypto/test/gtest_main.cc \
++  ssl/ech_grease_policy_test.cc \
+   ssl/span_test.cc \
+   ssl/ssl_c_test.c \
+   ssl/ssl_internal_test.cc \
+diff --git a/include/openssl/prefix_symbols.h b/include/openssl/prefix_symbols.h
+index 79df391045..c79d87a0f6 100644
+--- a/include/openssl/prefix_symbols.h
++++ b/include/openssl/prefix_symbols.h
+@@ -2372,6 +2372,7 @@
+ #pragma redefine_extname SSL_set_connect_state BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_connect_state)
+ #pragma redefine_extname SSL_set_custom_verify BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_custom_verify)
+ #pragma redefine_extname SSL_set_early_data_enabled BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_early_data_enabled)
++#pragma redefine_extname SSL_set_ech_grease_callback BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_ech_grease_callback)
+ #pragma redefine_extname SSL_set_enable_ech_grease BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_enable_ech_grease)
+ #pragma redefine_extname SSL_set_ex_data BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_ex_data)
+ #pragma redefine_extname SSL_set_fd BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_fd)
+@@ -5506,6 +5507,7 @@
+ #define SSL_set_connect_state BORINGSSL_ADD_PREFIX(SSL_set_connect_state)
+ #define SSL_set_custom_verify BORINGSSL_ADD_PREFIX(SSL_set_custom_verify)
+ #define SSL_set_early_data_enabled BORINGSSL_ADD_PREFIX(SSL_set_early_data_enabled)
++#define SSL_set_ech_grease_callback BORINGSSL_ADD_PREFIX(SSL_set_ech_grease_callback)
+ #define SSL_set_enable_ech_grease BORINGSSL_ADD_PREFIX(SSL_set_enable_ech_grease)
+ #define SSL_set_ex_data BORINGSSL_ADD_PREFIX(SSL_set_ex_data)
+ #define SSL_set_fd BORINGSSL_ADD_PREFIX(SSL_set_fd)
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index d786638787..64e40e6115 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -4638,6 +4638,58 @@ OPENSSL_EXPORT const char *SSL_early_data_reason_string(
+ // ECH extension when no supported ECHConfig is available.
+ OPENSSL_EXPORT void SSL_set_enable_ech_grease(SSL *ssl, int enable);
+ 
++// ECH GREASE parameters. These APIs do not enable GREASE or affect real ECH.
++// Configure before the first ClientHello is built. Lengths include the simulated
++// AEAD tag, but exclude the encapsulated key and extension framing.
++typedef struct {
++  uint16_t type;
++  size_t length;  // Extension body length, excluding its four-byte header.
++} SSL_ECH_GREASE_EXTENSION;
++
++// All pointers are borrowed for the callback only. Extensions exclude ECH,
++// padding, and pre_shared_key. psk_extension_length includes its header.
++// preamble_length excludes handshake headers and the extensions length prefix.
++typedef struct {
++  const uint8_t *cipher_suites;
++  size_t cipher_suites_length;
++  const SSL_ECH_GREASE_EXTENSION *extensions;
++  size_t num_extensions;
++  size_t preamble_length;
++  size_t psk_extension_length;
++  size_t server_name_length;
++  int has_server_name;
++  int is_dtls;
++  int is_quic;
++  uint16_t default_aead_id;
++  size_t aead_overhead;
++  size_t max_payload_length;
++} SSL_ECH_GREASE_SIZE_INFO;
++
++typedef struct {
++  uint16_t aead_id;
++  size_t payload_length;
++} SSL_ECH_GREASE_PARAMETERS;
++
++// The callback returns one on success, zero to fail the handshake. It must set
++// out->aead_id to EVP_HPKE_AES_128_GCM or EVP_HPKE_CHACHA20_POLY1305, and
++// out->payload_length to a nonzero value at most info->max_payload_length.
++// Both supported AEADs have the same overhead, exposed in info->aead_overhead.
++// Invalid output fails the handshake, without truncation or fallback. Only
++// GREASE parameters change, not TLS cipher preferences or real ECH. BoringSSL
++// still generates the random payload bytes.
++// The callback must not mutate or reenter the SSL. It is called once for the
++// first GREASE ClientHello; HRR reuses the complete extension (RFC 9849 6.2.1).
++typedef int (*SSL_ech_grease_callback)(
++    const SSL_ECH_GREASE_SIZE_INFO *info, SSL_ECH_GREASE_PARAMETERS *out,
++    void *arg);
++
++// Sets or replaces the callback. A null callback restores upstream defaults.
++// Returns one on success, zero if ClientHello has already started, leaving the
++// previous callback unchanged.
++// arg must remain valid until replacement or SSL destruction.
++OPENSSL_EXPORT int SSL_set_ech_grease_callback(
++    SSL *ssl, SSL_ech_grease_callback callback, void *arg);
++
+ // SSL_set1_ech_config_list configures `ssl` to, as a client, offer ECH with the
+ // specified configuration. `ech_config_list` should contain a serialized
+ // ECHConfigList structure. It returns one on success and zero on error.
+diff --git a/ssl/ech_grease_policy_test.cc b/ssl/ech_grease_policy_test.cc
+new file mode 100644
+index 0000000000..a37fe7b59a
+--- /dev/null
++++ b/ssl/ech_grease_policy_test.cc
+@@ -0,0 +1,194 @@
++// Copyright 2026 The btls Authors
++// SPDX-License-Identifier: Apache-2.0
++
++#include <algorithm>
++#include <vector>
++#include <gtest/gtest.h>
++#include <openssl/err.h>
++#include <openssl/ssl.h>
++#include "../crypto/bytestring/internal.h"
++#include "internal.h"
++
++BSSL_NAMESPACE_BEGIN
++namespace {
++
++static int FixedLength(const SSL_ECH_GREASE_SIZE_INFO *info,
++                       SSL_ECH_GREASE_PARAMETERS *out, void *arg) {
++  out->aead_id = info->default_aead_id;
++  out->payload_length = *static_cast<const size_t *>(arg);
++  return 1;
++}
++
++// Collect all records so near-limit ClientHellos may span record boundaries.
++static bool GetHello(SSL *ssl, Array<uint8_t> *out) {
++  UniquePtr<BIO> bio(BIO_new(BIO_s_mem()));
++  if (!bio || !BIO_up_ref(bio.get())) {
++    return false;
++  }
++  SSL_set_bio(ssl, nullptr, bio.get());
++  SSL_connect(ssl);
++  ERR_clear_error();
++  const uint8_t *data;
++  size_t length;
++  if (!BIO_mem_contents(bio.get(), &data, &length) || length == 0) {
++    return false;
++  }
++  CBS records(Span(data, length)), record;
++  ScopedCBB hello;
++  if (!CBB_init(hello.get(), 256)) {
++    return false;
++  }
++  while (CBS_len(&records) != 0) {
++    uint8_t type;
++    if (!CBS_get_u8(&records, &type) || type != SSL3_RT_HANDSHAKE ||
++        !CBS_skip(&records, 2) ||
++        !CBS_get_u16_length_prefixed(&records, &record) ||
++        !CBB_add_bytes(hello.get(), CBS_data(&record), CBS_len(&record))) {
++      return false;
++    }
++  }
++  return CBBFinishArray(hello.get(), out);
++}
++
++TEST(ECHGreasePolicyTest, WireLengthAndTotalBudget) {
++  for (size_t requested : {size_t{1}, size_t{239}, size_t{65000}}) {
++    UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++    ASSERT_TRUE(ctx);
++    ASSERT_TRUE(SSL_CTX_set1_curves_list(ctx.get(), "X25519"));
++    UniquePtr<SSL> ssl(SSL_new(ctx.get()));
++    ASSERT_TRUE(ssl);
++    SSL_set_enable_ech_grease(ssl.get(), 1);
++    ASSERT_TRUE(
++        SSL_set_ech_grease_callback(ssl.get(), FixedLength, &requested));
++    Array<uint8_t> hello;
++    ASSERT_TRUE(GetHello(ssl.get(), &hello));
++    ASSERT_GE(hello.size(), size_t{4});
++    SSL_CLIENT_HELLO parsed;
++    ASSERT_TRUE(SSL_parse_client_hello(ssl.get(), &parsed, hello.data() + 4,
++                                       hello.size() - 4));
++    const uint8_t *ech;
++    size_t length;
++    ASSERT_TRUE(SSL_early_callback_ctx_extension_get(
++        &parsed, TLSEXT_TYPE_encrypted_client_hello, &ech, &length));
++    ASSERT_EQ(length, requested + 42);
++    EXPECT_EQ((size_t{ech[40]} << 8) | ech[41], requested);
++    EXPECT_FALSE(SSL_set_ech_grease_callback(ssl.get(), nullptr, nullptr));
++    ERR_clear_error();
++  }
++}
++
++TEST(ECHGreasePolicyTest, RejectsCallbackOverflowAndFailure) {
++  for (int failure = 0; failure < 8; failure++) {
++    UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++    ASSERT_TRUE(ctx);
++    UniquePtr<SSL> ssl(SSL_new(ctx.get()));
++    ASSERT_TRUE(ssl);
++    SSL_set_enable_ech_grease(ssl.get(), 1);
++    ASSERT_TRUE(SSL_set_ech_grease_callback(
++        ssl.get(),
++        [](const SSL_ECH_GREASE_SIZE_INFO *info, SSL_ECH_GREASE_PARAMETERS *out,
++           void *arg) {
++          EXPECT_GT(info->num_extensions, size_t{0});
++          EXPECT_GT(info->cipher_suites_length, size_t{0});
++          EXPECT_LT(info->max_payload_length, size_t{UINT16_MAX - 42});
++          out->aead_id = info->default_aead_id;
++          switch (*static_cast<int *>(arg)) {
++            case 0:
++              out->payload_length = info->max_payload_length + 1;
++              break;
++            case 1:
++              out->payload_length = 0;
++              break;
++            case 2:
++              out->payload_length = SIZE_MAX;
++              break;
++            case 3:
++              return 0;
++            case 4:
++              return 1;  // Success without writing a length is invalid.
++            case 5:
++              out->aead_id = 0;
++              out->payload_length = 239;
++              break;
++            case 6:
++              out->aead_id = 2;  // AES-256-GCM is not a supported GREASE AEAD.
++              out->payload_length = 239;
++              break;
++            case 7:
++              out->aead_id = UINT16_MAX;
++              out->payload_length = 239;
++              break;
++          }
++          return 1;
++        },
++        &failure));
++    Array<uint8_t> hello;
++    EXPECT_FALSE(GetHello(ssl.get(), &hello));
++  }
++}
++
++TEST(ECHGreasePolicyTest, CallbackMayUseExactRemainingBudget) {
++  UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++  ASSERT_TRUE(ctx);
++  UniquePtr<SSL> ssl(SSL_new(ctx.get()));
++  ASSERT_TRUE(ssl);
++  SSL_set_enable_ech_grease(ssl.get(), 1);
++  ASSERT_TRUE(SSL_set_ech_grease_callback(
++      ssl.get(),
++      [](const SSL_ECH_GREASE_SIZE_INFO *info, SSL_ECH_GREASE_PARAMETERS *out,
++         void *) {
++        out->aead_id = info->default_aead_id;
++        out->payload_length = info->max_payload_length;
++        return 1;
++      },
++      nullptr));
++  Array<uint8_t> hello;
++  EXPECT_TRUE(GetHello(ssl.get(), &hello));
++}
++
++TEST(ECHGreasePolicyTest, PreservesExplicitExtensionPosition) {
++  UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++  ASSERT_TRUE(ctx);
++  const auto capture = [&](std::vector<uint16_t> *order) {
++    UniquePtr<SSL> ssl(SSL_new(ctx.get()));
++    ASSERT_TRUE(ssl);
++    SSL_set_enable_ech_grease(ssl.get(), 1);
++    size_t length = 239;
++    ASSERT_TRUE(SSL_set_ech_grease_callback(ssl.get(), FixedLength, &length));
++    Array<uint8_t> hello;
++    ASSERT_TRUE(GetHello(ssl.get(), &hello));
++    ASSERT_GE(hello.size(), size_t{4});
++    SSL_CLIENT_HELLO parsed;
++    ASSERT_TRUE(SSL_parse_client_hello(ssl.get(), &parsed, hello.data() + 4,
++                                       hello.size() - 4));
++    CBS extensions(Span(parsed.extensions, parsed.extensions_len)), body;
++    while (CBS_len(&extensions) != 0) {
++      uint16_t type;
++      ASSERT_TRUE(CBS_get_u16(&extensions, &type));
++      ASSERT_TRUE(CBS_get_u16_length_prefixed(&extensions, &body));
++      if (type != TLSEXT_TYPE_padding) {
++        order->push_back(type);
++      }
++    }
++  };
++  std::vector<uint16_t> others;
++  ASSERT_NO_FATAL_FAILURE(capture(&others));
++  const auto ech = std::find(others.begin(), others.end(),
++                             TLSEXT_TYPE_encrypted_client_hello);
++  ASSERT_NE(ech, others.end());
++  others.erase(ech);
++  // Derive the inventory from a real hello, not a copy of upstream's table.
++  for (size_t position : {size_t{0}, others.size() / 2, others.size()}) {
++    auto expected = others;
++    expected.insert(expected.begin() + position,
++                    TLSEXT_TYPE_encrypted_client_hello);
++    ASSERT_TRUE(SSL_CTX_set_extension_order(ctx.get(), expected.data(),
++                                            expected.size()));
++    std::vector<uint16_t> actual;
++    ASSERT_NO_FATAL_FAILURE(capture(&actual));
++    EXPECT_EQ(actual, expected);
++  }
++}
++
++}  // namespace
++BSSL_NAMESPACE_END
+diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
+index 46ba196f18..5507be2585 100644
+--- a/ssl/encrypted_client_hello.cc
++++ b/ssl/encrypted_client_hello.cc
+@@ -729,7 +729,8 @@ static size_t random_size(size_t min, size_t max) {
+   return value % (max - min + 1) + min;
+ }
+ 
+-static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
++static bool setup_ech_grease(SSL_HANDSHAKE *hs,
++                             SSL_ECH_GREASE_SIZE_INFO *info = nullptr) {
+   assert(!hs->selected_ech_config);
+   if (hs->max_version < TLS1_3_VERSION || !hs->config->ech_grease_enabled) {
+     return true;
+@@ -764,8 +765,35 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+   // The server_name extension has an overhead of 9 bytes. For now, arbitrarily
+   // estimate maximum_name_length to be between 32 and 100 bytes. Then round up
+   // to a multiple of 32, to match RFC 9849, section 6.1.3.
+-  const size_t payload_len =
+-      32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
++  size_t payload_len = 0;
++  if (info != nullptr) {
++    info->default_aead_id = EVP_HPKE_AEAD_id(aead);
++    info->aead_overhead = aead_overhead(aead);
++    SSL_ECH_GREASE_PARAMETERS parameters = {};
++    if (!hs->config->ech_grease_callback(
++            info, &parameters, hs->config->ech_grease_callback_arg)) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
++    }
++    switch (parameters.aead_id) {
++      case EVP_HPKE_AES_128_GCM:
++        aead = EVP_hpke_aes_128_gcm();
++        break;
++      case EVP_HPKE_CHACHA20_POLY1305:
++        aead = EVP_hpke_chacha20_poly1305();
++        break;
++      default:
++        OPENSSL_PUT_ERROR(SSL, SSL_R_UNKNOWN_CIPHER_TYPE);
++        return false;
++    }
++    payload_len = parameters.payload_length;
++    if (payload_len == 0 || payload_len > info->max_payload_length) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_LENGTH);
++      return false;
++    }
++  } else {
++    payload_len = 32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
++  }
+   bssl::ScopedCBB cbb;
+   CBB enc_cbb, payload_cbb;
+   uint8_t *payload;
+@@ -785,7 +813,11 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+ 
+ bool ssl_encrypt_client_hello(SSL_HANDSHAKE *hs, Span<const uint8_t> enc) {
+   SSLImpl *const ssl = hs->ssl;
++  hs->ech_grease_policy_locked = true;
+   if (!hs->selected_ech_config) {
++    if (ssl_ech_grease_pending(hs)) {
++      return true;
++    }
+     return setup_ech_grease(hs);
+   }
+ 
+@@ -889,6 +921,81 @@ bool ssl_encrypt_client_hello(SSL_HANDSHAKE *hs, Span<const uint8_t> enc) {
+   return true;
+ }
+ 
++// The 42-byte body framing includes the type byte, suite, config ID,
++// X25519 encapsulated key and both length prefixes. Four more bytes encode
++// the TLS extension header. Account for the whole extensions vector as well.
++static constexpr size_t kGreaseFraming = 42;
++
++bool ssl_ech_grease_pending(const SSL_HANDSHAKE *hs) {
++  return !hs->selected_ech_config && hs->max_version >= TLS1_3_VERSION &&
++         hs->config->ech_grease_enabled && hs->ech_client_outer.empty() &&
++         hs->config->ech_grease_callback != nullptr;
++}
++
++bool ssl_setup_ech_grease(SSL_HANDSHAKE *hs, Span<const uint8_t> extensions,
++                          Span<const uint8_t> preamble, size_t psk_len,
++                          size_t padding_reserve) {
++  const size_t old_len = extensions.size();
++  if (old_len > UINT16_MAX - 4 - kGreaseFraming ||
++      psk_len > UINT16_MAX - 4 - kGreaseFraming - old_len ||
++      padding_reserve > UINT16_MAX - 4 - kGreaseFraming - old_len - psk_len) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_LENGTH);
++    return false;
++  }
++  SSL_ECH_GREASE_SIZE_INFO info = {};
++  info.preamble_length = preamble.size();
++  info.psk_extension_length = psk_len;
++  info.is_dtls = SSL_is_dtls(hs->ssl);
++  info.is_quic = SSL_is_quic(hs->ssl);
++  info.max_payload_length =
++      UINT16_MAX - 4 - kGreaseFraming - old_len - psk_len - padding_reserve;
++
++  // Expose cipher bytes and extension sizes, not session IDs or ticket data.
++  CBS header(preamble), ignored, ciphers;
++  if (!CBS_skip(&header, 2 + SSL3_RANDOM_SIZE) ||
++      !CBS_get_u8_length_prefixed(&header, &ignored) ||
++      (info.is_dtls && !CBS_get_u8_length_prefixed(&header, &ignored)) ||
++      !CBS_get_u16_length_prefixed(&header, &ciphers) ||
++      !CBS_get_u8_length_prefixed(&header, &ignored) || CBS_len(&header) != 0) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  info.cipher_suites = CBS_data(&ciphers);
++  info.cipher_suites_length = CBS_len(&ciphers);
++  Array<SSL_ECH_GREASE_EXTENSION> metadata;
++  CBS remaining(extensions);
++  size_t count = 0;
++  while (CBS_len(&remaining) != 0) {
++    CBS body;
++    if (!CBS_skip(&remaining, 2) ||
++        !CBS_get_u16_length_prefixed(&remaining, &body)) {
++      return false;
++    }
++    count++;
++  }
++  // Allocate metadata only on the custom path, never proportional to key shares
++  // or other large extension bodies. Its lifetime includes the callback.
++  if (!metadata.InitForOverwrite(count)) {
++    return false;
++  }
++  remaining = CBS(extensions);
++  while (CBS_len(&remaining) != 0) {
++    uint16_t type;
++    CBS body;
++    if (!CBS_get_u16(&remaining, &type) ||
++        !CBS_get_u16_length_prefixed(&remaining, &body)) {
++      return false;
++    }
++    metadata[info.num_extensions++] = {type, CBS_len(&body)};
++    if (type == TLSEXT_TYPE_server_name) {
++      info.has_server_name = 1;
++      info.server_name_length = strlen(hs->ssl->hostname.get());
++    }
++  }
++  info.extensions = metadata.data();
++  return setup_ech_grease(hs, &info);
++}
++
+ BSSL_NAMESPACE_END
+ 
+ using namespace bssl;
+@@ -901,6 +1008,19 @@ void SSL_set_enable_ech_grease(SSL *ssl, int enable) {
+   ssl_impl->config->ech_grease_enabled = !!enable;
+ }
+ 
++int SSL_set_ech_grease_callback(
++    SSL *ssl, SSL_ech_grease_callback callback, void *arg) {
++  auto *impl = FromOpaque(ssl);
++  if (!impl->config || !impl->s3->hs ||
++      impl->s3->hs->ech_grease_policy_locked) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++  impl->config->ech_grease_callback = callback;
++  impl->config->ech_grease_callback_arg = arg;
++  return 1;
++}
++
+ int SSL_set1_ech_config_list(SSL *ssl, const uint8_t *ech_config_list,
+                              size_t ech_config_list_len) {
+   auto *ssl_impl = FromOpaque(ssl);
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index f8627416b4..0c8acaba3f 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -4712,11 +4712,21 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+   }
+ 
+   bool last_was_empty = false;
++  const bool custom_ech = ssl_ech_grease_pending(hs);
++  size_t ech_offset = 0;
++  size_t ech_index = 0;
+   for (size_t unpermuted = 0; unpermuted < kNumExtensions; unpermuted++) {
+     size_t i = hs->extension_permutation.empty()
+                    ? unpermuted
+                    : hs->extension_permutation[unpermuted];
+     const size_t len_before = CBB_len(&extensions);
++    if (custom_ech &&
++        kExtensions[i].value == TLSEXT_TYPE_encrypted_client_hello) {
++      ech_offset = len_before;
++      ech_index = i;
++      last_was_empty = false;
++      continue;
++    }
+     if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
+       OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
+       ERR_add_error_dataf("extension %u", (unsigned)kExtensions[i].value);
+@@ -4745,6 +4755,41 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+   // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
+   // images aligned.
+   size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
++  if (custom_ech) {
++    const size_t preamble_len = msg_len - SSL3_HM_HEADER_LENGTH;
++    if (!CBB_flush(&extensions)) {
++      return false;
++    }
++    // `out` has an active child, so CBB_data(out) is not permitted. The child's
++    // data follows the preamble and its two-byte extensions length prefix in
++    // the same allocation. Derive the view after all potentially reallocating
++    // extension writers have finished.
++    const auto preamble =
++        Span(CBB_data(&extensions) - 2 - preamble_len, preamble_len);
++    // A trailing empty extension needs a five-byte WebSphere workaround.
++    // The F5 workaround only applies to small messages, far below UINT16_MAX.
++    const size_t padding_reserve =
++        last_was_empty && psk_len == 0 && !SSL_is_dtls(ssl) &&
++                !SSL_is_quic(ssl) && !ssl->s3->used_hello_retry_request
++            ? 5
++            : 0;
++    const size_t old_len = CBB_len(&extensions);
++    if (ech_offset > old_len) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_LENGTH);
++      return false;
++    }
++    if (!ssl_setup_ech_grease(hs, Span(CBB_data(&extensions), old_len),
++                             preamble, psk_len, padding_reserve) ||
++        !ext_ech_add_clienthello(hs, &extensions, &extensions, type)) {
++      return false;
++    }
++    // Reuse the upstream encoder, then move the complete extension into place.
++    // Fetch data after encoding, which may have reallocated the CBB.
++    uint8_t *data = CBB_data(&extensions);
++    std::rotate(data + ech_offset, data + old_len,
++                data + CBB_len(&extensions));
++    hs->extensions.sent |= (1u << ech_index);
++  }
+   if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
+       !ssl->s3->used_hello_retry_request) {
+     msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
+diff --git a/ssl/internal.h b/ssl/internal.h
+index 20f9dd4612..ca8651d56e 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -1427,6 +1427,12 @@ size_t ssl_ech_extension_body_length(const EVP_HPKE_AEAD *aead, size_t enc_len,
+ // must already be computed.
+ bool ssl_encrypt_client_hello(SSL_HANDSHAKE *hs, Span<const uint8_t> enc);
+ 
++// Custom GREASE sizing runs after the other extensions have been serialized.
++bool ssl_ech_grease_pending(const SSL_HANDSHAKE *hs);
++bool ssl_setup_ech_grease(SSL_HANDSHAKE *hs, Span<const uint8_t> extensions,
++                          Span<const uint8_t> preamble, size_t psk_len,
++                          size_t padding_reserve);
++
+ 
+ // Credentials.
+ 
+@@ -1901,6 +1907,8 @@ struct SSL_HANDSHAKE {
+   // ClientHello, excluding the header and type byte.
+   Array<uint8_t> ech_client_outer;
+ 
++  bool ech_grease_policy_locked = false;
++
+   // ech_retry_configs, on the client, contains the retry configs from the
+   // server as a serialized ECHConfigList.
+   Array<uint8_t> ech_retry_configs;
+@@ -3527,6 +3535,9 @@ struct SSL_CONFIG {
+   // ClientHello.
+   bool ech_grease_enabled : 1;
+ 
++  SSL_ech_grease_callback ech_grease_callback = nullptr;
++  void *ech_grease_callback_arg = nullptr;
++
+   // Enable signed certificate time stamps. Currently client only.
+   bool signed_cert_timestamps_enabled : 1;
+ 

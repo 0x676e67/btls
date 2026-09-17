@@ -113,6 +113,8 @@ pub use self::connector::{
 #[cfg(feature = "credential")]
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
 pub use self::ech::SslEchKeysRef;
+#[cfg(not(feature = "fips"))]
+pub use self::ech_grease::{EchGreaseAead, EchGreaseInfo, EchGreaseParameters};
 pub use self::error::{Error, ErrorCode, HandshakeError};
 
 mod async_callbacks;
@@ -122,6 +124,8 @@ mod connector;
 #[cfg(feature = "credential")]
 mod credential;
 mod ech;
+#[cfg(not(feature = "fips"))]
+mod ech_grease;
 mod error;
 mod mut_only;
 #[cfg(test)]
