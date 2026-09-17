@@ -376,14 +376,14 @@ jobs:
     name: Test FIPS integration
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         submodules: 'recursive'
     - name: Install Rust (rustup)
       run: rustup update stable --no-self-update && rustup default stable
       shell: bash
     - name: Install golang
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: '>=1.22.0'
     - name: Run tests
@@ -405,11 +405,11 @@ jobs:
     name: Test BoringSSL upstream test suite
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         submodules: 'recursive'
     - name: Install golang
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: '>=1.22.0'
     - name: Install build tools (clang, cmake)
