@@ -17,8 +17,9 @@ pub(crate) struct PrefixCallback {
 
 impl PrefixCallback {
     pub(crate) fn new(target_os: &str, target_arch: &str) -> Self {
-        // bindgen treats an overridden link name as fully mangled. Mach-O and
-        // 32-bit Windows C symbols include a leading underscore.
+        // bindgen emits the override with a `\u{1}` prefix, which suppresses LLVM's
+        // platform mangling, so the name must already carry the leading underscore
+        // that Mach-O and 32-bit Windows C symbols have.
         let symbol_prefix =
             if is_macho_target(target_os) || (target_os == "windows" && target_arch == "x86") {
                 "_"
@@ -142,19 +143,12 @@ fn prepare_generator_workspace(source_root: &Path, generator_root: &Path) -> io:
     }
     fs::create_dir_all(generator_root)?;
 
-    for path in [
-        "include",
-        "util/build",
-        "util/idextractor",
-        "util/pregenerate",
-    ] {
-        let source = source_root.join(path);
-        let destination = Path::new(path).parent().map_or_else(
-            || generator_root.to_owned(),
-            |parent| generator_root.join(parent),
-        );
-        fs::create_dir_all(&destination)?;
-        fs_extra::dir::copy(source, destination, &Default::default()).map_err(io::Error::other)?;
+    // Copy `util` wholesale rather than just the packages `pregenerate` imports today: the
+    // import set is an upstream implementation detail, and a missing package would only show
+    // up as an opaque Go build error after a BoringSSL bump.
+    for path in ["include", "util"] {
+        fs_extra::dir::copy(source_root.join(path), generator_root, &Default::default())
+            .map_err(io::Error::other)?;
     }
 
     for file in ["go.mod", "go.sum"] {
@@ -219,8 +213,8 @@ fn prefix_build_json(source_root: &Path) -> io::Result<String> {
 
 fn object_file_format(target_os: &str) -> Option<&'static str> {
     match target_os {
-        "android" | "dragonfly" | "freebsd" | "haiku" | "illumos" | "linux" | "netbsd"
-        | "openbsd" | "solaris" => Some("elf"),
+        "android" | "dragonfly" | "freebsd" | "fuchsia" | "haiku" | "illumos" | "linux"
+        | "netbsd" | "openbsd" | "solaris" => Some("elf"),
         target_os if is_macho_target(target_os) => Some("macho"),
         "windows" => Some("pe"),
         _ => None,

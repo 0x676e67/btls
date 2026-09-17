@@ -737,6 +737,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     emit_rerun_if_changed();
     ensure_patches_applied(&config)?;
 
+    if config.features.prefix_symbols && config.env.path.is_some() {
+        println!(
+            "cargo:warning=a precompiled BoringSSL was provided, so this build cannot apply or \
+            verify symbol prefixing; the generated bindings still expect prefixed symbols, so the \
+            provided library must have been built with `-DBORINGSSL_PREFIX={}`",
+            PREFIX.as_str()
+        );
+    }
+
     if config.features.prefix_symbols && !config.env.docs_rs && config.env.path.is_none() {
         regenerate_prefix_symbols(get_boringssl_source_path(&config), &config.out_dir)
             .map_err(|e| format!("could not generate BoringSSL's prefixed symbol list: {e}"))?;
@@ -921,6 +930,7 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         "ripemd.h",
         "siphash.h",
         "srtp.h",
+        "tls_prf.h",
         "trust_token.h",
     ];
     for (i, header) in must_have_headers.into_iter().chain(headers).enumerate() {

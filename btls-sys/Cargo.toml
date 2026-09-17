@@ -76,9 +76,9 @@ allow-crl-extensions-bad-version = []
 # `BORING_BSSL{,_FIPS}_SOURCE_PATH`.
 underscore-wildcards = []
 
-# Build BoringSSL with its native symbol-prefixing support to prevent conflicts
-# with OpenSSL versions linked in the same process. This requires Go and a
-# Clang executable; supported build combinations are determined by BoringSSL.
+# Build BoringSSL with its native symbol-prefixing support, so its symbols don't
+# collide with an OpenSSL linked into the same process. Needs Go and clang at
+# build time, and cannot be combined with `fips` or `BORING_BSSL_SOURCE_PATH`.
 prefix-symbols = []
 
 # Restores the historical pre-TLS 1.3 client behaviour for RSA leaf certificates

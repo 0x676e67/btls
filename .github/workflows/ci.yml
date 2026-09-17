@@ -504,14 +504,38 @@ jobs:
           submodules: "recursive"
       - name: Install Rust (rustup)
         run: rustup update stable --no-self-update && rustup default stable
+      - name: Install golang
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: btls-sys/deps/boringssl/go.mod
+          cache-dependency-path: btls-sys/deps/boringssl/go.sum
       - name: Run `rpk` and `underscore-wildcards` tests
         run: cargo test --features rpk,underscore-wildcards -- --skip badssl_ciphers_negotiate
+      # Symbols reached only through a non-default feature are invisible to the
+      # per-target `prefix-symbols` jobs, which link `btls-sys` alone. Features are
+      # listed explicitly rather than via `--all-features`, which would pull in
+      # `fips`, rejected by symbol prefixing, and `legacy-compat-deprecated`, whose
+      # expectations describe an older BoringSSL than the vendored one.
+      - name: Run `prefix-symbols` tests with every compatible feature
+        run: |
+          cargo test -p btls \
+            --features prefix-symbols,prf,mlkem,mldsa,credential,rpk,underscore-wildcards,relax-cert-validation
       - name: Run `allow-crl-extensions-bad-version` tests
         run: cargo test -p btls-sys --features allow-crl-extensions-bad-version
       - name: Run `mldsa` tests
         run: cargo test -p btls --features mldsa
       - name: Run `relax-cert-validation` tests
         run: cargo test -p btls --features relax-cert-validation
+      - name: Check `fips` and `prefix-symbols` are rejected
+        run: |
+          log="$RUNNER_TEMP/fips-prefix-symbols.log"
+          if cargo build -p btls-sys --features fips,prefix-symbols >"$log" 2>&1; then
+            cat "$log"
+            echo 'expected the fips + prefix-symbols combination to be rejected'
+            exit 1
+          fi
+          cat "$log"
+          grep -qF '`prefix-symbols` features are mutually exclusive' "$log"
 
   crates:
     name: crates
@@ -555,6 +579,14 @@ jobs:
             bin: ""
             test: true
             custom_env: {}
+          # Covers the leading-underscore branch of the bindgen link name
+          # override, which only 32-bit Windows and Mach-O targets take.
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            bin: ""
+            test: true
+            custom_env:
+              CXXFLAGS: -msse2 # matches the `i686-msvc` test job
           - target: x86_64-apple-darwin
             os: macos-15-intel
             bin: ""
@@ -626,7 +658,39 @@ jobs:
           cd test-project
           cargo add btls-sys --path ../btls-sys/
           cargo add openssl-sys -F vendored
-          echo 'fn main() { btls_sys::init(); openssl_sys::init(); unsafe { let ctx = btls_sys::SSL_CTX_new(btls_sys::TLS_method()); assert!(!ctx.is_null()); assert_eq!(btls_sys::SSL_CTX_set_extension_order(ctx, std::ptr::null(), 0), 1); btls_sys::SSL_CTX_free(ctx); } }' > src/main.rs
+          cat > src/main.rs <<'EOF'
+          fn main() {
+              btls_sys::init();
+              openssl_sys::init();
+              unsafe {
+                  let ctx = btls_sys::SSL_CTX_new(btls_sys::TLS_method());
+                  assert!(!ctx.is_null());
+                  assert_eq!(btls_sys::SSL_CTX_set_extension_order(ctx, std::ptr::null(), 0), 1);
+                  btls_sys::SSL_CTX_free(ctx);
+
+                  // `CRYPTO_tls1_prf` is bound only because `tls_prf.h` is in the bindgen
+                  // header list. A symbol left out of that list keeps the unprefixed name
+                  // and fails to link here.
+                  let mut prf = [0u8; 32];
+                  assert_eq!(
+                      btls_sys::internal::CRYPTO_tls1_prf(
+                          btls_sys::EVP_sha256(),
+                          prf.as_mut_ptr(),
+                          prf.len(),
+                          b"secret".as_ptr(),
+                          6,
+                          b"label".as_ptr(),
+                          5,
+                          b"seed".as_ptr(),
+                          4,
+                          std::ptr::null(),
+                          0,
+                      ),
+                      1
+                  );
+              }
+          }
+          EOF
       - name: Install Rust toolchain
         shell: bash
         run: rustup target add ${{ matrix.target }}
