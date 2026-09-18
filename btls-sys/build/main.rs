@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use crate::config::Config;
 use crate::prefix::{
-    audit_prefixed_symbols, find_crypto_archive, regenerate_prefix_symbols, PrefixCallback, PREFIX,
+    audit_prefixed_symbols, find_archive, regenerate_prefix_symbols, PrefixCallback, PREFIX,
 };
 
 mod cache;
@@ -756,11 +756,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         emit_link_directives(&config);
         if config.features.prefix_symbols && config.env.path.is_none() {
             let bssl_dir = build_boringssl_or_get_prebuilt(&config);
-            let crypto_archive =
-                find_crypto_archive(bssl_dir, &config.target_env, msvc_lib_subdir(&config))?;
+            let msvc_subdir = msvc_lib_subdir(&config);
+            // libssl holds the C++ symbols that `prefix_symbols.h` cannot rename, so it
+            // needs the audit at least as much as libcrypto does.
+            let archives = ["crypto", "ssl"]
+                .into_iter()
+                .map(|library| find_archive(bssl_dir, &config.target_env, msvc_subdir, library))
+                .collect::<io::Result<Vec<_>>>()?;
             audit_prefixed_symbols(
                 get_boringssl_source_path(&config),
-                &crypto_archive,
+                &archives,
                 &config.target_os,
             )
             .map_err(|e| format!("BoringSSL's prefixed symbol audit failed: {e}"))?;
@@ -914,6 +919,9 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         "ossl_typ.h",
         "pkcs12.h",
         "poly1305.h",
+        // `src/lib.rs` re-exports `CRYPTO_tls1_prf` from this header unconditionally, so
+        // a missing one should fail here rather than as an unresolved import later.
+        "tls_prf.h",
         "x509v3.h",
     ];
     let headers = [
@@ -931,7 +939,6 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         "ripemd.h",
         "siphash.h",
         "srtp.h",
-        "tls_prf.h",
         "trust_token.h",
     ];
     for (i, header) in must_have_headers.into_iter().chain(headers).enumerate() {

@@ -72,7 +72,7 @@ pub(crate) fn regenerate_prefix_symbols(source_path: &Path, out_dir: &Path) -> i
 
 pub(crate) fn audit_prefixed_symbols(
     source_path: &Path,
-    archive_path: &Path,
+    archive_paths: &[PathBuf],
     target_os: &str,
 ) -> io::Result<()> {
     let Some(object_format) = object_file_format(target_os) else {
@@ -93,31 +93,33 @@ pub(crate) fn audit_prefixed_symbols(
                 "-ignore-symbols-with",
                 PREFIX.as_str(),
             ])
-            .arg(archive_path)
+            .args(archive_paths)
             .current_dir(source_root),
     )?;
 
     Ok(())
 }
 
-pub(crate) fn find_crypto_archive(
+/// Locates the static archive cmake built for `library`, which is `crypto` or `ssl`.
+pub(crate) fn find_archive(
     build_dir: &Path,
     target_env: &str,
     msvc_lib_subdir: Option<&str>,
+    library: &str,
 ) -> io::Result<PathBuf> {
     let library_name = if target_env == "msvc" {
-        "crypto.lib"
+        format!("{library}.lib")
     } else {
-        "libcrypto.a"
+        format!("lib{library}.a")
     };
     let mut candidates = Vec::new();
 
-    for subdir in ["lib", "crypto", ""] {
+    for subdir in ["lib", library, ""] {
         let dir = build_dir.join(subdir);
         if let Some(msvc_subdir) = msvc_lib_subdir {
-            candidates.push(dir.join(msvc_subdir).join(library_name));
+            candidates.push(dir.join(msvc_subdir).join(&library_name));
         }
-        candidates.push(dir.join(library_name));
+        candidates.push(dir.join(&library_name));
     }
 
     candidates
@@ -132,7 +134,7 @@ pub(crate) fn find_crypto_archive(
                 .join(", ");
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("could not find BoringSSL's crypto archive; searched: {searched}"),
+                format!("could not find BoringSSL's {library} archive; searched: {searched}"),
             )
         })
 }
