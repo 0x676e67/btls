@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: gngpp <gngppz@gmail.com>
 Date: Thu, 18 Sep 2026 00:00:00 +0800
-Subject: [PATCH 12/12] boringssl: skip compiler-generated helpers in the
- symbol audit
+Subject: [PATCH] boringssl: skip compiler-generated helpers in the symbol audit
 
 Auditing libssl, not just libcrypto, reaches the helper functions the compiler
 emits for C++ code: clang's `__clang_call_terminate` for exception cleanup, and

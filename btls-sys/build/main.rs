@@ -543,11 +543,16 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
             "0009-boringssl-zstd-cert-compression.patch",
             "0010-boringssl-build-compat.patch",
             "0011-boringssl-prefix-struct-tags.patch",
-            "0012-boringssl-audit-skip-compiler-helpers.patch",
         ] {
             println!("cargo:warning=applying {patch_name} to boringssl");
             apply_patch(config, patch_name)?;
         }
+    }
+
+    // Only the symbol audit reads this tool, and only a prefixed build runs it.
+    if config.features.prefix_symbols {
+        println!("cargo:warning=applying symbol audit patch to boringssl");
+        apply_patch(config, "boringssl-audit-symbols.patch")?;
     }
 
     println!("cargo:warning=applying loongarch patch to boringssl");
