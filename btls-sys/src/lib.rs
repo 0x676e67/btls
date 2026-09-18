@@ -79,7 +79,7 @@ pub fn cbs_init(data: &[u8]) -> CBS {
 }
 
 pub mod internal {
-    // Declared here by hand until BoringSSL moved it to the public
-    // `openssl/tls_prf.h`; kept as a re-export so the old path still works.
+    // BoringSSL now exposes this in the public `openssl/tls_prf.h`, so bindgen
+    // generates it; kept as a re-export so the old path still works.
     pub use super::CRYPTO_tls1_prf;
 }
