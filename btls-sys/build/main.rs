@@ -543,6 +543,7 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
             "0009-boringssl-zstd-cert-compression.patch",
             "0010-boringssl-build-compat.patch",
             "0011-boringssl-prefix-struct-tags.patch",
+            "0012-boringssl-audit-skip-clang-eh-helper.patch",
         ] {
             println!("cargo:warning=applying {patch_name} to boringssl");
             apply_patch(config, patch_name)?;
