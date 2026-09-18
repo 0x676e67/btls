@@ -74,7 +74,7 @@ impl Config {
             .as_ref()
             .is_some_and(|path| path.join("src").exists());
 
-        // DEP_BORINGSSL_VERSION_MAJOR
+        // DEP_BTLS_VERSION_MAJOR
         println!(
             "cargo:version_major={}",
             env::var("CARGO_PKG_VERSION_MAJOR").unwrap_or_default()

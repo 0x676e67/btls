@@ -9,7 +9,7 @@ license = "MIT"
 description = "FFI bindings to BoringSSL"
 repository = { workspace = true }
 documentation = "https://docs.rs/btls-sys"
-links = "boringssl"
+links = "btls"
 build = "build/main.rs"
 readme = "README.md"
 categories = ["cryptography", "external-ffi-bindings"]
