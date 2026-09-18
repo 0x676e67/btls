@@ -734,6 +734,40 @@ jobs:
         if: matrix.test == true
         shell: bash
         run: cargo ${{ matrix.bin }} run --target ${{ matrix.target }}
+      # The jobs above pair btls-sys with OpenSSL, whose symbols differ from BoringSSL's
+      # to begin with. boring-sys is the same BoringSSL, so every symbol collides unless
+      # prefixing covers all of them, the C++ destructors included. Linux only: which
+      # symbols exist is platform-independent, and boring-sys builds its own BoringSSL.
+      - name: Verify coexistence with an unprefixed BoringSSL
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        working-directory: .
+        shell: bash
+        run: |
+          # Outside the workspace: `cargo init` would otherwise add the project to
+          # `members`, and its binary would land in the workspace target directory.
+          project="$RUNNER_TEMP/boring-coexistence"
+          cargo init "$project"
+          cd "$project"
+          cargo add btls-sys --path "$GITHUB_WORKSPACE/btls-sys" -F prefix-symbols
+          cargo add boring-sys
+          cat > src/main.rs <<'EOF'
+          fn main() {
+              unsafe {
+                  let prefixed = btls_sys::SSL_CTX_new(btls_sys::TLS_method());
+                  assert!(!prefixed.is_null());
+                  btls_sys::SSL_CTX_free(prefixed);
+
+                  let unprefixed = boring_sys::SSL_CTX_new(boring_sys::TLS_method());
+                  assert!(!unprefixed.is_null());
+                  boring_sys::SSL_CTX_free(unprefixed);
+              }
+          }
+          EOF
+          cargo run
+          # Without both libraries actually linked in, the run above would prove nothing.
+          nm target/debug/boring-coexistence > symbols
+          grep -q ' btls_sys_SSL_CTX_new$' symbols
+          grep -qE ' [TtWw] SSL_CTX_new$' symbols
       - name: Verify packaged btls-sys with symbol prefixing
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         working-directory: btls-sys
