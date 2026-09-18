@@ -9,10 +9,6 @@ license = "MIT"
 description = "FFI bindings to BoringSSL"
 repository = { workspace = true }
 documentation = "https://docs.rs/btls-sys"
-# Not `boringssl`: `boring-sys` claims that value, and Cargo allows only one package
-# per `links` value, so sharing it would leave btls-sys and boring-sys unresolvable in
-# one dependency graph even though `prefix-symbols` keeps their symbols apart. The name
-# also picks the build-script metadata downstream reads, here `DEP_BTLS_*`.
 links = "btls"
 build = "build/main.rs"
 readme = "README.md"
