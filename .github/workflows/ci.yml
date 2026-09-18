@@ -734,10 +734,10 @@ jobs:
         if: matrix.test == true
         shell: bash
         run: cargo ${{ matrix.bin }} run --target ${{ matrix.target }}
-      # The jobs above pair btls-sys with OpenSSL, whose symbols differ from BoringSSL's
-      # to begin with. boring-sys is the same BoringSSL, so every symbol collides unless
-      # prefixing covers all of them, the C++ destructors included. Linux only: which
-      # symbols exist is platform-independent, and boring-sys builds its own BoringSSL.
+      # The jobs above pair btls-sys with OpenSSL, which shares only BoringSSL's public
+      # C API. boring-sys is the same codebase, so it also collides on internals and on
+      # C++ symbols that `prefix_symbols.h` does not rename. Linux only: which symbols
+      # exist is platform-independent, and boring-sys builds its own BoringSSL.
       - name: Verify coexistence with an unprefixed BoringSSL
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         working-directory: .
