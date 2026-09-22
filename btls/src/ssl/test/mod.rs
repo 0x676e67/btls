@@ -1170,27 +1170,30 @@ fn test_set_compliance() {
         assert_eq!(cipher.0.name(), cipher.1);
     }
 
-    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
-    ctx.set_compliance_policy(CompliancePolicy::WPA3_192_202304)
-        .unwrap();
+    #[cfg(not(feature = "legacy-compat-deprecated"))]
+    {
+        let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+        ctx.set_compliance_policy(CompliancePolicy::WPA3_192_202304)
+            .unwrap();
 
-    assert_eq!(ctx.max_proto_version().unwrap(), SslVersion::TLS1_3);
-    assert_eq!(ctx.min_proto_version().unwrap(), SslVersion::TLS1_2);
+        assert_eq!(ctx.max_proto_version().unwrap(), SslVersion::TLS1_3);
+        assert_eq!(ctx.min_proto_version().unwrap(), SslVersion::TLS1_2);
 
-    const WPA3_192_CIPHERS: [&str; 2] = [
-        "ECDHE-ECDSA-AES256-GCM-SHA384",
-        "ECDHE-RSA-AES256-GCM-SHA384",
-    ];
+        const WPA3_192_CIPHERS: [&str; 2] = [
+            "ECDHE-ECDSA-AES256-GCM-SHA384",
+            "ECDHE-RSA-AES256-GCM-SHA384",
+        ];
 
-    let ciphers = ctx.ciphers().unwrap();
-    assert_eq!(ciphers.len(), WPA3_192_CIPHERS.len());
+        let ciphers = ctx.ciphers().unwrap();
+        assert_eq!(ciphers.len(), WPA3_192_CIPHERS.len());
 
-    for cipher in ciphers.into_iter().zip(WPA3_192_CIPHERS) {
-        assert_eq!(cipher.0.name(), cipher.1);
+        for cipher in ciphers.into_iter().zip(WPA3_192_CIPHERS) {
+            assert_eq!(cipher.0.name(), cipher.1);
+        }
+
+        ctx.set_compliance_policy(CompliancePolicy::NONE)
+            .expect_err("Testing expect err if set compliance policy to NONE");
     }
-
-    ctx.set_compliance_policy(CompliancePolicy::NONE)
-        .expect_err("Testing expect err if set compliance policy to NONE");
 }
 
 #[test]
@@ -1252,28 +1255,31 @@ fn test_ssl_set_compliance() {
         assert_eq!(cipher.0.name(), cipher.1);
     }
 
-    let ctx = SslContext::builder(SslMethod::tls()).unwrap().build();
-    let mut ssl = Ssl::new(&ctx).unwrap();
-    ssl.set_compliance_policy(CompliancePolicy::WPA3_192_202304)
-        .unwrap();
+    #[cfg(not(feature = "legacy-compat-deprecated"))]
+    {
+        let ctx = SslContext::builder(SslMethod::tls()).unwrap().build();
+        let mut ssl = Ssl::new(&ctx).unwrap();
+        ssl.set_compliance_policy(CompliancePolicy::WPA3_192_202304)
+            .unwrap();
 
-    assert_eq!(ssl.max_proto_version().unwrap(), SslVersion::TLS1_3);
-    assert_eq!(ssl.min_proto_version().unwrap(), SslVersion::TLS1_2);
+        assert_eq!(ssl.max_proto_version().unwrap(), SslVersion::TLS1_3);
+        assert_eq!(ssl.min_proto_version().unwrap(), SslVersion::TLS1_2);
 
-    const WPA3_192_CIPHERS: [&str; 2] = [
-        "ECDHE-ECDSA-AES256-GCM-SHA384",
-        "ECDHE-RSA-AES256-GCM-SHA384",
-    ];
+        const WPA3_192_CIPHERS: [&str; 2] = [
+            "ECDHE-ECDSA-AES256-GCM-SHA384",
+            "ECDHE-RSA-AES256-GCM-SHA384",
+        ];
 
-    let ciphers = ssl.ciphers();
-    assert_eq!(ciphers.len(), WPA3_192_CIPHERS.len());
+        let ciphers = ssl.ciphers();
+        assert_eq!(ciphers.len(), WPA3_192_CIPHERS.len());
 
-    for cipher in ciphers.into_iter().zip(WPA3_192_CIPHERS) {
-        assert_eq!(cipher.0.name(), cipher.1);
+        for cipher in ciphers.into_iter().zip(WPA3_192_CIPHERS) {
+            assert_eq!(cipher.0.name(), cipher.1);
+        }
+
+        ssl.set_compliance_policy(CompliancePolicy::NONE)
+            .expect_err("Testing expect err if set compliance policy to NONE");
     }
-
-    ssl.set_compliance_policy(CompliancePolicy::NONE)
-        .expect_err("Testing expect err if set compliance policy to NONE");
 }
 
 #[test]
