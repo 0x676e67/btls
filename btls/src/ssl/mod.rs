@@ -2129,6 +2129,10 @@ impl SslContextBuilder {
     /// may still answer with a plain certificate; see
     /// [`SslRef::used_delegated_credential`].
     ///
+    /// Received credentials are validated per RFC 9345 §4.1.3, including that
+    /// they expire before the certificate; Firefox skips that last check. This
+    /// only affects certificate validation, not the ClientHello.
+    ///
     /// # Errors
     ///
     /// Returns an error for an empty list, an unknown name, or an embedded NUL.
