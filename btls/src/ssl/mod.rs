@@ -3451,6 +3451,24 @@ impl SslRef {
         unsafe { cvt(ffi::SSL_set_tlsext_host_name(self.as_ptr(), cstr.as_ptr())) }
     }
 
+    /// Configures the session as the client side of a handshake.
+    ///
+    /// Unlike [`SslStreamBuilder::set_connect_state`], this works on an `Ssl` that is later
+    /// wrapped with [`SslStream::new`], so the caller drives the handshake itself (for example
+    /// over memory buffers, calling [`SslStream::do_handshake`] as data arrives).
+    #[corresponds(SSL_set_connect_state)]
+    pub fn set_connect_state(&mut self) {
+        unsafe { ffi::SSL_set_connect_state(self.as_ptr()) }
+    }
+
+    /// Configures the session as the server side of a handshake.
+    ///
+    /// See [`SslRef::set_connect_state`].
+    #[corresponds(SSL_set_accept_state)]
+    pub fn set_accept_state(&mut self) {
+        unsafe { ffi::SSL_set_accept_state(self.as_ptr()) }
+    }
+
     /// Returns the peer's certificate, if present.
     #[corresponds(SSL_get_peer_certificate)]
     #[must_use]

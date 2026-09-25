@@ -1513,3 +1513,71 @@ fn set_verify_algorithm_prefs_ssl_rejects_unsatisfiable() {
         .expect("verify prefs should be accepted by setter");
     let _err = ssl_builder.connect_err();
 }
+
+/// A stream over memory: reads return `WouldBlock` once `input` is empty.
+#[derive(Default)]
+struct MemStream {
+    input: Vec<u8>,
+    output: Vec<u8>,
+}
+
+impl Read for MemStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.input.is_empty() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let n = buf.len().min(self.input.len());
+        buf[..n].copy_from_slice(&self.input[..n]);
+        self.input.drain(..n);
+        Ok(n)
+    }
+}
+
+impl Write for MemStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn handshake_state_on_ssl() {
+    let mut server_ctx = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    server_ctx
+        .set_certificate_file(Path::new("test/cert.pem"), SslFiletype::PEM)
+        .unwrap();
+    server_ctx
+        .set_private_key_file(Path::new("test/key.pem"), SslFiletype::PEM)
+        .unwrap();
+    let server_ctx = server_ctx.build();
+
+    let mut client_ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    client_ctx.set_verify(SslVerifyMode::NONE);
+    let client_ctx = client_ctx.build();
+
+    let mut client = Ssl::new(&client_ctx).unwrap();
+    client.set_connect_state();
+    let mut client = SslStream::new(client, MemStream::default()).unwrap();
+    let mut server = Ssl::new(server_ctx.context()).unwrap();
+    server.set_accept_state();
+    let mut server = SslStream::new(server, MemStream::default()).unwrap();
+
+    // Shuttle the flights between the two until both are done.
+    let (mut client_done, mut server_done) = (false, false);
+    for _ in 0..10 {
+        client_done = client_done || client.do_handshake().is_ok();
+        let flight = mem::take(&mut client.get_mut().output);
+        server.get_mut().input.extend(flight);
+        server_done = server_done || server.do_handshake().is_ok();
+        let flight = mem::take(&mut server.get_mut().output);
+        client.get_mut().input.extend(flight);
+        if client_done && server_done {
+            break;
+        }
+    }
+    assert!(client_done && server_done);
+}
