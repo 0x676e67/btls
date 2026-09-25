@@ -525,7 +525,7 @@ fn assert_record_size_limit_records(
         server_receive_limit,
         &server_headers,
     );
-    let server_headers_for_io = Arc::clone(&server_headers);
+    let server_headers_for_io = server_headers.clone();
     server.io_cb(move |mut stream| {
         // Server::Builder writes a one-byte handshake sentinel first. Start the
         // measurement after it so only the test payload remains.
