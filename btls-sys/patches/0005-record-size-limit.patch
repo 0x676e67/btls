@@ -17,30 +17,30 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ---
- build.json                       |   2 +
- gen/sources.bzl                  |   2 +
- gen/sources.cmake                |   2 +
- gen/sources.gni                  |   2 +
- gen/sources.json                 |   4 +-
- gen/sources.mk                   |   2 +
- include/openssl/prefix_symbols.h |   4 +
- include/openssl/ssl.h            |  15 +
- include/openssl/tls1.h           |   3 +
- ssl/extensions.cc                |   7 +
- ssl/handoff.cc                   |   6 +-
- ssl/handshake_client.cc          |   1 +
- ssl/internal.h                   |  72 +++
- ssl/record_size_limit.cc         | 384 +++++++++++++
- ssl/record_size_limit_test.cc    | 932 +++++++++++++++++++++++++++++++
- ssl/s3_both.cc                   |   7 +-
- ssl/s3_pkt.cc                    |   2 +-
- ssl/ssl_asn1.cc                  |  28 +
- ssl/ssl_lib.cc                   |   1 +
- ssl/ssl_session.cc               |   2 +
- ssl/tls13_server.cc              |   8 +
- ssl/tls_method.cc                |   2 +
- ssl/tls_record.cc                |  17 +-
- 23 files changed, 1495 insertions(+), 10 deletions(-)
+ build.json                       |    2 +
+ gen/sources.bzl                  |    2 +
+ gen/sources.cmake                |    2 +
+ gen/sources.gni                  |    2 +
+ gen/sources.json                 |    4 +-
+ gen/sources.mk                   |    2 +
+ include/openssl/prefix_symbols.h |    4 +
+ include/openssl/ssl.h            |   15 +
+ include/openssl/tls1.h           |    3 +
+ ssl/extensions.cc                |   17 +
+ ssl/handoff.cc                   |    6 +-
+ ssl/handshake_client.cc          |    1 +
+ ssl/internal.h                   |   72 +++
+ ssl/record_size_limit.cc         |  384 ++++++++++++
+ ssl/record_size_limit_test.cc    | 1005 ++++++++++++++++++++++++++++++
+ ssl/s3_both.cc                   |    7 +-
+ ssl/s3_pkt.cc                    |    2 +-
+ ssl/ssl_asn1.cc                  |   28 +
+ ssl/ssl_lib.cc                   |    1 +
+ ssl/ssl_session.cc               |    2 +
+ ssl/tls13_server.cc              |    8 +
+ ssl/tls_method.cc                |    2 +
+ ssl/tls_record.cc                |   17 +-
+ 23 files changed, 1578 insertions(+), 10 deletions(-)
  create mode 100644 ssl/record_size_limit.cc
  create mode 100644 ssl/record_size_limit_test.cc
 
@@ -248,7 +248,7 @@ index 0a01b24..611b202 100644
  #define TLSEXT_TYPE_server_name 0
  #define TLSEXT_TYPE_status_request 5
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 9ad7527..8a46cf4 100644
+index 9ad7527..503a128 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -4323,6 +4323,13 @@ static const struct tls_extension kExtensions[] = {
@@ -265,6 +265,30 @@ index 9ad7527..8a46cf4 100644
      {
          TLSEXT_TYPE_client_cert_type,
          ext_client_cert_type_add_clienthello,
+@@ -4540,6 +4547,10 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+     size_t i = hs->extension_permutation.empty()
+                    ? unpermuted
+                    : hs->extension_permutation[unpermuted];
++    if (kExtensions[i].value == TLSEXT_TYPE_record_size_limit &&
++        hs->record_size_limit == 0) {
++      continue;
++    }
+     const size_t len_before = CBB_len(&extensions);
+     const size_t len_compressed_before = CBB_len(compressed.get());
+     if (!kExtensions[i].add_clienthello(hs, &extensions, compressed.get(),
+@@ -4653,6 +4664,12 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+     size_t i = hs->extension_permutation.empty()
+                    ? unpermuted
+                    : hs->extension_permutation[unpermuted];
++    // A disabled record_size_limit slot must not count as the last extension,
++    // or it would clear `last_was_empty` and drop the padding below.
++    if (kExtensions[i].value == TLSEXT_TYPE_record_size_limit &&
++        hs->record_size_limit == 0) {
++      continue;
++    }
+     const size_t len_before = CBB_len(&extensions);
+     if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
+       OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
 diff --git a/ssl/handoff.cc b/ssl/handoff.cc
 index c8d9897..840258e 100644
 --- a/ssl/handoff.cc
@@ -818,10 +842,10 @@ index 0000000..ba1a56b
 +}
 diff --git a/ssl/record_size_limit_test.cc b/ssl/record_size_limit_test.cc
 new file mode 100644
-index 0000000..4261bbc
+index 0000000..f33f89a
 --- /dev/null
 +++ b/ssl/record_size_limit_test.cc
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,1005 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1081,6 +1105,8 @@ index 0000000..4261bbc
 +struct ClientHelloObservation {
 +  bool called = false;
 +  bool present = false;
++  bool padding_present = false;
++  bool session_ticket_empty = false;
 +  uint16_t value = 0;
 +  uint16_t mutate_server_limit_to = 0;
 +};
@@ -1111,6 +1137,12 @@ index 0000000..4261bbc
 +  if (observation->present && len == 2) {
 +    observation->value = (static_cast<uint16_t>(data[0]) << 8) | data[1];
 +  }
++  observation->padding_present = SSL_early_callback_ctx_extension_get(
++      client_hello, TLSEXT_TYPE_padding, &data, &len);
++  observation->session_ticket_empty =
++      SSL_early_callback_ctx_extension_get(
++          client_hello, TLSEXT_TYPE_session_ticket, &data, &len) &&
++      len == 0;
 +  if (observation->mutate_server_limit_to != 0) {
 +    SSL_set_record_size_limit(client_hello->ssl,
 +                              observation->mutate_server_limit_to);
@@ -1140,6 +1172,71 @@ index 0000000..4261bbc
 +    EXPECT_EQ(state->write_record_size_limit, 0);
 +    EXPECT_EQ(state->pending_read_record_size_limit, 0);
 +    EXPECT_EQ(state->pending_write_record_size_limit, 0);
++  }
++}
++
++TEST(RecordSizeLimitTest, DisabledSlotKeepsClientHelloPadding) {
++  // The ClientHello writer appends a padding extension when the last
++  // extension it wrote was empty. A disabled record_size_limit slot writes
++  // nothing and must not reset that state, or an ordering that ends with an
++  // empty session_ticket followed by the slot would change the wire image.
++  static const uint16_t kOrder[] = {
++      TLSEXT_TYPE_server_name,
++      TLSEXT_TYPE_encrypted_client_hello,
++      TLSEXT_TYPE_extended_master_secret,
++      TLSEXT_TYPE_renegotiate,
++      TLSEXT_TYPE_supported_groups,
++      TLSEXT_TYPE_ec_point_formats,
++      TLSEXT_TYPE_application_layer_protocol_negotiation,
++      TLSEXT_TYPE_status_request,
++      TLSEXT_TYPE_signature_algorithms,
++      TLSEXT_TYPE_next_proto_neg,
++      TLSEXT_TYPE_certificate_timestamp,
++      TLSEXT_TYPE_channel_id,
++      TLSEXT_TYPE_srtp,
++      TLSEXT_TYPE_key_share,
++      TLSEXT_TYPE_psk_key_exchange_modes,
++      TLSEXT_TYPE_early_data,
++      TLSEXT_TYPE_supported_versions,
++      TLSEXT_TYPE_cookie,
++      TLSEXT_TYPE_quic_transport_parameters,
++      TLSEXT_TYPE_quic_transport_parameters_legacy,
++      TLSEXT_TYPE_cert_compression,
++      TLSEXT_TYPE_delegated_credential,
++      TLSEXT_TYPE_application_settings,
++      TLSEXT_TYPE_application_settings_old,
++      TLSEXT_TYPE_certificate_authorities,
++      TLSEXT_TYPE_pake,
++      TLSEXT_TYPE_trust_anchors,
++      TLSEXT_TYPE_client_cert_type,
++      TLSEXT_TYPE_server_cert_type,
++      TLSEXT_TYPE_server_padding,
++      TLSEXT_TYPE_session_ticket,
++      TLSEXT_TYPE_record_size_limit,
++  };
++  for (uint16_t limit : {0, 64}) {
++    SCOPED_TRACE(limit);
++    UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_2_VERSION);
++    UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_2_VERSION);
++    ASSERT_TRUE(client_ctx);
++    ASSERT_TRUE(server_ctx);
++    ASSERT_TRUE(SSL_CTX_set_extension_order(client_ctx.get(), kOrder,
++                                            std::size(kOrder)));
++    SSL_CTX_set_record_size_limit(client_ctx.get(), limit);
++
++    ClientHelloObservation observation;
++    ScopedClientHelloObservation scoped_observation(&observation);
++    SSL_CTX_set_select_certificate_cb(server_ctx.get(), ObserveClientHello);
++    UniquePtr<SSL> client, server;
++    ASSERT_TRUE(
++        CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
++    ASSERT_TRUE(CompleteHandshakes(client.get(), server.get()));
++    ASSERT_TRUE(observation.called);
++    ASSERT_TRUE(observation.session_ticket_empty);
++    EXPECT_EQ(observation.present, limit != 0);
++    // Disabled: session_ticket is the last extension written, so padding
++    // follows. Enabled: the non-empty record_size_limit is last instead.
++    EXPECT_EQ(observation.padding_present, limit == 0);
 +  }
 +}
 +
