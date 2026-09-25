@@ -236,6 +236,18 @@ fn msvc_lib_subdir(config: &Config) -> Option<&'static str> {
 /// Returns a new `cmake::Config` for building BoringSSL.
 ///
 /// It will add platform-specific parameters if needed.
+/// The deployment target rustc reads for an Apple target, if it is set.
+fn apple_deployment_target(config: &Config) -> Option<String> {
+    let var = match config.target_os.as_str() {
+        "macos" => "MACOSX_DEPLOYMENT_TARGET",
+        "ios" => "IPHONEOS_DEPLOYMENT_TARGET",
+        "tvos" => "TVOS_DEPLOYMENT_TARGET",
+        _ => return None,
+    };
+    println!("cargo:rerun-if-env-changed={var}");
+    std::env::var(var).ok()
+}
+
 fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     let src_path = get_boringssl_source_path(config);
     let mut boringssl_cmake = cmake::Config::new(src_path);
@@ -294,6 +306,13 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
             .define("CMAKE_C_COMPILER_EXTERNAL_TOOLCHAIN", toolchain)
             .define("CMAKE_CXX_COMPILER_EXTERNAL_TOOLCHAIN", toolchain)
             .define("CMAKE_ASM_COMPILER_EXTERNAL_TOOLCHAIN", toolchain);
+    }
+
+    // Build for the same OS version the Rust code is built for. Without it,
+    // CMake targets the SDK's version, and linking for an older one fails or
+    // warns (e.g. ___chkstk_darwin is missing below iOS 13).
+    if let Some(target) = apple_deployment_target(config) {
+        boringssl_cmake.define("CMAKE_OSX_DEPLOYMENT_TARGET", target);
     }
 
     // Add platform-specific parameters for cross-compilation.
