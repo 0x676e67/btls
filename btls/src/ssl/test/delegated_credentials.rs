@@ -347,7 +347,7 @@ fn patch_delegated_credential_usage_is_false_on_resumption() {
     client_context
         .set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
     client_context.set_new_session_callback({
-        let session = Arc::clone(&session);
+        let session = session.clone();
         move |_, ticket| {
             let mut session = session.lock().unwrap();
             if session.is_none() {
