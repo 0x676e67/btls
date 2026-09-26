@@ -555,7 +555,24 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          bash +x scripts/publish.sh
+          set -euo pipefail
+
+          if [[ "$(git diff --stat)" != '' ]]; then
+            echo 'Please commit or discard your changes before creating a new release.'
+            exit 1
+          fi
+
+          echo "===  Publishing btls-sys... ==="
+          (cd btls-sys && cargo publish)
+          sleep 20
+
+          echo "===  Publishing btls... ==="
+          (cd btls && cargo publish)
+          sleep 20
+
+          echo "===  Publishing tokio-btls... ==="
+          (cd tokio-btls && cargo publish)
+          sleep 20
 
       - name: Upload binaries to GitHub Release
         uses: softprops/action-gh-release@v3
