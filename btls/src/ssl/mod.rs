@@ -2102,7 +2102,17 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_sigalgs_enabled(self.as_ptr(), enabled as _) }
     }
 
-    /// Sets whether the context should enable record size limit.
+    /// Sets the maximum protected-record plaintext this endpoint is willing to
+    /// receive, as defined by [RFC 8449].
+    ///
+    /// The default is zero, which disables the extension. Nonzero values below
+    /// 64 or above the protocol maximum are clamped when advertised. The peer's
+    /// advertised value limits records sent by this endpoint. Configure this
+    /// before creating connections; the value is fixed for each handshake.
+    /// This currently applies to stream TLS, not DTLS, QUIC, or split
+    /// handshakes.
+    ///
+    /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_record_size_limit)]
     pub fn set_record_size_limit(&mut self, limit: u16) {
