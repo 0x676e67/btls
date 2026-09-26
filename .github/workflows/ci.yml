@@ -505,7 +505,7 @@ jobs:
       - name: Install Rust (rustup)
         run: rustup update stable --no-self-update && rustup default stable
       - name: Install golang
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: btls-sys/deps/boringssl/go.mod
           cache-dependency-path: btls-sys/deps/boringssl/go.sum
@@ -630,7 +630,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install golang
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: btls-sys/deps/boringssl/go.mod
           cache-dependency-path: btls-sys/deps/boringssl/go.sum
