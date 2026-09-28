@@ -330,6 +330,49 @@ fn test_alpn_server_select_none() {
 }
 
 #[test]
+fn peer_application_settings() {
+    fn handshake(server_settings: Option<&'static [u8]>) -> Option<Vec<u8>> {
+        let mut server = Server::builder();
+        server.ctx().set_alpn_select_callback(|_, client| {
+            ssl::select_next_proto(b"\x02h2", client).ok_or(ssl::AlpnError::NOACK)
+        });
+        server.ssl_cb(move |ssl| {
+            if let Some(settings) = server_settings {
+                let ok = unsafe {
+                    ffi::SSL_add_application_settings(
+                        ssl.as_ptr(),
+                        b"h2".as_ptr(),
+                        2,
+                        settings.as_ptr(),
+                        settings.len(),
+                    )
+                };
+                assert_eq!(ok, 1);
+            }
+        });
+        server.io_cb(move |s| {
+            // The client sends an empty value.
+            let expected = server_settings.map(|_| &b""[..]);
+            assert_eq!(s.ssl().peer_application_settings(), expected);
+        });
+        let server = server.build();
+
+        let mut client = server.client().build().builder();
+        client.ssl().set_alpn_protos(b"\x02h2").unwrap();
+        client.ssl().add_application_settings(b"h2").unwrap();
+        let s = client.connect();
+        s.ssl().peer_application_settings().map(ToOwned::to_owned)
+    }
+
+    assert_eq!(
+        handshake(Some(b"\x00\x03\x00\x00\x00\x64")),
+        Some(b"\x00\x03\x00\x00\x00\x64".to_vec())
+    );
+    assert_eq!(handshake(Some(b"")), Some(Vec::new()));
+    assert_eq!(handshake(None), None);
+}
+
+#[test]
 fn test_empty_alpn() {
     assert_eq!(ssl::select_next_proto(b"", b""), None);
     assert_eq!(ssl::select_next_proto(b"", b"\x08http/1.1"), None);
