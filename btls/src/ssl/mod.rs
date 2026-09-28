@@ -4276,16 +4276,24 @@ impl SslRef {
         }
     }
 
-    /// Sets application settings flag for ALPS (Application-Layer Protocol Negotiation).
+    /// Enables ALPS (application-layer protocol settings) for the ALPN protocol `proto`, sending
+    /// `settings` to the peer, or an empty value if `None`.
+    ///
+    /// The peer's value is available with [`Self::peer_application_settings`].
     #[corresponds(SSL_add_application_settings)]
-    pub fn add_application_settings(&mut self, alps: &[u8]) -> Result<(), ErrorStack> {
+    pub fn add_application_settings(
+        &mut self,
+        proto: &[u8],
+        settings: Option<&[u8]>,
+    ) -> Result<(), ErrorStack> {
+        let settings = settings.unwrap_or_default();
         unsafe {
             cvt(ffi::SSL_add_application_settings(
                 self.as_ptr(),
-                alps.as_ptr(),
-                alps.len(),
-                std::ptr::null(),
-                0,
+                proto.as_ptr(),
+                proto.len(),
+                settings.as_ptr(),
+                settings.len(),
             ))
             .map(|_| ())
         }
