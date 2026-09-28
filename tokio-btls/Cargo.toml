@@ -31,7 +31,7 @@ prefix-symbols = ["btls/prefix-symbols"]
 
 [dependencies]
 btls = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 futures = { workspace = true }

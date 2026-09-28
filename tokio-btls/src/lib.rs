@@ -7,6 +7,11 @@
 //! This file reimplements tokio-btls with the [overhauled](https://github.com/sfackler/tokio-openssl/commit/56f6618ab619f3e431fa8feec2d20913bf1473aa)
 //! tokio-openssl interface while the tokio APIs from official [boring](https://github.com/cloudflare/boring) crate is not yet caught up
 //! to it.
+//!
+//! A client's certificate verification runs on Tokio's blocking thread pool, so that it does not
+//! hold up the runtime; see [`SslStream::new`]. The handshake also waits for the futures of
+//! btls's async callbacks, such as
+//! [`set_async_custom_verify_callback`](ssl::SslContextBuilder::set_async_custom_verify_callback).
 
 use std::{
     fmt, future,
@@ -17,7 +22,7 @@ use std::{
 
 use btls::{
     error::ErrorStack,
-    ssl::{self, ErrorCode, ShutdownResult, Ssl, SslRef, SslStream as SslStreamCore},
+    ssl::{self, ErrorCode, ShutdownResult, Ssl, SslRef, SslStream as SslStreamCore, VerifyJob},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -101,15 +106,46 @@ fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
     }
 }
 
+/// Runs a certificate verification on the blocking thread pool, or right away outside a runtime.
+fn spawn_verify(job: VerifyJob) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => drop(handle.spawn_blocking(job)),
+        Err(_) => job(),
+    }
+}
+
 /// An asynchronous version of [`btls::ssl::SslStream`].
 #[derive(Debug)]
-pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
+pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>, Verify);
+
+/// Where a client's certificate verification runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verify {
+    BlockingPool,
+    Inline,
+}
 
 impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     #[inline]
     /// Like [`SslStream::new`](ssl::SslStream::new).
+    ///
+    /// When the handshake starts as a client, the server's certificate chain is verified on
+    /// Tokio's blocking thread pool with [`SslRef::try_set_async_default_verify`], unless a
+    /// verify callback is configured by then. The result is that of BoringSSL's built-in
+    /// verification, which may block, e.g. to read certificates from disk.
     pub fn new(ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
-        SslStreamCore::new(ssl, StreamWrapper { stream, context: 0 }).map(SslStream)
+        Self::with_verify(ssl, stream, Verify::BlockingPool)
+    }
+
+    #[inline]
+    /// Like [`Self::new`], but keeps BoringSSL's built-in verification on the task's thread.
+    pub fn with_inline_verify(ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
+        Self::with_verify(ssl, stream, Verify::Inline)
+    }
+
+    fn with_verify(ssl: Ssl, stream: S, verify: Verify) -> Result<Self, ErrorStack> {
+        let stream = StreamWrapper { stream, context: 0 };
+        SslStreamCore::new(ssl, stream).map(|s| SslStream(s, verify))
     }
 
     #[inline]
@@ -118,7 +154,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.connect()))
+        self.with_handshake_context(cx, Verify::BlockingPool, |s| s.connect())
     }
 
     #[inline]
@@ -130,7 +166,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     #[inline]
     /// Like [`SslStream::accept`](ssl::SslStream::accept).
     pub fn poll_accept(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.accept()))
+        self.with_handshake_context(cx, Verify::Inline, |s| s.accept())
     }
 
     #[inline]
@@ -145,13 +181,47 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.do_handshake()))
+        self.with_handshake_context(cx, Verify::BlockingPool, |s| s.do_handshake())
     }
 
     #[inline]
     /// A convenience method wrapping [`poll_do_handshake`](Self::poll_do_handshake).
     pub async fn do_handshake(mut self: Pin<&mut Self>) -> Result<(), ssl::Error> {
         future::poll_fn(|cx| self.as_mut().poll_do_handshake(cx)).await
+    }
+
+    /// Drives the handshake with `f`, with the task's waker as the `Ssl`'s task waker, so that
+    /// the future of an async callback wakes the task once the handshake can continue.
+    ///
+    /// `verify` is where `f` may verify a client's certificates: `accept` sets the role of the
+    /// `Ssl` only once it runs, so it cannot tell yet.
+    fn with_handshake_context<F>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        verify: Verify,
+        f: F,
+    ) -> Poll<Result<(), ssl::Error>>
+    where
+        F: FnOnce(&mut SslStreamCore<StreamWrapper<S>>) -> Result<(), ssl::Error>,
+    {
+        let blocking_pool = self.1 == Verify::BlockingPool && verify == Verify::BlockingPool;
+        let waker = cx.waker().clone();
+        self.with_context(cx, |s| {
+            if blocking_pool {
+                // Does nothing once set, or for a server.
+                s.ssl_mut().try_set_async_default_verify(spawn_verify);
+            }
+            s.ssl_mut().set_task_waker(Some(waker));
+            let result = f(s);
+            let pending = s.ssl_mut().has_pending_async_callback();
+            s.ssl_mut().set_task_waker(None);
+            match result {
+                // Only a pending future wakes the task: an error from a synchronous callback
+                // asking to retry is returned.
+                Err(e) if pending && e.would_block() => Poll::Pending,
+                result => cvt_ossl(result),
+            }
+        })
     }
 }
 
@@ -243,5 +313,41 @@ where
         }
 
         self.get_pin_mut().poll_shutdown(ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btls::ssl::{SslConnector, SslMethod};
+
+    /// Starts a client handshake and returns whether the async verification could still be set,
+    /// i.e. whether the stream left it alone.
+    async fn left_alone(inline_verify: bool) -> bool {
+        let ssl = SslConnector::builder(SslMethod::tls())
+            .unwrap()
+            .build()
+            .configure()
+            .unwrap()
+            .into_ssl("localhost")
+            .unwrap();
+        let (stream, _peer) = tokio::io::duplex(1 << 16);
+        let mut stream = if inline_verify {
+            SslStream::with_inline_verify(ssl, stream).unwrap()
+        } else {
+            SslStream::new(ssl, stream).unwrap()
+        };
+        future::poll_fn(|cx| {
+            assert!(Pin::new(&mut stream).poll_connect(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        stream.0.ssl_mut().try_set_async_default_verify(drop)
+    }
+
+    #[tokio::test]
+    async fn client_verifies_on_blocking_pool() {
+        assert!(!left_alone(false).await);
+        assert!(left_alone(true).await);
     }
 }
