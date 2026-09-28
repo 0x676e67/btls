@@ -3629,7 +3629,6 @@ impl SslRef {
     ///
     /// The value may be empty. It is available once the handshake has negotiated ALPS.
     #[corresponds(SSL_get0_peer_application_settings)]
-    #[must_use]
     pub fn peer_application_settings(&self) -> Option<&[u8]> {
         unsafe {
             if ffi::SSL_has_application_settings(self.as_ptr()) == 0 {
