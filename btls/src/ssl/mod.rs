@@ -623,6 +623,7 @@ impl ExtensionType {
     pub const CHANNEL_ID: Self = Self(ffi::TLSEXT_TYPE_channel_id as u16);
     #[cfg(not(feature = "fips"))]
     pub const RECORD_SIZE_LIMIT: Self = Self(ffi::TLSEXT_TYPE_record_size_limit as u16);
+    pub const SERVER_PADDING: Self = Self(ffi::TLSEXT_TYPE_server_padding as u16);
 }
 
 impl From<u16> for ExtensionType {
@@ -4282,6 +4283,29 @@ impl SslRef {
     pub fn set_aes_hw_override(&mut self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
         unsafe { ffi::SSL_set_aes_hw_override(self.as_ptr(), enable) }
+    }
+
+    /// Requests `num_bytes` of padding from the server in its EncryptedExtensions.
+    ///
+    /// Servers answer only over TLS 1.3, and not for more than 16 KiB. The extension is
+    /// experimental in BoringSSL.
+    #[corresponds(SSL_set_server_padding_request)]
+    pub fn set_server_padding_request(&mut self, num_bytes: u16) {
+        unsafe { ffi::SSL_set_server_padding_request(self.as_ptr(), num_bytes) }
+    }
+
+    /// Sets whether a server answers the client's server padding request.
+    #[corresponds(SSL_set_server_padding_enabled)]
+    pub fn set_server_padding_enabled(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_set_server_padding_enabled(self.as_ptr(), enabled as _) }
+    }
+
+    /// Returns whether the server sent the padding requested with
+    /// [`set_server_padding_request`](Self::set_server_padding_request).
+    #[corresponds(SSL_server_sent_requested_padding)]
+    #[must_use]
+    pub fn server_sent_requested_padding(&self) -> bool {
+        unsafe { ffi::SSL_server_sent_requested_padding(self.as_ptr()) == 1 }
     }
 }
 
