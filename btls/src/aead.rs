@@ -16,6 +16,9 @@
 //!   scatter/gather operations for protocols that split ciphertext output across
 //!   multiple buffers.
 //!
+//! - [`StatelessAeadCtx`] — a context limited to the generic AEADs, which seals
+//!   and opens through `&self` and can be shared between threads.
+//!
 //! # When to use [`crate::symm`] instead
 //!
 //! If you want one-shot helpers that allocate output buffers or APIs centered
@@ -38,12 +41,15 @@
 //!
 //! # Mutability
 //!
-//! All seal and open methods require `&mut self`. While the generic AEADs
-//! (AES-GCM, ChaCha20-Poly1305, etc.) are stateless after initialization,
-//! the TLS-specific AEADs are **stateful** and internally mutate the context
-//! during seal operations. Using `&mut self` universally prevents LLVM from
-//! incorrectly optimizing away state changes — an issue that has caused
-//! real-world cryptographic failures (see [quiche#2383]).
+//! All seal and open methods of [`AeadCtx`] require `&mut self`. While the
+//! generic AEADs (AES-GCM, ChaCha20-Poly1305, etc.) are stateless after
+//! initialization, the TLS-specific AEADs are **stateful** and internally
+//! mutate the context during seal operations. Using `&mut self` universally
+//! prevents LLVM from incorrectly optimizing away state changes — an issue
+//! that has caused real-world cryptographic failures (see [quiche#2383]).
+//!
+//! [`StatelessAeadCtx`] only accepts the generic AEADs, which never write to
+//! the context, so it takes `&self`.
 //!
 //! [quiche#2383]: https://github.com/cloudflare/quiche/pull/2383
 //!
@@ -374,8 +380,7 @@ impl AeadCtxRef {
         extra_in: Option<&[u8]>,
         associated_data: &[u8],
     ) -> Result<&'a mut [u8], ErrorStack> {
-        #[allow(deprecated)]
-        self.seal_scatter(nonce, in_out, out_tag, extra_in, associated_data)
+        self.raw_seal_scatter(nonce, in_out, out_tag, extra_in, associated_data)
     }
 
     #[doc(hidden)]
@@ -383,6 +388,18 @@ impl AeadCtxRef {
         note = "Non-thread-safe when used with TLS due to interior mutability in BoringSSL. Use `seal_scatter_mut` instead."
     )]
     pub fn seal_scatter<'a>(
+        &self,
+        nonce: &[u8],
+        in_out: &mut [u8],
+        out_tag: &'a mut [u8],
+        extra_in: Option<&[u8]>,
+        associated_data: &[u8],
+    ) -> Result<&'a mut [u8], ErrorStack> {
+        self.raw_seal_scatter(nonce, in_out, out_tag, extra_in, associated_data)
+    }
+
+    /// Seals through `&self`, which is only sound for stateless AEADs or with exclusive access.
+    fn raw_seal_scatter<'a>(
         &self,
         nonce: &[u8],
         in_out: &mut [u8],
@@ -439,8 +456,7 @@ impl AeadCtxRef {
         in_tag: &[u8],
         associated_data: &[u8],
     ) -> Result<(), ErrorStack> {
-        #[allow(deprecated)]
-        self.open_gather(nonce, in_out, in_tag, associated_data)
+        self.raw_open_gather(nonce, in_out, in_tag, associated_data)
     }
 
     #[doc(hidden)]
@@ -448,6 +464,17 @@ impl AeadCtxRef {
         note = "Non-thread-safe when used with TLS due to interior mutability in BoringSSL. Use `open_gather_mut` instead."
     )]
     pub fn open_gather(
+        &self,
+        nonce: &[u8],
+        in_out: &mut [u8],
+        in_tag: &[u8],
+        associated_data: &[u8],
+    ) -> Result<(), ErrorStack> {
+        self.raw_open_gather(nonce, in_out, in_tag, associated_data)
+    }
+
+    /// Opens through `&self`, which is only sound for stateless AEADs or with exclusive access.
+    fn raw_open_gather(
         &self,
         nonce: &[u8],
         in_out: &mut [u8],
@@ -509,8 +536,7 @@ impl AeadCtxRef {
         tag: &'a mut [u8],
         associated_data: &[u8],
     ) -> Result<&'a mut [u8], ErrorStack> {
-        #[allow(deprecated)]
-        self.seal_scatter(nonce, buffer, tag, None, associated_data)
+        self.raw_seal_scatter(nonce, buffer, tag, None, associated_data)
     }
 
     /// Decrypts `buffer` in place, verifying the authentication `tag` and
@@ -547,8 +573,7 @@ impl AeadCtxRef {
         tag: &[u8],
         associated_data: &[u8],
     ) -> Result<(), ErrorStack> {
-        #[allow(deprecated)]
-        self.open_gather(nonce, buffer, tag, associated_data)
+        self.raw_open_gather(nonce, buffer, tag, associated_data)
     }
 }
 
@@ -560,11 +585,12 @@ impl AeadCtxRef {
 pub struct StatelessAeadCtx(AeadCtx);
 
 impl StatelessAeadCtx {
-    /// Creates a context for AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 or
-    /// XChaCha20-Poly1305. Other algorithms, such as the stateful TLS-specific ones, are
-    /// rejected.
+    /// Creates a context for one of the stateless members of the crate's [`Algorithm`] set:
+    /// AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 or XChaCha20-Poly1305. Other algorithms,
+    /// such as the stateful TLS-specific ones, are rejected.
     ///
     /// `tag_len` controls the default tag length used by the context.
+    #[corresponds(EVP_AEAD_CTX_new)]
     pub fn new(algorithm: &Algorithm, key: &[u8], tag_len: usize) -> Result<Self, ErrorStack> {
         let stateless = [
             Algorithm::aes_128_gcm(),
@@ -595,8 +621,8 @@ impl StatelessAeadCtx {
         associated_data: &[u8],
     ) -> Result<&'a mut [u8], ErrorStack> {
         // The algorithm keeps no state, so the context is never written to.
-        #[allow(deprecated)]
-        self.0.seal_in_place(nonce, buffer, tag, associated_data)
+        self.0
+            .raw_seal_scatter(nonce, buffer, tag, None, associated_data)
     }
 
     /// Like [`AeadCtxRef::open_in_place_mut`], through a shared reference.
@@ -609,8 +635,7 @@ impl StatelessAeadCtx {
         associated_data: &[u8],
     ) -> Result<(), ErrorStack> {
         // The algorithm keeps no state, so the context is never written to.
-        #[allow(deprecated)]
-        self.0.open_in_place(nonce, buffer, tag, associated_data)
+        self.0.raw_open_gather(nonce, buffer, tag, associated_data)
     }
 }
 
