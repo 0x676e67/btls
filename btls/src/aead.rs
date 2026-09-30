@@ -552,9 +552,104 @@ impl AeadCtxRef {
     }
 }
 
+/// An AEAD context for an algorithm that keeps no state between operations, so it seals and
+/// opens through `&self` and can be shared between threads.
+///
+/// BoringSSL allows concurrent seal and open calls on one context of a generic AEAD, but not
+/// of the TLS-specific ones, which is why [`AeadCtx`] requires `&mut self`.
+pub struct StatelessAeadCtx(AeadCtx);
+
+impl StatelessAeadCtx {
+    /// Creates a context for AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 or
+    /// XChaCha20-Poly1305. Other algorithms, such as the stateful TLS-specific ones, are
+    /// rejected.
+    ///
+    /// `tag_len` controls the default tag length used by the context.
+    pub fn new(algorithm: &Algorithm, key: &[u8], tag_len: usize) -> Result<Self, ErrorStack> {
+        let stateless = [
+            Algorithm::aes_128_gcm(),
+            Algorithm::aes_256_gcm(),
+            Algorithm::chacha20_poly1305(),
+            Algorithm::xchacha20_poly1305(),
+        ];
+        if !stateless.contains(algorithm) {
+            return Err(ErrorStack::internal_error_str(
+                "AEAD keeps state between operations",
+            ));
+        }
+        AeadCtx::new(algorithm, key, tag_len).map(Self)
+    }
+
+    /// Like [`Self::new`], with the algorithm's full tag length.
+    pub fn new_default_tag(algorithm: &Algorithm, key: &[u8]) -> Result<Self, ErrorStack> {
+        Self::new(algorithm, key, ffi::EVP_AEAD_DEFAULT_TAG_LENGTH as usize)
+    }
+
+    /// Like [`AeadCtxRef::seal_in_place_mut`], through a shared reference.
+    #[corresponds(EVP_AEAD_CTX_seal_scatter)]
+    pub fn seal_in_place<'a>(
+        &self,
+        nonce: &[u8],
+        buffer: &mut [u8],
+        tag: &'a mut [u8],
+        associated_data: &[u8],
+    ) -> Result<&'a mut [u8], ErrorStack> {
+        // The algorithm keeps no state, so the context is never written to.
+        #[allow(deprecated)]
+        self.0.seal_in_place(nonce, buffer, tag, associated_data)
+    }
+
+    /// Like [`AeadCtxRef::open_in_place_mut`], through a shared reference.
+    #[corresponds(EVP_AEAD_CTX_open_gather)]
+    pub fn open_in_place(
+        &self,
+        nonce: &[u8],
+        buffer: &mut [u8],
+        tag: &[u8],
+        associated_data: &[u8],
+    ) -> Result<(), ErrorStack> {
+        // The algorithm keeps no state, so the context is never written to.
+        #[allow(deprecated)]
+        self.0.open_in_place(nonce, buffer, tag, associated_data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AeadCtx, Algorithm};
+    use super::{AeadCtx, Algorithm, StatelessAeadCtx};
+
+    #[test]
+    fn stateless_ctx() {
+        let algorithm = Algorithm::aes_128_gcm();
+        let key = [7; 16];
+        let nonce = [0; 12];
+        let mut expected = *b"hello";
+        let mut expected_tag = [0; 16];
+        AeadCtx::new_default_tag(&algorithm, &key)
+            .unwrap()
+            .seal_in_place_mut(&nonce, &mut expected, &mut expected_tag, b"ad")
+            .unwrap();
+
+        // Threads seal with one shared context, as they would with a mutable one.
+        let ctx = StatelessAeadCtx::new_default_tag(&algorithm, &key).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let mut buffer = *b"hello";
+                    let mut tag = [0; 16];
+                    ctx.seal_in_place(&nonce, &mut buffer, &mut tag, b"ad")
+                        .unwrap();
+                    assert_eq!((buffer, tag), (expected, expected_tag));
+                });
+            }
+        });
+        ctx.open_in_place(&nonce, &mut expected, &expected_tag, b"ad")
+            .unwrap();
+        assert_eq!(&expected, b"hello");
+
+        let tls13 = Algorithm::aes_128_gcm_tls13();
+        assert!(StatelessAeadCtx::new_default_tag(&tls13, &key).is_err());
+    }
 
     #[test]
     fn in_out() {
