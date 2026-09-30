@@ -107,6 +107,7 @@ pub use self::async_callbacks::{
     BoxCustomVerifyFuture, BoxGetSessionFinish, BoxGetSessionFuture, BoxPrivateKeyMethodFinish,
     BoxPrivateKeyMethodFuture, BoxSelectCertFinish, BoxSelectCertFuture, ExDataFuture,
 };
+pub use self::async_verify::VerifyJob;
 pub use self::connector::{
     ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
 };
@@ -116,6 +117,7 @@ pub use self::ech::SslEchKeysRef;
 pub use self::error::{Error, ErrorCode, HandshakeError};
 
 mod async_callbacks;
+mod async_verify;
 mod bio;
 mod callbacks;
 mod connector;
@@ -1114,6 +1116,7 @@ impl SslContextBuilder {
         // is what you need to register a new callback.
         // See the NOTE in `ssl_raw_verify` for confirmation.
         self.replace_ex_data(SslContext::cached_ex_index::<F>(), callback);
+        async_verify::record_ctx_cert_verify(self);
         unsafe {
             ffi::SSL_CTX_set_cert_verify_callback(
                 self.as_ptr(),
@@ -1185,6 +1188,7 @@ impl SslContextBuilder {
     where
         F: Fn(&mut SslRef) -> Result<(), SslVerifyError> + 'static + Sync + Send,
     {
+        async_verify::record_ctx_custom_verify(self);
         unsafe {
             self.replace_ex_data(SslContext::cached_ex_index::<F>(), callback);
             ffi::SSL_CTX_set_custom_verify(
@@ -1298,12 +1302,15 @@ impl SslContextBuilder {
     pub fn set_verify_cert_store(&mut self, cert_store: X509Store) -> Result<(), ErrorStack> {
         self.ctx.check_x509();
 
+        let store = cert_store.clone();
         unsafe {
             cvt(ffi::SSL_CTX_set0_verify_cert_store(
                 self.as_ptr(),
                 cert_store.into_ptr(),
-            ))
+            ))?;
         }
+        async_verify::record_ctx_verify_store(self, store);
+        Ok(())
     }
 
     /// Replaces the context's certificate store, and keeps it immutable.
@@ -3287,12 +3294,15 @@ impl SslRef {
     pub fn set_verify_cert_store(&mut self, cert_store: X509Store) -> Result<(), ErrorStack> {
         self.ssl_context().check_x509();
 
+        let store = cert_store.clone();
         unsafe {
             cvt(ffi::SSL_set0_verify_cert_store(
                 self.as_ptr(),
                 cert_store.into_ptr(),
-            ))
+            ))?;
         }
+        async_verify::record_ssl_verify_store(self, store);
+        Ok(())
     }
 
     /// Like [`SslContextBuilder::set_custom_verify_callback`].
@@ -3307,6 +3317,7 @@ impl SslRef {
     {
         self.ssl_context().check_x509();
 
+        async_verify::record_ssl_custom_verify(self);
         unsafe {
             // this needs to be in an Arc since the callback can register a new callback!
             self.replace_ex_data(Ssl::cached_ex_index(), Arc::new(callback));
@@ -3755,7 +3766,12 @@ impl SslRef {
             "X.509 certificate support in old and new contexts doesn't match",
         );
 
-        unsafe { cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr())).map(|_| ()) }
+        let switch = async_verify::context_switch(self, ctx);
+        unsafe { cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr()))? };
+        if let Some(had_custom_verify) = switch {
+            async_verify::record_context_switch(self, had_custom_verify);
+        }
+        Ok(())
     }
 
     /// Returns the context corresponding to the current connection.
@@ -3786,7 +3802,10 @@ impl SslRef {
     pub fn verify_result(&self) -> X509VerifyResult {
         self.ssl_context().check_x509();
 
-        unsafe { X509VerifyError::from_raw(ffi::SSL_get_verify_result(self.as_ptr()) as c_int) }
+        let result = unsafe {
+            X509VerifyError::from_raw(ffi::SSL_get_verify_result(self.as_ptr()) as c_int)
+        };
+        async_verify::verify_error(self, result)
     }
 
     /// Returns a shared reference to the SSL session.

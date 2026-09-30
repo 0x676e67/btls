@@ -1,6 +1,10 @@
-use std::{net::ToSocketAddrs, pin::Pin};
+use std::{net::ToSocketAddrs, pin::Pin, time::Duration};
 
-use btls::ssl::{Ssl, SslAcceptor, SslConnector, SslFiletype, SslMethod};
+use btls::ssl::{
+    BoxCustomVerifyFinish, ErrorCode, Ssl, SslAcceptor, SslConnector, SslConnectorBuilder,
+    SslFiletype, SslMethod, SslVerifyError, SslVerifyMode,
+};
+use btls::x509::{X509VerifyError, X509VerifyResult};
 use futures::future;
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -92,4 +96,96 @@ async fn server() {
     };
 
     future::join(server, client).await;
+}
+
+/// The error codes and the client's verify result of a handshake with `tests/cert.pem`.
+async fn handshake(
+    inline_verify: bool,
+    client: impl FnOnce(&mut SslConnectorBuilder),
+) -> (
+    Result<(), ErrorCode>,
+    X509VerifyResult,
+    Result<(), ErrorCode>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = async move {
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor
+            .set_private_key_file("tests/key.pem", SslFiletype::PEM)
+            .unwrap();
+        acceptor
+            .set_certificate_chain_file("tests/cert.pem")
+            .unwrap();
+        let ssl = Ssl::new(acceptor.build().context()).unwrap();
+        let stream = listener.accept().await.unwrap().0;
+        let mut stream = SslStream::new(ssl, stream).unwrap();
+        Pin::new(&mut stream).accept().await.map_err(|e| e.code())
+    };
+
+    let client = async {
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        client(&mut connector);
+        let ssl = connector
+            .build()
+            .configure()
+            .unwrap()
+            .into_ssl("localhost")
+            .unwrap();
+        let stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = if inline_verify {
+            SslStream::with_inline_verify(ssl, stream).unwrap()
+        } else {
+            SslStream::new(ssl, stream).unwrap()
+        };
+        let result = Pin::new(&mut stream).connect().await;
+        (result.map_err(|e| e.code()), stream.ssl().verify_result())
+    };
+
+    let (server, (client, verify_result)) = future::join(server, client).await;
+    (client, verify_result, server)
+}
+
+async fn verification_matches_inline() {
+    let trusted = |c: &mut SslConnectorBuilder| c.set_ca_file("tests/cert.pem").unwrap();
+    let ok = handshake(false, trusted).await;
+    assert_eq!(ok, (Ok(()), Ok(()), Ok(())));
+    assert_eq!(handshake(true, trusted).await, ok);
+
+    let failed = handshake(false, |_| {}).await;
+    assert_eq!(failed.1, Err(X509VerifyError::DEPTH_ZERO_SELF_SIGNED_CERT));
+    assert_eq!(failed.0, Err(ErrorCode::SSL));
+    assert_eq!(handshake(true, |_| {}).await, failed);
+}
+
+#[tokio::test]
+async fn verification_on_current_thread_runtime() {
+    verification_matches_inline().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verification_on_multi_thread_runtime() {
+    verification_matches_inline().await;
+}
+
+#[tokio::test]
+async fn handshake_waits_for_async_callbacks() {
+    let result = handshake(false, |c| {
+        c.set_async_custom_verify_callback(SslVerifyMode::PEER, |_| {
+            Ok(Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(Box::new(|_: &mut _| Ok(())) as BoxCustomVerifyFinish)
+            }))
+        });
+    })
+    .await;
+    assert_eq!(result.0, Ok(()));
+
+    // Nothing would wake the task for a synchronous callback asking to retry.
+    let retry = handshake(false, |c| {
+        c.set_custom_verify_callback(SslVerifyMode::PEER, |_| Err(SslVerifyError::Retry));
+    });
+    let retry = tokio::time::timeout(Duration::from_secs(10), retry).await;
+    assert_eq!(retry.unwrap().0, Err(ErrorCode::WANT_CERTIFICATE_VERIFY));
 }

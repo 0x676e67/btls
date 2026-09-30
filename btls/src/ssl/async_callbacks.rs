@@ -205,6 +205,25 @@ impl SslRef {
     pub fn set_task_waker(&mut self, waker: Option<Waker>) {
         self.replace_ex_data(*TASK_WAKER_INDEX, waker);
     }
+
+    /// Returns whether an async callback of this `Ssl` waits for its future.
+    ///
+    /// The handshake then stops with an error such as [`ErrorCode::WANT_CERTIFICATE_VERIFY`],
+    /// and the task waker is woken once it can continue. Without a pending future, such an error
+    /// came from a synchronous callback, which nothing will wake.
+    ///
+    /// [`ErrorCode::WANT_CERTIFICATE_VERIFY`]: super::ErrorCode::WANT_CERTIFICATE_VERIFY
+    pub fn has_pending_async_callback(&mut self) -> bool {
+        fn pending<T>(ssl: &mut SslRef, index: Index<Ssl, MutOnly<Option<T>>>) -> bool {
+            ssl.ex_data_mut(index)
+                .is_some_and(|future| future.get_mut().is_some())
+        }
+
+        pending(self, *SELECT_CERT_FUTURE_INDEX)
+            || pending(self, *SELECT_PRIVATE_KEY_METHOD_FUTURE_INDEX)
+            || pending(self, *SELECT_GET_SESSION_FUTURE_INDEX)
+            || pending(self, *SELECT_CUSTOM_VERIFY_FUTURE_INDEX)
+    }
 }
 
 fn async_custom_verify_callback<F>(
@@ -357,7 +376,7 @@ fn with_private_key_method(
 ///
 /// This function won't even bother storing the future in `index` if the future
 /// created by `create_fut` returns `Poll::Ready(_)` on the first poll call.
-fn with_ex_data_future<H, R, T, E>(
+pub(super) fn with_ex_data_future<H, R, T, E>(
     ssl_handle: &mut H,
     index: Index<Ssl, MutOnly<Option<ExDataFuture<R>>>>,
     get_ssl_mut: impl Fn(&mut H) -> &mut SslRef,
