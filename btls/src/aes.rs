@@ -40,11 +40,19 @@
 use crate::ffi;
 use libc::c_int;
 use openssl_macros::corresponds;
-use std::{mem, ptr};
+use std::{fmt, mem, ptr};
 
 /// Provides Error handling for parsing keys.
 #[derive(Debug)]
 pub struct KeyError(());
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid AES key or key wrap input")
+    }
+}
+
+impl std::error::Error for KeyError {}
 
 /// The key used to encrypt or decrypt cipher blocks. Its key schedule is zeroed on drop.
 pub struct AesKey(ffi::AES_KEY);
