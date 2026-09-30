@@ -233,6 +233,31 @@ fn msvc_lib_subdir(config: &Config) -> Option<&'static str> {
     }
 }
 
+/// Returns `-ffile-prefix-map` flags that remove `OUT_DIR`, which holds the
+/// BoringSSL sources and build tree, from `__FILE__` strings and debug info.
+fn file_prefix_map_flags(config: &Config) -> Vec<String> {
+    if config.target_env == "msvc" {
+        return Vec::new();
+    }
+    let mut dirs = vec![config.out_dir.clone()];
+    dirs.extend(
+        fs::canonicalize(&config.out_dir)
+            .ok()
+            .filter(|d| *d != config.out_dir),
+    );
+    let mut probe = cc::Build::new();
+    probe.cargo_metadata(false);
+    dirs.iter()
+        .filter_map(|dir| dir.to_str())
+        .filter(|dir| {
+            dir.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c))
+        })
+        .map(|dir| format!("-ffile-prefix-map={dir}=."))
+        .filter(|flag| probe.is_flag_supported(flag).unwrap_or(false))
+        .collect()
+}
+
 /// Returns a new `cmake::Config` for building BoringSSL.
 ///
 /// It will add platform-specific parameters if needed.
@@ -246,6 +271,11 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
 
     if config.features.prefix_symbols {
         boringssl_cmake.define("BORINGSSL_PREFIX", PREFIX.as_str());
+    }
+
+    let prefix_map = file_prefix_map_flags(config);
+    for flag in &prefix_map {
+        boringssl_cmake.cflag(flag).cxxflag(flag).asmflag(flag);
     }
 
     if config.env.cmake_toolchain_file.is_some() {
@@ -343,7 +373,11 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
             };
 
             let cflag = format!("{bitcode_cflag} {target_cflag}");
-            boringssl_cmake.define("CMAKE_ASM_FLAGS", &cflag);
+            // Defining CMAKE_ASM_FLAGS makes cmake-rs drop `asmflag`s.
+            boringssl_cmake.define(
+                "CMAKE_ASM_FLAGS",
+                format!("{cflag} {}", prefix_map.join(" ")),
+            );
             boringssl_cmake.cflag(&cflag);
         }
 
