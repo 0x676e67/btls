@@ -11,6 +11,7 @@
 use std::{
     fmt, future,
     io::{self, Read, Write},
+    mem,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -21,9 +22,19 @@ use btls::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// Capacity of the ciphertext read buffer, enough for one maximum-size TLS record.
+///
+/// BoringSSL reads a record header and body with separate exact-size BIO reads. Filling this
+/// buffer instead takes one socket read per burst of records, and the resulting short read lets
+/// tokio clear readiness rather than issue a final read that ends in `WouldBlock`.
+const READ_BUF_CAPACITY: usize = 17 * 1024;
+
 struct StreamWrapper<S> {
     stream: S,
     context: usize,
+    // Ciphertext read ahead of BoringSSL; `read_buf[read_pos..]` has not been consumed yet.
+    read_buf: Vec<u8>,
+    read_pos: usize,
 }
 
 impl<S> fmt::Debug for StreamWrapper<S>
@@ -46,6 +57,47 @@ impl<S> StreamWrapper<S> {
         let context = &mut *(self.context as *mut _);
         (stream, context)
     }
+
+    fn new(stream: S) -> Self {
+        StreamWrapper {
+            stream,
+            context: 0,
+            read_buf: Vec::new(),
+            read_pos: 0,
+        }
+    }
+}
+
+impl<S> StreamWrapper<S>
+where
+    S: AsyncRead,
+{
+    /// Refills the drained read buffer with a single read of the underlying stream.
+    ///
+    /// The buffer is released when the stream has nothing to read or reaches EOF, so idle and
+    /// finished connections do not hold it. `WouldBlock` is returned only in the first case, with
+    /// the waker registered on the stream.
+    fn fill_read_buf(&mut self) -> io::Result<()> {
+        let mut read_buf = mem::take(&mut self.read_buf);
+        read_buf.clear();
+        read_buf.reserve(READ_BUF_CAPACITY);
+        self.read_pos = 0;
+
+        let (stream, cx) = unsafe { self.parts() };
+        let mut buf = ReadBuf::uninit(read_buf.spare_capacity_mut());
+        match stream.poll_read(cx, &mut buf)? {
+            Poll::Ready(()) => {
+                let filled = buf.filled().len();
+                if filled > 0 {
+                    // SAFETY: `ReadBuf` guarantees its first `filled` bytes are initialized.
+                    unsafe { read_buf.set_len(filled) };
+                    self.read_buf = read_buf;
+                }
+                Ok(())
+            }
+            Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        }
+    }
 }
 
 impl<S> Read for StreamWrapper<S>
@@ -53,12 +105,15 @@ where
     S: AsyncRead,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let (stream, cx) = unsafe { self.parts() };
-        let mut buf = ReadBuf::new(buf);
-        match stream.poll_read(cx, &mut buf)? {
-            Poll::Ready(()) => Ok(buf.filled().len()),
-            Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        if self.read_pos == self.read_buf.len() {
+            self.fill_read_buf()?;
         }
+
+        let buffered = &self.read_buf[self.read_pos..];
+        let n = buffered.len().min(buf.len());
+        buf[..n].copy_from_slice(&buffered[..n]);
+        self.read_pos += n;
+        Ok(n)
     }
 }
 
@@ -109,7 +164,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     #[inline]
     /// Like [`SslStream::new`](ssl::SslStream::new).
     pub fn new(ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
-        SslStreamCore::new(ssl, StreamWrapper { stream, context: 0 }).map(SslStream)
+        SslStreamCore::new(ssl, StreamWrapper::new(stream)).map(SslStream)
     }
 
     #[inline]
@@ -164,18 +219,26 @@ impl<S> SslStream<S> {
 
     #[inline]
     /// Returns a shared reference to the underlying stream.
+    ///
+    /// Its readiness (for example `readable()`) does not reflect ciphertext that has already been
+    /// buffered.
     pub fn get_ref(&self) -> &S {
         &self.0.get_ref().stream
     }
 
     #[inline]
     /// Returns a mutable reference to the underlying stream.
+    ///
+    /// Reading from it directly skips ciphertext that has already been buffered, and its readiness
+    /// (for example `readable()`) does not reflect that ciphertext.
     pub fn get_mut(&mut self) -> &mut S {
         &mut self.0.get_mut().stream
     }
 
     #[inline]
     /// Returns a pinned mutable reference to the underlying stream.
+    ///
+    /// The same buffering caveats as [`get_mut`](Self::get_mut) apply.
     pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut S> {
         unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0.get_mut().stream) }
     }
