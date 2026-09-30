@@ -98,7 +98,7 @@ async fn server() {
 async fn buffered_reads_preserve_record_boundaries() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    // Small records share one socket read; large ones span several buffer refills.
+    // Exercise varied write sizes, including writes larger than one TLS record.
     let records: Vec<Vec<u8>> = [1, 5, 300, 16 * 1024, 40 * 1024, 7]
         .iter()
         .enumerate()

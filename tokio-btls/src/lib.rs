@@ -22,11 +22,12 @@ use btls::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Capacity of the ciphertext read buffer, enough for one maximum-size TLS record.
+/// Capacity of the ciphertext read buffer, large enough for one TLS record
+/// supported by BoringSSL.
 ///
-/// BoringSSL reads a record header and body with separate exact-size BIO reads. Filling this
-/// buffer instead takes one socket read per burst of records, and the resulting short read lets
-/// tokio clear readiness rather than issue a final read that ends in `WouldBlock`.
+/// BoringSSL may request record headers and bodies in separate BIO reads.
+/// Buffering lets these reads share data from one underlying read.
+/// Larger bursts may require multiple refills.
 const READ_BUF_CAPACITY: usize = 17 * 1024;
 
 struct StreamWrapper<S> {
@@ -73,7 +74,8 @@ where
 {
     /// Fills the empty read buffer with a single read of the underlying stream.
     ///
-    /// Returns `WouldBlock` when the stream has nothing to read, with the waker registered on it.
+    /// Maps the underlying stream's `Poll::Pending` to `WouldBlock`.
+    /// The underlying `AsyncRead` implementation registers the waker.
     fn fill_read_buf(&mut self) -> io::Result<()> {
         let mut read_buf = mem::take(&mut self.read_buf);
         read_buf.reserve(READ_BUF_CAPACITY);
