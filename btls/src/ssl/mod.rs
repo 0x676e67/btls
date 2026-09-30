@@ -112,8 +112,10 @@ pub use self::connector::{
 };
 #[cfg(feature = "credential")]
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
+pub use self::early_data::EarlyDataReason;
 pub use self::ech::SslEchKeysRef;
 pub use self::error::{Error, ErrorCode, HandshakeError};
+pub use self::quic::{QuicEncryptionLevel, QuicMethod, QuicMethodError};
 
 mod async_callbacks;
 mod bio;
@@ -121,9 +123,11 @@ mod callbacks;
 mod connector;
 #[cfg(feature = "credential")]
 mod credential;
+mod early_data;
 mod ech;
 mod error;
 mod mut_only;
+mod quic;
 #[cfg(test)]
 mod test;
 
@@ -550,6 +554,12 @@ impl SslAlert {
     pub const UNKNOWN_PSK_IDENTITY: Self = Self(ffi::SSL_AD_UNKNOWN_PSK_IDENTITY);
     pub const CERTIFICATE_REQUIRED: Self = Self(ffi::SSL_AD_CERTIFICATE_REQUIRED);
     pub const NO_APPLICATION_PROTOCOL: Self = Self(ffi::SSL_AD_NO_APPLICATION_PROTOCOL);
+
+    /// Returns the alert's description code.
+    #[must_use]
+    pub fn as_raw(&self) -> c_int {
+        self.0
+    }
 }
 
 /// An error returned from an ALPN selection callback.
@@ -1131,6 +1141,13 @@ impl SslContextBuilder {
         unsafe {
             ffi::SSL_CTX_set_verify(self.as_ptr(), c_int::from(mode.bits()), None);
         }
+    }
+
+    /// Returns the verify mode set by [`Self::set_verify`] or one of the verify callbacks.
+    #[corresponds(SSL_CTX_get_verify_mode)]
+    #[must_use]
+    pub fn verify_mode(&self) -> SslVerifyMode {
+        self.ctx.verify_mode()
     }
 
     /// Configures the certificate verification method for new connections and
