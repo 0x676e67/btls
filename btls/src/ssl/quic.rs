@@ -31,8 +31,9 @@ pub struct QuicMethodError;
 /// The QUIC hooks of a context (`SSL_QUIC_METHOD`), see [`SslContextBuilder::set_quic_method`].
 ///
 /// BoringSSL calls them from inside calls on the connection, such as
-/// [`SslRef::do_handshake`] and [`SslRef::provide_quic_data`]. Per-connection state belongs in
-/// the connection's ex data. An error terminates the handshake.
+/// [`SslRef::do_handshake`] and [`SslRef::provide_quic_data`], so they must not call back into
+/// the handshake with those. Per-connection state belongs in the connection's ex data. An error
+/// terminates the handshake.
 pub trait QuicMethod: Send + Sync + 'static {
     /// Installs the read secret and cipher suite of `level`. BoringSSL calls it at most once per
     /// level, and only after the write secret that ACKs the packets it protects.
@@ -89,6 +90,11 @@ impl<M: QuicMethod> QuicMethodTable<M> {
 impl SslContextBuilder {
     /// Configures the context for QUIC, with `method` receiving the secrets and handshake data
     /// of its connections.
+    ///
+    /// A connection keeps the method table of the context it was created with, but the
+    /// callbacks look `method` up in its current context. A context switched in during the
+    /// handshake, such as by [`SslRef::set_ssl_context`], must therefore hold a method of the
+    /// same type, or the handshake fails.
     #[corresponds(SSL_CTX_set_quic_method)]
     pub fn set_quic_method<M: QuicMethod>(&mut self, method: M) -> Result<(), ErrorStack> {
         self.replace_ex_data(SslContext::cached_ex_index::<M>(), method);
@@ -219,6 +225,8 @@ impl SslRef {
     }
 
     /// Processes the handshake data provided after the handshake, such as session tickets.
+    ///
+    /// On [`ErrorCode::SSL`], the reason is on the error queue.
     #[corresponds(SSL_process_quic_post_handshake)]
     pub fn process_quic_post_handshake(&mut self) -> Result<(), ErrorCode> {
         let ret = unsafe { ffi::SSL_process_quic_post_handshake(self.as_ptr()) };

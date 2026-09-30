@@ -249,3 +249,15 @@ fn quic_handshake_and_early_data() {
     handshake(&mut c, &mut s);
     assert!(!c.early_data_accepted() && !s.early_data_accepted());
 }
+
+#[test]
+fn alert_description() {
+    assert_eq!(
+        SslAlert::NO_APPLICATION_PROTOCOL.description(),
+        "no application protocol"
+    );
+    assert_eq!(
+        SslAlert::HANDSHAKE_FAILURE.description(),
+        "handshake failure"
+    );
+}

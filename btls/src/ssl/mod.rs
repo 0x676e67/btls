@@ -560,6 +560,17 @@ impl SslAlert {
     pub fn as_raw(&self) -> c_int {
         self.0
     }
+
+    /// Returns a readable name of the alert, or "unknown".
+    #[corresponds(SSL_alert_desc_string_long)]
+    #[must_use]
+    pub fn description(&self) -> &'static str {
+        unsafe {
+            CStr::from_ptr(ffi::SSL_alert_desc_string_long(self.0))
+                .to_str()
+                .unwrap_or("unknown")
+        }
+    }
 }
 
 /// An error returned from an ALPN selection callback.
