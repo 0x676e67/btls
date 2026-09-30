@@ -32,7 +32,6 @@ const READ_BUF_CAPACITY: usize = 17 * 1024;
 struct StreamWrapper<S> {
     stream: S,
     context: usize,
-    // Ciphertext read ahead of BoringSSL; `read_buf[read_pos..]` has not been consumed yet.
     read_buf: Vec<u8>,
     read_pos: usize,
 }
