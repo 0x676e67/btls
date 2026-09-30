@@ -120,6 +120,19 @@ impl Drop for AesKey {
     }
 }
 
+/// Encrypts a single block with a key from [`AesKey::new_encrypt`], as the building block of
+/// other modes such as QUIC header protection.
+#[corresponds(AES_encrypt)]
+pub fn encrypt_block(key: &AesKey, in_: &[u8; 16], out: &mut [u8; 16]) {
+    unsafe { ffi::AES_encrypt(in_.as_ptr(), out.as_mut_ptr(), &key.0) }
+}
+
+/// Decrypts a single block with a key from [`AesKey::new_decrypt`].
+#[corresponds(AES_decrypt)]
+pub fn decrypt_block(key: &AesKey, in_: &[u8; 16], out: &mut [u8; 16]) {
+    unsafe { ffi::AES_decrypt(in_.as_ptr(), out.as_mut_ptr(), &key.0) }
+}
+
 /// Wrap a key, according to [RFC 3394](https://tools.ietf.org/html/rfc3394)
 ///
 /// * `key`: The key-encrypting-key to use. Must be a encrypting key
@@ -202,6 +215,31 @@ mod test {
     use hex::FromHex;
 
     use super::*;
+
+    /// The AES-128 example of FIPS-197, Appendix C.1.
+    #[test]
+    fn test_block() {
+        let key = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let plaintext: [u8; 16] = hex::decode("00112233445566778899aabbccddeeff")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut ciphertext = [0; 16];
+        encrypt_block(
+            &AesKey::new_encrypt(&key).unwrap(),
+            &plaintext,
+            &mut ciphertext,
+        );
+        assert_eq!(hex::encode(ciphertext), "69c4e0d86a7b0430d8cdb78070b4c55a");
+
+        let mut decrypted = [0; 16];
+        decrypt_block(
+            &AesKey::new_decrypt(&key).unwrap(),
+            &ciphertext,
+            &mut decrypted,
+        );
+        assert_eq!(decrypted, plaintext);
+    }
 
     // from the RFC https://tools.ietf.org/html/rfc3394#section-2.2.3
     #[test]
