@@ -71,14 +71,11 @@ impl<S> StreamWrapper<S>
 where
     S: AsyncRead,
 {
-    /// Refills the drained read buffer with a single read of the underlying stream.
+    /// Fills the empty read buffer with a single read of the underlying stream.
     ///
-    /// The buffer is released when the stream has nothing to read or reaches EOF, so idle and
-    /// finished connections do not hold it. `WouldBlock` is returned only in the first case, with
-    /// the waker registered on the stream.
+    /// Returns `WouldBlock` when the stream has nothing to read, with the waker registered on it.
     fn fill_read_buf(&mut self) -> io::Result<()> {
         let mut read_buf = mem::take(&mut self.read_buf);
-        read_buf.clear();
         read_buf.reserve(READ_BUF_CAPACITY);
         self.read_pos = 0;
 
@@ -87,11 +84,9 @@ where
         match stream.poll_read(cx, &mut buf)? {
             Poll::Ready(()) => {
                 let filled = buf.filled().len();
-                if filled > 0 {
-                    // SAFETY: `ReadBuf` guarantees its first `filled` bytes are initialized.
-                    unsafe { read_buf.set_len(filled) };
-                    self.read_buf = read_buf;
-                }
+                // SAFETY: `ReadBuf` guarantees its first `filled` bytes are initialized.
+                unsafe { read_buf.set_len(filled) };
+                self.read_buf = read_buf;
                 Ok(())
             }
             Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
@@ -104,7 +99,7 @@ where
     S: AsyncRead,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.read_pos == self.read_buf.len() {
+        if self.read_buf.is_empty() {
             self.fill_read_buf()?;
         }
 
@@ -112,6 +107,13 @@ where
         let n = buffered.len().min(buf.len());
         buf[..n].copy_from_slice(&buffered[..n]);
         self.read_pos += n;
+
+        // Release the buffer as soon as it is drained, so a connection that stops reading here,
+        // such as one returned to a pool, does not keep it.
+        if self.read_pos == self.read_buf.len() {
+            self.read_buf = Vec::new();
+            self.read_pos = 0;
+        }
         Ok(n)
     }
 }
@@ -305,5 +307,45 @@ where
         }
 
         self.get_pin_mut().poll_shutdown(ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Yields the given bytes in one read, then stays pending.
+    struct Once(Vec<u8>);
+
+    impl AsyncRead for Once {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.0.is_empty() {
+                return Poll::Pending;
+            }
+            buf.put_slice(&mem::take(&mut self.0));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn read_buf_released_when_drained() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut wrapper = StreamWrapper::new(Once(vec![1; 100]));
+        wrapper.context = &mut cx as *mut _ as usize;
+
+        let mut buf = [0; 60];
+        assert_eq!(wrapper.read(&mut buf).unwrap(), 60);
+        assert_eq!(wrapper.read_buf.capacity(), READ_BUF_CAPACITY);
+
+        assert_eq!(wrapper.read(&mut buf).unwrap(), 40);
+        assert_eq!(wrapper.read_buf.capacity(), 0);
+
+        let err = wrapper.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(wrapper.read_buf.capacity(), 0);
     }
 }
