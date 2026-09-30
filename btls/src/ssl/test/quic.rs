@@ -1,12 +1,15 @@
 use std::mem;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::error::ErrorStack;
 use crate::ex_data::Index;
+use crate::ffi;
 use crate::ssl::{
-    EarlyDataReason, ErrorCode, QuicEncryptionLevel, QuicMethod, QuicMethodError, Ssl, SslAlert,
-    SslCipherRef, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslRef, SslSession,
-    SslSessionCacheMode, SslVerifyMode, SslVersion,
+    AlpnError, EarlyDataReason, ErrorCode, QuicEncryptionLevel, QuicMethod, QuicMethodError, Ssl,
+    SslAlert, SslCipherRef, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslRef,
+    SslSession, SslSessionCacheMode, SslVerifyMode, SslVersion,
 };
+use std::ffi::c_int;
 
 const LEVELS: [QuicEncryptionLevel; 4] = [
     QuicEncryptionLevel::INITIAL,
@@ -24,7 +27,9 @@ struct Recorded {
     pending: Vec<(QuicEncryptionLevel, Vec<u8>)>,
     /// Handshake data from the peer, waiting for its level to be read.
     inbox: Vec<(QuicEncryptionLevel, Vec<u8>)>,
-    alert: Option<SslAlert>,
+    alert: Option<(QuicEncryptionLevel, SslAlert)>,
+    /// Makes [`QuicMethod::set_write_secret`] fail.
+    fail_write_secret: bool,
 }
 
 static RECORDED: LazyLock<Index<Ssl, Recorded>> = LazyLock::new(|| Ssl::new_ex_index().unwrap());
@@ -58,7 +63,11 @@ impl QuicMethod for Recorder {
         _: &SslCipherRef,
         secret: &[u8],
     ) -> Result<(), QuicMethodError> {
-        recorded(ssl).write_secrets[index(level)] = Some(secret.to_vec());
+        let recorded = recorded(ssl);
+        if recorded.fail_write_secret {
+            return Err(QuicMethodError);
+        }
+        recorded.write_secrets[index(level)] = Some(secret.to_vec());
         Ok(())
     }
 
@@ -79,10 +88,10 @@ impl QuicMethod for Recorder {
     fn send_alert(
         &self,
         ssl: &mut SslRef,
-        _: QuicEncryptionLevel,
+        level: QuicEncryptionLevel,
         alert: SslAlert,
     ) -> Result<(), QuicMethodError> {
-        recorded(ssl).alert = Some(alert);
+        recorded(ssl).alert = Some((level, alert));
         Ok(())
     }
 }
@@ -95,13 +104,18 @@ fn context(builder: &mut SslContextBuilder) {
     builder.set_early_data_enabled(true);
 }
 
-fn server_context() -> SslContext {
+fn server_builder() -> SslContextBuilder {
     let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
     context(&mut builder);
     builder.set_certificate_chain_file("test/cert.pem").unwrap();
     builder
         .set_private_key_file("test/key.pem", SslFiletype::PEM)
         .unwrap();
+    builder
+}
+
+fn server_context() -> SslContext {
+    let mut builder = server_builder();
     builder.set_alpn_select_callback(|_, _| Ok(b"h3"));
     builder.build()
 }
@@ -186,6 +200,14 @@ fn secret(ssl: &mut Ssl, read: bool, level: QuicEncryptionLevel) -> Option<Vec<u
     secrets[index(level)].clone()
 }
 
+/// Returns whether `errors` holds the SSL reason `reason`.
+fn has_reason(errors: &ErrorStack, reason: c_int) -> bool {
+    errors
+        .errors()
+        .iter()
+        .any(|e| e.library_reason(ffi::ERR_LIB_SSL) == Some(reason))
+}
+
 #[test]
 fn quic_handshake_and_early_data() {
     let sessions = Arc::new(Mutex::new(Vec::new()));
@@ -214,7 +236,7 @@ fn quic_handshake_and_early_data() {
     assert_eq!(c.peer_quic_transport_params(), Some(&b"server params"[..]));
     assert_eq!(s.peer_quic_transport_params(), Some(&b"client params"[..]));
     assert_eq!(c.early_data_reason(), EarlyDataReason::NO_SESSION_OFFERED);
-    assert!(recorded(&mut c).alert.is_none());
+    assert!(recorded(&mut c).alert.is_none() && recorded(&mut s).alert.is_none());
     assert!(latest_session().early_data_capable());
 
     // A resumption under the same context accepts 0-RTT.
@@ -248,6 +270,82 @@ fn quic_handshake_and_early_data() {
     c.reset_early_data_reject();
     handshake(&mut c, &mut s);
     assert!(!c.early_data_accepted() && !s.early_data_accepted());
+
+    // A server without an early data context issues sessions that do not allow 0-RTT.
+    let mut c = client(&client_ctx, None);
+    let mut s = server(&server_ctx, b"");
+    handshake(&mut c, &mut s);
+    let session = latest_session();
+    assert!(!session.early_data_capable());
+    let mut c = client(&client_ctx, Some(&session));
+    let mut s = server(&server_ctx, b"context");
+    step(&mut c, &mut s).unwrap();
+    assert!(!c.in_early_data());
+    handshake(&mut c, &mut s);
+    assert!(c.session_reused());
+    for ssl in [&c, &s] {
+        assert_eq!(
+            ssl.early_data_reason(),
+            EarlyDataReason::UNSUPPORTED_FOR_SESSION
+        );
+    }
+}
+
+#[test]
+fn failing_handshake() {
+    let client_ctx = client_context(Arc::default());
+
+    // A server that selects no ALPN protocol alerts at the level it writes.
+    let mut builder = server_builder();
+    builder.set_alpn_select_callback(|_, _| Err(AlpnError::ALERT_FATAL));
+    let server_ctx = builder.build();
+    let mut c = client(&client_ctx, None);
+    let mut s = server(&server_ctx, b"context");
+    step(&mut c, &mut s).unwrap();
+    assert!(step(&mut s, &mut c) == Err(ErrorCode::SSL));
+    assert!(has_reason(
+        &ErrorStack::get(),
+        ffi::SSL_R_NO_APPLICATION_PROTOCOL
+    ));
+    assert_eq!(
+        recorded(&mut s).alert,
+        Some((
+            QuicEncryptionLevel::INITIAL,
+            SslAlert::NO_APPLICATION_PROTOCOL
+        ))
+    );
+
+    // A failing secret callback leaves its reason on the error queue.
+    let server_ctx = server_context();
+    let mut c = client(&client_ctx, None);
+    let mut s = server(&server_ctx, b"context");
+    recorded(&mut s).fail_write_secret = true;
+    step(&mut c, &mut s).unwrap();
+    assert!(step(&mut s, &mut c) == Err(ErrorCode::SSL));
+    assert!(has_reason(
+        &ErrorStack::get(),
+        ffi::SSL_R_QUIC_INTERNAL_ERROR
+    ));
+}
+
+#[test]
+fn provide_quic_data_errors() {
+    let client_ctx = client_context(Arc::default());
+    let mut c = client(&client_ctx, None);
+
+    let err = c
+        .provide_quic_data(QuicEncryptionLevel::HANDSHAKE, b"data")
+        .unwrap_err();
+    assert!(has_reason(&err, ffi::SSL_R_WRONG_ENCRYPTION_LEVEL_RECEIVED));
+
+    // The buffered data may fill the flight, but not exceed it.
+    let len = c.quic_max_handshake_flight_len(QuicEncryptionLevel::INITIAL);
+    c.provide_quic_data(QuicEncryptionLevel::INITIAL, &vec![0; len])
+        .unwrap();
+    let err = c
+        .provide_quic_data(QuicEncryptionLevel::INITIAL, &[0])
+        .unwrap_err();
+    assert!(has_reason(&err, ffi::SSL_R_EXCESSIVE_MESSAGE_SIZE));
 }
 
 #[test]

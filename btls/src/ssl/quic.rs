@@ -18,9 +18,13 @@ use std::{ptr, slice};
 pub struct QuicEncryptionLevel(ffi::ssl_encryption_level_t);
 
 impl QuicEncryptionLevel {
+    /// Protects the ClientHello and ServerHello.
     pub const INITIAL: Self = Self(ffi::ssl_encryption_level_t::ssl_encryption_initial);
+    /// Protects client 0-RTT data. The handshake itself never writes at this level.
     pub const EARLY_DATA: Self = Self(ffi::ssl_encryption_level_t::ssl_encryption_early_data);
+    /// Protects the rest of the handshake.
     pub const HANDSHAKE: Self = Self(ffi::ssl_encryption_level_t::ssl_encryption_handshake);
+    /// Protects 1-RTT data and post-handshake messages, such as session tickets.
     pub const APPLICATION: Self = Self(ffi::ssl_encryption_level_t::ssl_encryption_application);
 }
 
@@ -30,10 +34,10 @@ pub struct QuicMethodError;
 
 /// The QUIC hooks of a context (`SSL_QUIC_METHOD`), see [`SslContextBuilder::set_quic_method`].
 ///
-/// BoringSSL calls them from inside calls on the connection, such as
-/// [`SslRef::do_handshake`] and [`SslRef::provide_quic_data`], so they must not call back into
-/// the handshake with those. Per-connection state belongs in the connection's ex data. An error
-/// terminates the handshake.
+/// BoringSSL calls them from inside [`SslRef::do_handshake`] and
+/// [`SslRef::process_quic_post_handshake`], and from calls that send an alert, never from
+/// [`SslRef::provide_quic_data`]. They must not drive the handshake themselves. Per-connection
+/// state belongs in the connection's ex data. An error terminates the handshake.
 pub trait QuicMethod: Send + Sync + 'static {
     /// Installs the read secret and cipher suite of `level`. BoringSSL calls it at most once per
     /// level, and only after the write secret that ACKs the packets it protects.
@@ -46,6 +50,12 @@ pub trait QuicMethod: Send + Sync + 'static {
     ) -> Result<(), QuicMethodError>;
 
     /// Installs the write secret and cipher suite of `level`, at most once per level.
+    ///
+    /// A server gets its [`QuicEncryptionLevel::APPLICATION`] secret before the client Finished,
+    /// so it can send half-RTT data. The handshake is not confirmed then, and a client that was
+    /// asked for a certificate is not authenticated yet. After a 0-RTT reject, the
+    /// [`QuicEncryptionLevel::EARLY_DATA`] secret may use another cipher suite than the other
+    /// levels.
     fn set_write_secret(
         &self,
         ssl: &mut SslRef,
@@ -185,6 +195,8 @@ impl SslRef {
     }
 
     /// Returns the level that peer handshake data is expected at.
+    ///
+    /// BoringSSL asserts that the connection is a QUIC one in debug builds.
     #[corresponds(SSL_quic_read_level)]
     #[must_use]
     pub fn quic_read_level(&self) -> QuicEncryptionLevel {
@@ -192,6 +204,8 @@ impl SslRef {
     }
 
     /// Returns the level that handshake data is written at.
+    ///
+    /// BoringSSL asserts that the connection is a QUIC one in debug builds.
     #[corresponds(SSL_quic_write_level)]
     #[must_use]
     pub fn quic_write_level(&self) -> QuicEncryptionLevel {
@@ -206,8 +220,13 @@ impl SslRef {
         unsafe { ffi::SSL_quic_max_handshake_flight_len(self.as_ptr(), level.0) }
     }
 
-    /// Provides handshake data the peer sent at `level`. It fails if the handshake does not
-    /// expect data at `level`, and the connection should then be closed.
+    /// Provides handshake data the peer sent at `level`, which the next
+    /// [`SslRef::do_handshake`] or [`SslRef::process_quic_post_handshake`] processes.
+    ///
+    /// It fails with `SSL_R_WRONG_ENCRYPTION_LEVEL_RECEIVED` if `level` is not
+    /// [`SslRef::quic_read_level`], and with `SSL_R_EXCESSIVE_MESSAGE_SIZE` if the buffered data
+    /// would exceed [`SslRef::quic_max_handshake_flight_len`]. The connection should then be
+    /// closed.
     #[corresponds(SSL_provide_quic_data)]
     pub fn provide_quic_data(
         &mut self,
@@ -238,7 +257,8 @@ impl SslRef {
     }
 }
 
-/// Finds the [`QuicMethod`] of the context `ssl` belongs to and runs `f` with it.
+/// Finds the [`QuicMethod`] of the context `ssl` belongs to and runs `f` with it. A missing
+/// method fails like `f`.
 fn with_method<M: QuicMethod>(
     ssl: *mut ffi::SSL,
     f: impl FnOnce(&M, &mut SslRef) -> Result<(), QuicMethodError>,
@@ -252,6 +272,24 @@ fn with_method<M: QuicMethod>(
     f(method, ssl).is_ok().into()
 }
 
+/// Pushes `SSL_R_QUIC_INTERNAL_ERROR` for a failed secret callback. BoringSSL does so for the
+/// other callbacks, but not these, which would leave the error queue empty.
+fn secret_result(ret: c_int) -> c_int {
+    if ret == 0 {
+        // SAFETY: the file name is a static C string.
+        unsafe {
+            ffi::ERR_put_error(
+                ffi::ERR_LIB_SSL.0 as c_int,
+                0,
+                ffi::SSL_R_QUIC_INTERNAL_ERROR,
+                concat!(file!(), "\0").as_ptr().cast(),
+                line!(),
+            );
+        }
+    }
+    ret
+}
+
 unsafe extern "C" fn raw_set_read_secret<M: QuicMethod>(
     ssl: *mut ffi::SSL,
     level: ffi::ssl_encryption_level_t,
@@ -262,9 +300,9 @@ unsafe extern "C" fn raw_set_read_secret<M: QuicMethod>(
     // SAFETY: BoringSSL passes the cipher suite and a secret of `secret_len` bytes.
     let cipher = unsafe { SslCipherRef::from_ptr(cipher.cast_mut()) };
     let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
-    with_method::<M>(ssl, |method, ssl| {
+    secret_result(with_method::<M>(ssl, |method, ssl| {
         method.set_read_secret(ssl, QuicEncryptionLevel(level), cipher, secret)
-    })
+    }))
 }
 
 unsafe extern "C" fn raw_set_write_secret<M: QuicMethod>(
@@ -277,9 +315,9 @@ unsafe extern "C" fn raw_set_write_secret<M: QuicMethod>(
     // SAFETY: BoringSSL passes the cipher suite and a secret of `secret_len` bytes.
     let cipher = unsafe { SslCipherRef::from_ptr(cipher.cast_mut()) };
     let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
-    with_method::<M>(ssl, |method, ssl| {
+    secret_result(with_method::<M>(ssl, |method, ssl| {
         method.set_write_secret(ssl, QuicEncryptionLevel(level), cipher, secret)
-    })
+    }))
 }
 
 unsafe extern "C" fn raw_add_handshake_data<M: QuicMethod>(

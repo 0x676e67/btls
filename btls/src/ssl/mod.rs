@@ -946,6 +946,9 @@ impl SslInfoCallbackMode {
     /// Signaled when a handshake progresses to a new state.
     pub const ACCEPT_LOOP: Self = Self(ffi::SSL_CB_ACCEPT_LOOP);
 
+    /// Signaled when a client-side handshake progresses to a new state.
+    pub const CONNECT_LOOP: Self = Self(ffi::SSL_CB_CONNECT_LOOP);
+
     /// Signaled when the current iteration of the server-side handshake state machine completes.
     pub const ACCEPT_EXIT: Self = Self(ffi::SSL_CB_ACCEPT_EXIT);
 
@@ -1155,6 +1158,9 @@ impl SslContextBuilder {
     }
 
     /// Returns the verify mode set by [`Self::set_verify`] or one of the verify callbacks.
+    ///
+    /// An explicit [`SslVerifyMode::NONE`] reads the same as the default. Panics if the context
+    /// is not configured for X.509 certificates.
     #[corresponds(SSL_CTX_get_verify_mode)]
     #[must_use]
     pub fn verify_mode(&self) -> SslVerifyMode {
