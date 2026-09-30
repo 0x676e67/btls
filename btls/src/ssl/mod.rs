@@ -3624,6 +3624,27 @@ impl SslRef {
         }
     }
 
+    /// Returns the peer's ALPS (application-layer protocol settings) value, or `None` if ALPS
+    /// was not negotiated.
+    ///
+    /// The value may be empty. It is available once the handshake has negotiated ALPS.
+    #[corresponds(SSL_get0_peer_application_settings)]
+    pub fn peer_application_settings(&self) -> Option<&[u8]> {
+        unsafe {
+            if ffi::SSL_has_application_settings(self.as_ptr()) == 0 {
+                return None;
+            }
+            let mut data = ptr::null();
+            let mut len = 0;
+            ffi::SSL_get0_peer_application_settings(self.as_ptr(), &mut data, &mut len);
+            if data.is_null() {
+                Some(&[])
+            } else {
+                Some(slice::from_raw_parts(data, len))
+            }
+        }
+    }
+
     /// Enables the DTLS extension "use_srtp" as defined in RFC5764.
     #[corresponds(SSL_set_tlsext_use_srtp)]
     pub fn set_tlsext_use_srtp(&mut self, protocols: &str) -> Result<(), ErrorStack> {
