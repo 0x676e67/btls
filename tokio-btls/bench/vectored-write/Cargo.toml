@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-btls = { path = "../../btls" }
-tokio-btls = { path = "../../tokio-btls" }
+btls = { path = "../../../btls" }
+tokio-btls = { path = "../.." }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tokio = { version = "1", features = ["full"] }

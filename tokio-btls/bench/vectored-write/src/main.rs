@@ -213,11 +213,11 @@ impl AsyncWrite for Io {
 
 const CERT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tokio-btls/tests/cert.pem"
+    "/../../tests/cert.pem"
 );
 const KEY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tokio-btls/tests/key.pem"
+    "/../../tests/key.pem"
 );
 
 #[derive(Clone, Copy, PartialEq, Debug)]
