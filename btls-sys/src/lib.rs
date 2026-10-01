@@ -21,7 +21,10 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulong};
     clippy::useless_transmute,
     dead_code,
     unknown_lints,
-    unnecessary_transmutes
+    unnecessary_transmutes,
+    // bindgen emits libc's `malloc`/`realloc` with clang's builtin `size_t` type, which has the
+    // same ABI as `usize` but trips this lint (Rust 1.99+).
+    suspicious_runtime_symbol_definitions
 )]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
