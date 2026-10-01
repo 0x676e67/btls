@@ -434,6 +434,7 @@ jobs:
           0009-boringssl-zstd-cert-compression.patch \
           0010-boringssl-build-compat.patch \
           0011-boringssl-prefix-struct-tags.patch \
+          0012-boringssl-seal-app-data.patch \
           boringssl-loongarch.patch \
           underscore-wildcards.patch \
           relax-cert-validation.patch; do
@@ -457,6 +458,11 @@ jobs:
     - name: Run BoringSSL SSL runner tests
       working-directory: btls-sys/deps/boringssl/ssl/test/runner
       run: go test
+    - name: Run BoringSSL SSL runner tests through SSL_seal_app_data
+      working-directory: btls-sys/deps/boringssl/ssl/test/runner
+      run: >-
+        go test -shim-extra-flags=-seal-app-data
+        -test='Basic-*;*KeyUpdate*;*CBCRecordSplitting*;*MaxSendFragment*;Renegotiate-*;*Shutdown*;*EarlyData*;*FalseStart*;*Alert*'
 
   cross-build:
     name: Cross build from macOS to Linux
