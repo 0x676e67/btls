@@ -81,9 +81,14 @@ struct ReadBuffer {
 }
 
 /// Sealed records not yet written to the transport.
+///
+/// Partial writes advance `pos` instead of shifting the rest; appends drop the written prefix
+/// through [`make_room`](Self::make_room).
 #[derive(Default)]
 struct OutBuffer {
     bytes: Vec<u8>,
+    // `bytes[..pos]` is written. `pos < bytes.len()` unless both are 0.
+    pos: usize,
 }
 
 /// Packs the slices of one write into the plaintext of successive records.
@@ -215,18 +220,17 @@ where
     S: AsyncRead + AsyncWrite,
 {
     // The buffer lives behind the BIO, so move it out while the `SslRef` is borrowed mutably.
-    let mut out = s.get_mut().out_buf.take();
-    out.reserve(max_out);
+    let (mut out, pos) = s.get_mut().out_buf.take(max_out);
     let res = s
         .ssl_mut()
         .seal_app_data(bufs, budget, &mut out.spare_capacity_mut()[..max_out]);
     if let Ok(Some(sealed)) = res {
         // SAFETY: `seal_app_data` initialized the first `written` bytes of the spare capacity,
-        // and `written` is at most `max_out`, which `reserve` made room for.
+        // and `written` is at most `max_out`, which `take` made room for.
         unsafe { out.set_len(out.len() + sealed.written) };
     }
     let wrapper = s.get_mut();
-    wrapper.out_buf.restore(out);
+    wrapper.out_buf.restore(out, pos);
     let consumed = match res {
         Ok(Some(sealed)) if sealed.consumed > 0 => sealed.consumed,
         Ok(_) => return Ok(None),
@@ -649,12 +653,19 @@ impl ReadBuffer {
 impl OutBuffer {
     #[inline]
     fn push(&mut self, record: &[u8]) {
+        self.make_room(record.len());
         self.bytes.extend_from_slice(record);
+    }
+
+    /// The records still to write.
+    #[inline]
+    fn buffered(&self) -> &[u8] {
+        &self.bytes[self.pos..]
     }
 
     #[inline]
     fn len(&self) -> usize {
-        self.bytes.len()
+        self.bytes.len() - self.pos
     }
 
     #[inline]
@@ -662,28 +673,46 @@ impl OutBuffer {
         self.bytes.is_empty()
     }
 
-    /// Moves the buffered records out, so records can be sealed after them while the `SslRef` is
-    /// borrowed.
+    /// Reserves room to append `extra` bytes, first dropping the written prefix once it is at
+    /// least as long as the rest, or when the append would reallocate anyway.
     #[inline]
-    fn take(&mut self) -> Vec<u8> {
-        mem::take(&mut self.bytes)
+    fn make_room(&mut self, extra: usize) {
+        if self.pos > 0
+            && (self.pos >= self.len() || self.bytes.capacity() - self.bytes.len() < extra)
+        {
+            self.bytes.copy_within(self.pos.., 0);
+            self.bytes.truncate(self.bytes.len() - self.pos);
+            self.pos = 0;
+        }
+        self.bytes.reserve(extra);
     }
 
-    /// Puts back the records moved out by [`take`](Self::take).
+    /// Moves the buffer and its written length out, with spare capacity for `extra` bytes, so
+    /// records can be sealed after the buffered ones while the `SslRef` is borrowed.
+    #[inline]
+    fn take(&mut self, extra: usize) -> (Vec<u8>, usize) {
+        self.make_room(extra);
+        (mem::take(&mut self.bytes), mem::take(&mut self.pos))
+    }
+
+    /// Puts back what [`take`](Self::take) moved out.
     ///
     /// Sealing does no transport I/O, so nothing reached the BIO meanwhile; bytes that did stay
     /// buffered after the records.
     #[inline]
-    fn restore(&mut self, bytes: Vec<u8>) {
+    fn restore(&mut self, bytes: Vec<u8>, pos: usize) {
         debug_assert!(self.bytes.is_empty(), "sealing wrote to the BIO");
         let stray = mem::replace(&mut self.bytes, bytes);
-        self.bytes.extend_from_slice(&stray);
+        self.pos = pos;
+        if !stray.is_empty() {
+            self.push(&stray);
+        }
     }
 
     /// Whether buffered ciphertext has reached `OUT_BUF_CAPACITY`.
     #[inline]
     fn is_full(&self) -> bool {
-        self.bytes.len() >= OUT_BUF_CAPACITY
+        self.len() >= OUT_BUF_CAPACITY
     }
 
     /// Reserves room for the records sealed from `total` plaintext bytes, up to the cap, when
@@ -692,8 +721,7 @@ impl OutBuffer {
     fn reserve(&mut self, total: usize) {
         if total > MAX_RECORD {
             let sealed = total.min(OUT_BUF_CAPACITY);
-            self.bytes
-                .reserve(sealed + sealed.div_ceil(MAX_RECORD) * RECORD_OVERHEAD);
+            self.make_room(sealed + sealed.div_ceil(MAX_RECORD) * RECORD_OVERHEAD);
         }
     }
 
@@ -719,23 +747,21 @@ impl OutBuffer {
     where
         S: AsyncWrite,
     {
-        let mut pos = 0;
         let res = loop {
-            if pos == self.bytes.len() {
+            if self.pos == self.bytes.len() {
                 break Ok(());
             }
             let (stream, cx) = transport.parts();
-            match stream.poll_write(cx, &self.bytes[pos..]) {
+            match stream.poll_write(cx, self.buffered()) {
                 Poll::Ready(Ok(0)) => break Err(io::ErrorKind::WriteZero.into()),
-                Poll::Ready(Ok(n)) => pos += n,
+                Poll::Ready(Ok(n)) => self.pos += n,
                 Poll::Ready(Err(e)) => break Err(e),
                 Poll::Pending => break Err(io::Error::from(io::ErrorKind::WouldBlock)),
             }
         };
-        if pos == self.bytes.len() {
+        if self.pos == self.bytes.len() {
             self.bytes = Vec::new();
-        } else {
-            self.bytes.drain(..pos);
+            self.pos = 0;
         }
         res
     }
@@ -748,11 +774,11 @@ impl OutBuffer {
         S: AsyncWrite,
     {
         let (stream, cx) = transport.parts();
-        let pending = self.bytes.len();
+        let pending = self.len();
         let res = if pending == 0 {
             stream.poll_write(cx, record)
         } else if stream.is_write_vectored() {
-            let bufs = [io::IoSlice::new(&self.bytes), io::IoSlice::new(record)];
+            let bufs = [io::IoSlice::new(self.buffered()), io::IoSlice::new(record)];
             stream.poll_write_vectored(cx, &bufs)
         } else {
             // Let the next drain combine the buffer and record into one write.
@@ -763,10 +789,11 @@ impl OutBuffer {
             Poll::Ready(Err(_)) | Poll::Pending => 0,
         };
         if n < pending {
-            self.bytes.drain(..n);
-            self.bytes.extend_from_slice(record);
+            self.pos += n;
+            self.push(record);
         } else {
             self.bytes.clear();
+            self.pos = 0;
             self.bytes.extend_from_slice(&record[n - pending..]);
         }
     }
@@ -1043,7 +1070,7 @@ mod tests {
         wrapper.write_all(&[1; 100]).unwrap();
         let err = wrapper.flush().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(wrapper.out_buf.bytes.len(), 100);
+        assert_eq!(wrapper.out_buf.len(), 100);
 
         wrapper.transport.stream.budget = usize::MAX;
         wrapper.flush().unwrap();
@@ -1066,13 +1093,13 @@ mod tests {
         wrapper.transport.stream.budget = 4;
         wrapper.write_all(b"abcde").unwrap();
         assert_eq!(wrapper.transport.stream.data, b"0123");
-        assert_eq!(wrapper.out_buf.bytes, b"456789abcde");
+        assert_eq!(wrapper.out_buf.buffered(), b"456789abcde");
 
         // One vectored write takes the buffered records and the head of the last one.
         wrapper.transport.stream.budget = 15;
         wrapper.write_all(b"fghij").unwrap();
         assert_eq!(wrapper.transport.stream.data, b"0123456789abcdefghi");
-        assert_eq!(wrapper.out_buf.bytes, b"j");
+        assert_eq!(wrapper.out_buf.buffered(), b"j");
 
         // With nothing buffered, the record goes straight out.
         wrapper.transport.stream.budget = usize::MAX;
@@ -1100,8 +1127,47 @@ mod tests {
             let err = wrapper.out_buf.drain(&mut wrapper.transport).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         }
-        assert_eq!(wrapper.out_buf.bytes.len(), 3 * CHUNK);
+        assert_eq!(wrapper.out_buf.len(), 3 * CHUNK);
         assert!(wrapper.out_buf.bytes.capacity() <= 2 * OUT_BUF_CAPACITY);
+    }
+
+    #[test]
+    fn write_buf_keeps_order_under_short_writes() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut wrapper = StreamWrapper::new(Sink {
+            budget: 0,
+            data: Vec::new(),
+        });
+        wrapper.transport.context = &mut cx as *mut _ as usize;
+
+        // A backlog that never empties, so the written prefix is only ever dropped by compaction.
+        let mut expected = vec![0xff; 1024];
+        wrapper.out_buf.push(&expected);
+        let mut capacity = 0;
+        for i in 0..1000usize {
+            // Records average slightly more than the 37 bytes the transport takes per round.
+            let record: Vec<u8> = (0..1 + i % 74).map(|j| (i ^ j) as u8).collect();
+            expected.extend_from_slice(&record);
+            wrapper.transport.stream.budget = 37;
+            match i % 3 {
+                0 => wrapper.out_buf.push(&record),
+                1 => wrapper.out_buf.write_last(&mut wrapper.transport, &record),
+                _ => {
+                    let (mut bytes, pos) = wrapper.out_buf.take(record.len());
+                    bytes.extend_from_slice(&record);
+                    wrapper.out_buf.restore(bytes, pos);
+                }
+            }
+            let _ = wrapper.out_buf.drain(&mut wrapper.transport);
+            assert!(!wrapper.out_buf.is_empty());
+            capacity = capacity.max(wrapper.out_buf.bytes.capacity());
+        }
+        assert!(capacity <= 4096, "{capacity}");
+
+        wrapper.transport.stream.budget = usize::MAX;
+        wrapper.flush().unwrap();
+        assert_eq!(wrapper.transport.stream.data, expected);
+        assert_eq!(wrapper.out_buf.bytes.capacity(), 0);
     }
 
     /// Duplex transport whose writes can stall, fail once, or keep returning `BrokenPipe`.
@@ -1372,7 +1438,7 @@ mod tests {
                 Poll::Ready(Ok(n)) => n,
                 result => panic!("initial buffering failed: {result:?}"),
             };
-            let buffered = client.0.get_ref().out_buf.bytes.len();
+            let buffered = client.0.get_ref().out_buf.len();
             assert_eq!(consumed, data.len());
             assert!(buffered > OUT_BUF_CAPACITY);
             assert!(buffered <= data.len() + 5 * RECORD_OVERHEAD);
@@ -1380,7 +1446,7 @@ mod tests {
                 assert!(Pin::new(&mut client)
                     .poll_write(&mut cx, b"extra")
                     .is_pending());
-                assert_eq!(client.0.get_ref().out_buf.bytes.len(), buffered);
+                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
             }
 
             client.get_mut().open = true;
@@ -1407,12 +1473,12 @@ mod tests {
                 result => panic!("initial buffering failed: {result:?}"),
             };
             assert!(consumed > 0 && consumed < expected.len());
-            let buffered = client.0.get_ref().out_buf.bytes.len();
+            let buffered = client.0.get_ref().out_buf.len();
             assert!(buffered >= OUT_BUF_CAPACITY);
             assert!(Pin::new(&mut client)
                 .poll_write(&mut cx, &expected[consumed..])
                 .is_pending());
-            assert_eq!(client.0.get_ref().out_buf.bytes.len(), buffered);
+            assert_eq!(client.0.get_ref().out_buf.len(), buffered);
 
             // A persistent error prevents every later write from accepting more input.
             client.get_mut().broken = true;
@@ -1425,14 +1491,14 @@ mod tests {
                     Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
                     result => panic!("expected persistent write failure: {result:?}"),
                 }
-                assert_eq!(client.0.get_ref().out_buf.bytes.len(), buffered);
+                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
             }
 
             client.get_mut().broken = false;
             client.get_mut().open = true;
             client.write_all(&expected[consumed..]).await.unwrap();
             client.flush().await.unwrap();
-            assert!(client.0.get_ref().out_buf.bytes.is_empty());
+            assert!(client.0.get_ref().out_buf.is_empty());
 
             // If the error first occurs after sealing, report the consumed plaintext once.
             let tail = b"tail-queued-before-reporting-error";
@@ -1441,7 +1507,7 @@ mod tests {
                 Pin::new(&mut client).poll_write(&mut cx, tail),
                 Poll::Ready(Ok(n)) if n == tail.len()
             ));
-            let buffered = client.0.get_ref().out_buf.bytes.len();
+            let buffered = client.0.get_ref().out_buf.len();
             assert!(buffered > 0);
             for _ in 0..2 {
                 match Pin::new(&mut client).poll_flush(&mut cx) {
@@ -1452,7 +1518,7 @@ mod tests {
                     Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
                     result => panic!("expected deferred write failure: {result:?}"),
                 }
-                assert_eq!(client.0.get_ref().out_buf.bytes.len(), buffered);
+                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
             }
 
             client.get_mut().broken = false;
@@ -1522,7 +1588,7 @@ mod tests {
         if sealed {
             assert_eq!(client.get_ref().polls, 2);
         }
-        assert!(!client.0.get_ref().out_buf.bytes.is_empty());
+        assert!(!client.0.get_ref().out_buf.is_empty());
 
         // Once the retry returns `Pending`, the transport is not polled again.
         let polls = client.get_ref().polls;
@@ -1571,7 +1637,7 @@ mod tests {
         // close_notify stays buffered while the transport takes nothing.
         client.get_mut().open = false;
         assert!(Pin::new(&mut client).poll_shutdown(&mut cx).is_pending());
-        let buffered = client.0.get_ref().out_buf.bytes.clone();
+        let buffered = client.0.get_ref().out_buf.buffered().to_vec();
         assert!(!buffered.is_empty());
 
         let polls = client.get_ref().polls;
@@ -1586,7 +1652,7 @@ mod tests {
         }
         // Only the retry polled the transport, and nothing was added to the buffer.
         assert_eq!(client.get_ref().polls, polls + 1);
-        assert_eq!(client.0.get_ref().out_buf.bytes, buffered);
+        assert_eq!(client.0.get_ref().out_buf.buffered(), buffered);
 
         client.get_mut().open = true;
         client.shutdown().await.unwrap();
