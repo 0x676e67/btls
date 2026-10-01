@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0800
+Subject: [PATCH 13/13] boringssl: skip clearing an empty error queue
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ ssl/ssl_lib.cc  |  7 +++++--
+ ssl/ssl_test.cc | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -74,9 +74,12 @@ static ExDataClass g_ex_data_class_ssl_ctx(/*with_app_data=*/true);
+ 
+ void ssl_reset_error_state(SSLImpl *ssl) {
+   // Functions which use `SSL_get_error` must reset I/O and error state on
+-  // entry.
++  // entry. `ERR_clear_error` sweeps every slot even when the queue is empty,
++  // and popped slots hold nothing to clear, so skip it then.
+   ssl->s3->rwstate = SSL_ERROR_NONE;
+-  ERR_clear_error();
++  if (ERR_peek_error() != 0) {
++    ERR_clear_error();
++  }
+   ERR_clear_system_error();
+ }
+ 
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -11583,6 +11583,53 @@ TEST(SSLTest, ErrorSyscallAfterCloseNotify) {
+   write_failed = false;
+ }
+ 
++// Test that `SSL_read` and `SSL_write` start from an empty error queue, so
++// `SSL_get_error` reports their own outcome, whether an earlier error is still
++// queued or was already popped.
++TEST(SSLTest, ErrorQueueResetOnEntry) {
++  bssl::UniquePtr<SSL_CTX> client_ctx(SSL_CTX_new(TLS_method()));
++  bssl::UniquePtr<SSL_CTX> server_ctx =
++      CreateContextWithTestCertificate(TLS_method());
++  ASSERT_TRUE(client_ctx);
++  ASSERT_TRUE(server_ctx);
++  SSL_CTX_set_custom_verify(client_ctx.get(), SSL_VERIFY_PEER,
++                            AcceptAnyCertificate);
++  bssl::UniquePtr<SSL> client, server;
++  ASSERT_TRUE(ConnectClientAndServer(&client, &server, client_ctx.get(),
++                                     server_ctx.get()));
++
++  auto stale_error = [](bool pop) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    ERR_add_error_data(1, "stale");
++    if (pop) {
++      // A popped slot keeps its packed value.
++      const char *data;
++      int flags;
++      EXPECT_NE(ERR_get_error_line_data(nullptr, nullptr, &data, &flags), 0u);
++      EXPECT_EQ(ERR_peek_error(), 0u);
++    }
++  };
++  const uint8_t data[1] = {42};
++  for (bool pop : {false, true}) {
++    SCOPED_TRACE(pop);
++    // Nothing to read yet.
++    stale_error(pop);
++    uint8_t buf[1];
++    int ret = SSL_read(client.get(), buf, sizeof(buf));
++    EXPECT_EQ(ret, -1);
++    EXPECT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_WANT_READ);
++    EXPECT_EQ(ERR_peek_error(), 0u);
++
++    stale_error(pop);
++    ret = SSL_write(server.get(), data, sizeof(data));
++    EXPECT_EQ(ret, 1);
++    EXPECT_EQ(SSL_get_error(server.get(), ret), SSL_ERROR_NONE);
++    EXPECT_EQ(ERR_peek_error(), 0u);
++    ASSERT_EQ(SSL_read(client.get(), buf, sizeof(buf)), 1);
++    EXPECT_EQ(buf[0], data[0]);
++  }
++}
++
+ // Test that `SSL_shutdown`, when quiet shutdown is enabled, simulates receiving
+ // a close_notify, down to `SSL_read` reporting `SSL_ERROR_ZERO_RETURN`.
+ TEST(SSLTest, QuietShutdown) {

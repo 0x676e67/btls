@@ -435,6 +435,7 @@ jobs:
           0010-boringssl-build-compat.patch \
           0011-boringssl-prefix-struct-tags.patch \
           0012-boringssl-seal-app-data.patch \
+          0013-boringssl-cheap-error-reset.patch \
           boringssl-loongarch.patch \
           underscore-wildcards.patch \
           relax-cert-validation.patch; do
