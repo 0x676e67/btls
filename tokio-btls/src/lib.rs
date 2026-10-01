@@ -13,7 +13,7 @@ use std::{
     io::{self, Read, Write},
     mem,
     pin::Pin,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use btls::{
@@ -35,7 +35,19 @@ struct StreamWrapper<S> {
     context: usize,
     read_buf: Vec<u8>,
     read_pos: usize,
+    // Sealed records not yet written to `stream`: `out_buf[out_pos..]`.
+    out_buf: Vec<u8>,
+    out_pos: usize,
 }
+
+/// Pending ciphertext beyond which records are written out without waiting for a flush.
+const OUT_BUF_CAPACITY: usize = 64 * 1024;
+
+/// Largest plaintext BoringSSL seals into one TLS record.
+const MAX_RECORD: usize = 16 * 1024;
+
+/// Per-record room reserved for header, nonce and tag; covers the AEAD suites.
+const RECORD_OVERHEAD: usize = 64;
 
 impl<S> fmt::Debug for StreamWrapper<S>
 where
@@ -64,6 +76,8 @@ impl<S> StreamWrapper<S> {
             context: 0,
             read_buf: Vec::new(),
             read_pos: 0,
+            out_buf: Vec::new(),
+            out_pos: 0,
         }
     }
 }
@@ -120,19 +134,119 @@ where
     }
 }
 
+impl<S> StreamWrapper<S>
+where
+    S: AsyncWrite,
+{
+    fn out_pending(&self) -> usize {
+        self.out_buf.len() - self.out_pos
+    }
+
+    /// Writes buffered records to `stream` until none remain.
+    fn drain_out(&mut self) -> io::Result<()> {
+        while self.out_pos < self.out_buf.len() {
+            debug_assert_ne!(self.context, 0);
+            // SAFETY: same invariants as `parts`; borrowing fields separately leaves `out_buf`
+            // readable while the stream is written.
+            let cx = unsafe { &mut *(self.context as *mut Context<'_>) };
+            let stream = unsafe { Pin::new_unchecked(&mut self.stream) };
+            match stream.poll_write(cx, &self.out_buf[self.out_pos..]) {
+                Poll::Ready(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+                Poll::Ready(Ok(n)) => self.out_pos += n,
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Pending => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        }
+        // Like the read buffer, an idle connection holds no write buffer.
+        self.out_buf = Vec::new();
+        self.out_pos = 0;
+        Ok(())
+    }
+}
+
+/// Seals `bufs` into records and writes them to the transport in as few writes as possible.
+///
+/// Several small slices, such as an HTTP/2 frame header and its payload, share one record.
+/// Larger input is sealed record by record until `OUT_BUF_CAPACITY` is pending, and all
+/// sealed records then go out together. Records the transport cannot take yet stay buffered
+/// for the next write or flush.
+///
+/// Nothing is sealed while the buffer is full, so the BIO never refuses a record here. A
+/// refused record would stay pending in BoringSSL and fail any retry with less data.
+fn write_records<S>(
+    s: &mut SslStreamCore<StreamWrapper<S>>,
+    bufs: &[io::IoSlice<'_>],
+) -> io::Result<usize>
+where
+    S: AsyncRead + AsyncWrite,
+{
+    let wrapper = s.get_mut();
+    if wrapper.out_pending() >= OUT_BUF_CAPACITY {
+        wrapper.drain_out()?;
+    }
+    let total: usize = bufs.iter().map(|b| b.len()).sum();
+    let sealed = total.min(OUT_BUF_CAPACITY);
+    wrapper
+        .out_buf
+        .reserve(sealed + sealed.div_ceil(MAX_RECORD) * RECORD_OVERHEAD);
+
+    let mut written = 0;
+    let mut err = None;
+    if total <= MAX_RECORD && bufs.iter().filter(|b| !b.is_empty()).count() > 1 {
+        let mut record = Vec::with_capacity(total);
+        for buf in bufs {
+            record.extend_from_slice(buf);
+        }
+        match s.write(&record) {
+            Ok(n) => written = n,
+            Err(e) => err = Some(e),
+        }
+    } else {
+        'bufs: for buf in bufs {
+            let mut offset = 0;
+            while offset < buf.len() {
+                match s.write(&buf[offset..]) {
+                    Ok(n) => {
+                        offset += n;
+                        written += n;
+                    }
+                    Err(e) => {
+                        err = Some(e);
+                        break 'bufs;
+                    }
+                }
+                if s.get_ref().out_pending() >= OUT_BUF_CAPACITY {
+                    break 'bufs;
+                }
+            }
+        }
+    }
+
+    match s.get_mut().drain_out() {
+        Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
+        _ => {}
+    }
+    match err {
+        Some(e) if written == 0 => Err(e),
+        _ => Ok(written),
+    }
+}
+
 impl<S> Write for StreamWrapper<S>
 where
     S: AsyncWrite,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let (stream, cx) = unsafe { self.parts() };
-        match stream.poll_write(cx, buf) {
-            Poll::Ready(r) => r,
-            Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        // Only handshake and alert writes can get here with a full buffer.
+        if self.out_pending() >= OUT_BUF_CAPACITY {
+            self.drain_out()?;
         }
+        self.out_buf.extend_from_slice(buf);
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.drain_out()?;
         let (stream, cx) = unsafe { self.parts() };
         match stream.poll_flush(cx) {
             Poll::Ready(r) => r,
@@ -288,7 +402,19 @@ where
 {
     #[inline]
     fn poll_write(self: Pin<&mut Self>, ctx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        self.with_context(ctx, |s| cvt(s.write(buf)))
+        self.with_context(ctx, |s| cvt(write_records(s, &[io::IoSlice::new(buf)])))
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.with_context(ctx, |s| cvt(write_records(s, bufs)))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
     #[inline]
@@ -308,6 +434,8 @@ where
             }
         }
 
+        // close_notify is buffered like any record and must reach the transport first.
+        ready!(self.as_mut().poll_flush(ctx))?;
         self.get_pin_mut().poll_shutdown(ctx)
     }
 }
@@ -331,6 +459,58 @@ mod tests {
             buf.put_slice(&mem::take(&mut self.0));
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// Takes every write while open, stays pending while closed.
+    struct Sink {
+        open: bool,
+        data: Vec<u8>,
+    }
+
+    impl AsyncWrite for Sink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if !self.open {
+                return Poll::Pending;
+            }
+            self.data.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn write_buf_bounded_and_released() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut wrapper = StreamWrapper::new(Sink {
+            open: false,
+            data: Vec::new(),
+        });
+        wrapper.context = &mut cx as *mut _ as usize;
+
+        // A blocked transport stops buffering once the cap is reached.
+        assert_eq!(
+            wrapper.write(&[1; OUT_BUF_CAPACITY]).unwrap(),
+            OUT_BUF_CAPACITY
+        );
+        let err = wrapper.write(&[2; 10]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(wrapper.out_pending(), OUT_BUF_CAPACITY);
+
+        wrapper.stream.open = true;
+        wrapper.flush().unwrap();
+        assert_eq!(wrapper.stream.data.len(), OUT_BUF_CAPACITY);
+        assert_eq!(wrapper.out_buf.capacity(), 0);
     }
 
     #[test]
