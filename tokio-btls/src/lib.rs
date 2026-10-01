@@ -56,7 +56,8 @@ struct StreamWrapper<S> {
     transport: Transport<S>,
     read_buf: ReadBuffer,
     out_buf: OutBuffer,
-    // Set while sealing the last record of a write, which goes straight to the transport.
+    // Set while sealing the last record of a write, which goes straight to the transport;
+    // `write` clears it if the transport returns `Pending` or an error.
     write_through: bool,
     // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
     shutdown_sent: bool,
@@ -248,14 +249,14 @@ where
 ///
 /// Small adjacent slices share records as in a flattened buffer. Sealing stops once buffered
 /// ciphertext reaches `OUT_BUF_CAPACITY`, except when at most `MAX_RECORD` plaintext bytes remain.
-/// The last record goes out with the buffer when possible; backpressure can leave it buffered too.
-/// The BIO accepts every record, so BoringSSL never holds a pending write that a retry with
-/// less data would fail.
+/// The last record goes out with the buffer when possible; backpressure can leave it buffered too,
+/// and then the transport is not polled again. The BIO accepts every record, so BoringSSL never
+/// holds a pending write that a retry with less data would fail.
 fn ssl_write_records<S>(
     s: &mut SslStreamCore<StreamWrapper<S>>,
     bufs: &[io::IoSlice<'_>],
     total: usize,
-    blocked: bool,
+    mut blocked: bool,
 ) -> io::Result<usize>
 where
     S: AsyncRead + AsyncWrite,
@@ -270,9 +271,10 @@ where
     let mut through = !blocked;
     while let Some(plaintext) = packer.next_record() {
         let len = plaintext.len();
-        s.get_mut().write_through = through && written.saturating_add(len) >= total;
+        let last = through && written.saturating_add(len) >= total;
+        s.get_mut().write_through = last;
         let res = s.write(plaintext);
-        s.get_mut().write_through = false;
+        blocked |= last && !mem::take(&mut s.get_mut().write_through);
         let n = match res {
             Ok(n) => n,
             Err(e) => {
@@ -553,7 +555,8 @@ where
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.write_through {
-            self.out_buf.write_last(&mut self.transport, buf);
+            // A transport that refused the record is not polled again in this write.
+            self.write_through = self.out_buf.write_last(&mut self.transport, buf);
         } else {
             self.out_buf.push(buf);
         }
@@ -768,8 +771,9 @@ impl OutBuffer {
 
     /// Writes buffered records and `record` in one transport write and buffers the rest.
     ///
-    /// Errors leave the unwritten bytes buffered for the next drain to retry.
-    fn write_last<S>(&mut self, transport: &mut Transport<S>, record: &[u8])
+    /// Returns `false` if the transport returned `Pending` or an error, which leaves the unwritten
+    /// bytes buffered for the next drain to retry.
+    fn write_last<S>(&mut self, transport: &mut Transport<S>, record: &[u8]) -> bool
     where
         S: AsyncWrite,
     {
@@ -784,9 +788,9 @@ impl OutBuffer {
             // Let the next drain combine the buffer and record into one write.
             Poll::Ready(Ok(0))
         };
-        let n = match res {
-            Poll::Ready(Ok(n)) => n,
-            Poll::Ready(Err(_)) | Poll::Pending => 0,
+        let (n, ready) = match res {
+            Poll::Ready(Ok(n)) => (n, true),
+            Poll::Ready(Err(_)) | Poll::Pending => (0, false),
         };
         if n < pending {
             self.pos += n;
@@ -796,6 +800,7 @@ impl OutBuffer {
             self.pos = 0;
             self.bytes.extend_from_slice(&record[n - pending..]);
         }
+        ready
     }
 }
 
@@ -1151,7 +1156,9 @@ mod tests {
             wrapper.transport.stream.budget = 37;
             match i % 3 {
                 0 => wrapper.out_buf.push(&record),
-                1 => wrapper.out_buf.write_last(&mut wrapper.transport, &record),
+                1 => {
+                    wrapper.out_buf.write_last(&mut wrapper.transport, &record);
+                }
                 _ => {
                     let (mut bytes, pos) = wrapper.out_buf.take(record.len());
                     bytes.extend_from_slice(&record);
@@ -1574,7 +1581,6 @@ mod tests {
     async fn small_write_is_one_transport_write() {
         let (mut client, mut server) = tls_pair().await;
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let sealed = client.ssl().seal_app_data_limits().is_some();
 
         let res = Pin::new(&mut client).poll_write(&mut cx, &[1; 100]);
         assert!(matches!(res, Poll::Ready(Ok(100))));
@@ -1585,22 +1591,31 @@ mod tests {
         client.get_mut().open = false;
         let res = Pin::new(&mut client).poll_write(&mut cx, &[2; 100]);
         assert!(matches!(res, Poll::Ready(Ok(100))));
-        if sealed {
-            assert_eq!(client.get_ref().polls, 2);
-        }
+        assert_eq!(client.get_ref().polls, 2);
         assert!(!client.0.get_ref().out_buf.is_empty());
 
         // Once the retry returns `Pending`, the transport is not polled again.
-        let polls = client.get_ref().polls;
         let res = Pin::new(&mut client).poll_write(&mut cx, &[3; 100]);
         assert!(matches!(res, Poll::Ready(Ok(100))));
+        assert_eq!(client.get_ref().polls, 3);
+
+        // Nor once the `SSL_write` fallback's last record gets `Pending`.
+        client.get_mut().open = true;
+        client.flush().await.unwrap();
+        client.get_mut().open = false;
+        let polls = client.get_ref().polls;
+        let bufs = [io::IoSlice::new(&[4; 100])];
+        let res = Pin::new(&mut client)
+            .with_context(&mut cx, |s| ssl_write_records(s, &bufs, 100, false));
+        assert_eq!(res.unwrap(), 100);
         assert_eq!(client.get_ref().polls, polls + 1);
+        assert!(!client.0.get_ref().out_buf.is_empty());
 
         client.get_mut().open = true;
         client.shutdown().await.unwrap();
         let mut received = Vec::new();
         server.read_to_end(&mut received).await.unwrap();
-        assert_eq!(received, [[1; 100], [2; 100], [3; 100]].concat());
+        assert_eq!(received, [[1; 100], [2; 100], [3; 100], [4; 100]].concat());
     }
 
     #[tokio::test]
