@@ -43,7 +43,8 @@ struct StreamWrapper<S> {
     shutdown_sent: bool,
 }
 
-/// Buffered ciphertext at which writes stop sealing and wait for the transport.
+/// Buffered ciphertext threshold at which writes stop sealing, except for a final
+/// plaintext tail of at most `MAX_RECORD` bytes.
 const OUT_BUF_CAPACITY: usize = 64 * 1024;
 
 /// Largest plaintext in one TLS record.
@@ -171,7 +172,7 @@ where
 
     /// Writes buffered records and `record` in one transport write and buffers the rest.
     ///
-    /// Errors leave everything buffered for the next drain to report.
+    /// Errors leave the unwritten bytes buffered for the next drain to retry.
     fn write_last(&mut self, record: &[u8]) {
         debug_assert_ne!(self.context, 0);
         // SAFETY: same invariants as `parts`; borrowing fields separately leaves `out_buf`
@@ -185,6 +186,7 @@ where
             let bufs = [io::IoSlice::new(&self.out_buf), io::IoSlice::new(record)];
             stream.poll_write_vectored(cx, &bufs)
         } else {
+            // Let the next drain combine the buffer and record into one write.
             Poll::Ready(Ok(0))
         };
         let n = match res {
@@ -201,10 +203,37 @@ where
     }
 }
 
+/// Chooses a record length, the end of grouped slices, and a prefix of the next slice.
+#[inline]
+fn pack_record(bufs: &[io::IoSlice<'_>], i: usize, off: usize) -> (usize, usize, usize) {
+    let head_len = (bufs[i].len() - off).min(MAX_RECORD);
+    let mut len = head_len;
+    let (mut end, mut tail) = (i + 1, 0);
+    while end < bufs.len() && len < MAX_RECORD {
+        let next = bufs[end].len();
+        if len + next <= MAX_RECORD {
+            len += next;
+            end += 1;
+        } else {
+            // Avoid copying a prefix from slices larger than half a record to fill it.
+            // An isolated head and final slice already need two records; keep their boundary.
+            if next <= MAX_RECORD / 2
+                && (len > head_len || bufs[end + 1..].iter().any(|buf| !buf.is_empty()))
+            {
+                tail = MAX_RECORD - len;
+                len = MAX_RECORD;
+            }
+            break;
+        }
+    }
+    (len, end, tail)
+}
+
 /// Seals `bufs` into records and writes them with as few transport writes as possible.
 ///
-/// Small adjacent slices share records as in a flattened buffer. Records are buffered up to
-/// `OUT_BUF_CAPACITY`, and the last one goes out with the buffer instead of being copied.
+/// Small adjacent slices share records as in a flattened buffer. Sealing stops once buffered
+/// ciphertext reaches `OUT_BUF_CAPACITY`, except when at most `MAX_RECORD` plaintext bytes remain.
+/// The last record goes out with the buffer when possible; backpressure can leave it buffered too.
 /// The BIO accepts every record, so BoringSSL never holds a pending write that a retry with
 /// less data would fail.
 fn write_records<S>(
@@ -216,7 +245,7 @@ where
 {
     let wrapper = s.get_mut();
     if !wrapper.out_buf.is_empty() {
-        // Surface errors deferred by an earlier write before accepting more plaintext.
+        // Retry buffered records before accepting more plaintext.
         match wrapper.drain_out() {
             Err(e)
                 if e.kind() != io::ErrorKind::WouldBlock
@@ -251,25 +280,10 @@ where
             continue;
         }
 
-        // Top up the record from the next slices; one over half a record is sealed in place
-        // instead, since copying it would cost more than the record it saves.
-        let mut len = head.len().min(MAX_RECORD);
-        let (mut end, mut tail) = (i + 1, 0);
-        while end < bufs.len() && len < MAX_RECORD {
-            let next = bufs[end].len();
-            if len + next <= MAX_RECORD {
-                len += next;
-                end += 1;
-            } else {
-                if next <= MAX_RECORD / 2 {
-                    tail = MAX_RECORD - len;
-                    len = MAX_RECORD;
-                }
-                break;
-            }
-        }
+        let head_len = head.len().min(MAX_RECORD);
+        let (len, end, tail) = pack_record(bufs, i, off);
         s.get_mut().write_through = through && written.saturating_add(len) >= total;
-        let res = if end == i + 1 && tail == 0 {
+        let res = if len == head_len {
             s.write(&head[..len])
         } else {
             record.clear();
@@ -304,7 +318,7 @@ where
             off = 0;
         }
 
-        // The last record is written through, so it never waits on a full buffer.
+        // Finish a tail of at most one default record, even if backpressure leaves it buffered.
         if s.get_ref().out_buf.len() >= OUT_BUF_CAPACITY
             && total.saturating_sub(written) > MAX_RECORD
         {
@@ -376,7 +390,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     #[inline]
     /// Like [`SslStream::new`](ssl::SslStream::new).
     pub fn new(mut ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
-        // Each `SSL_write` then seals at most one record.
+        // Allow `SSL_write` to return after one plaintext fragment.
         ssl.set_mode(SslMode::ENABLE_PARTIAL_WRITE);
         SslStreamCore::new(ssl, StreamWrapper::new(stream)).map(SslStream)
     }
@@ -555,10 +569,41 @@ where
 
 #[cfg(test)]
 mod tests {
-    use btls::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod};
+    use btls::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVersion};
+    use foreign_types::ForeignType;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
+
+    #[test]
+    fn packing_preserves_in_place_heads_and_fills_longer_inputs() {
+        type PackingCase<'a> = (&'a [usize], usize, usize, (usize, usize, usize));
+        let cases: &[PackingCase<'_>] = &[
+            (&[10000, 7000], 0, 0, (10000, 1, 0)),
+            (&[8193, 8192], 0, 0, (8193, 1, 0)),
+            (&[16000, 500], 0, 0, (16000, 1, 0)),
+            (&[10000, 0, 7000, 0], 0, 0, (10000, 2, 0)),
+            (&[8193, 8192, 0], 0, 0, (8193, 1, 0)),
+            (&[7000, 0, 0], 0, 0, (7000, 3, 0)),
+            (&[0, 7000, 0], 1, 0, (7000, 3, 0)),
+            (&[23000, 7000, 0], 0, 13000, (10000, 1, 0)),
+            (&[10000, 7000, 10000], 0, 0, (MAX_RECORD, 1, 6384)),
+            (&[10000, 7000, 0, 10000], 0, 0, (MAX_RECORD, 1, 6384)),
+            (&[6000, 6000, 7000], 0, 0, (MAX_RECORD, 2, 4384)),
+            (&[8191, 8192], 0, 0, (16383, 2, 0)),
+            (&[8192, 8192], 0, 0, (MAX_RECORD, 2, 0)),
+            (&[8192, 8193, 1], 0, 0, (8192, 1, 0)),
+        ];
+        for &(lengths, i, off, expected) in cases {
+            let data: Vec<_> = lengths.iter().map(|&len| vec![0; len]).collect();
+            let bufs: Vec<_> = data.iter().map(|buf| io::IoSlice::new(buf)).collect();
+            assert_eq!(
+                pack_record(&bufs, i, off),
+                expected,
+                "{lengths:?}, {i}, {off}"
+            );
+        }
+    }
 
     /// Yields the given bytes in one read, then stays pending.
     struct Once(Vec<u8>);
@@ -702,11 +747,14 @@ mod tests {
         assert!(wrapper.out_buf.capacity() <= 2 * OUT_BUF_CAPACITY);
     }
 
-    /// Duplex transport whose writes can be held back, or fail once with `Interrupted`.
+    /// Duplex transport whose writes can stall, fail once, or keep returning `BrokenPipe`.
     struct Gate {
         io: DuplexStream,
         open: bool,
+        budget: usize,
         interrupt: bool,
+        interrupt_flush: bool,
+        broken: bool,
     }
 
     impl AsyncRead for Gate {
@@ -725,16 +773,27 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            if self.broken {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
             if mem::take(&mut self.interrupt) {
                 return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
             }
-            if !self.open {
+            if !self.open || self.budget == 0 {
                 return Poll::Pending;
             }
-            Pin::new(&mut self.io).poll_write(cx, buf)
+            let n = buf.len().min(self.budget);
+            let result = Pin::new(&mut self.io).poll_write(cx, &buf[..n]);
+            if let Poll::Ready(Ok(written)) = result {
+                self.budget -= written;
+            }
+            result
         }
 
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if mem::take(&mut self.interrupt_flush) {
+                return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
+            }
             Pin::new(&mut self.io).poll_flush(cx)
         }
 
@@ -744,9 +803,19 @@ mod tests {
     }
 
     async fn tls_pair() -> (SslStream<Gate>, SslStream<DuplexStream>) {
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tls_pair_with(SslVersion::TLS1_2, None).await
+    }
 
-        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+    async fn tls_pair_with(
+        version: SslVersion,
+        max_fragment: Option<usize>,
+    ) -> (SslStream<Gate>, SslStream<DuplexStream>) {
+        // Keep the complete test payload in the transport while writes are polled manually.
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acceptor.set_min_proto_version(Some(version)).unwrap();
+        acceptor.set_max_proto_version(Some(version)).unwrap();
         acceptor
             .set_private_key_file("tests/key.pem", SslFiletype::PEM)
             .unwrap();
@@ -757,6 +826,8 @@ mod tests {
         let mut server = SslStream::new(Ssl::new(acceptor.context()).unwrap(), server_io).unwrap();
 
         let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        connector.set_min_proto_version(Some(version)).unwrap();
+        connector.set_max_proto_version(Some(version)).unwrap();
         connector.set_ca_file("tests/cert.pem").unwrap();
         let ssl = connector
             .build()
@@ -764,10 +835,20 @@ mod tests {
             .unwrap()
             .into_ssl("localhost")
             .unwrap();
+        if let Some(fragment) = max_fragment {
+            // SAFETY: `ssl` owns a live SSL object and has not been shared or attached to a BIO.
+            assert_eq!(
+                unsafe { btls_sys::SSL_set_max_send_fragment(ssl.as_ptr(), fragment) },
+                1
+            );
+        }
         let gate = Gate {
             io: client_io,
             open: true,
+            budget: usize::MAX,
             interrupt: false,
+            interrupt_flush: false,
+            broken: false,
         };
         let mut client = SslStream::new(ssl, gate).unwrap();
 
@@ -811,6 +892,182 @@ mod tests {
         let mut buf = Vec::new();
         server.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"headerpayload");
+    }
+
+    #[tokio::test]
+    async fn short_fragments_preserve_vectored_prefix_after_retries() {
+        for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+            let (mut client, mut server) = tls_pair_with(version, Some(512)).await;
+            let segments: Vec<Vec<u8>> = [0, 3, 16384, 0, 40965, 1, 0, 32771, 95000, 0]
+                .into_iter()
+                .enumerate()
+                .map(|(i, len)| {
+                    (0..len)
+                        .map(|offset| ((offset ^ (offset >> 8)) as u8).wrapping_add(i as u8))
+                        .collect()
+                })
+                .collect();
+            let expected: Vec<_> = segments.iter().flatten().copied().collect();
+            let mut bufs: Vec<_> = segments.iter().map(|buf| io::IoSlice::new(buf)).collect();
+            let mut bufs = &mut bufs[..];
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+
+            // Smaller SSL fragments force repeated partial consumption inside a source slice.
+            client.get_mut().budget = 0;
+            let mut accepted = match Pin::new(&mut client).poll_write_vectored(&mut cx, bufs) {
+                Poll::Ready(Ok(n)) => n,
+                result => panic!("initial buffering failed: {result:?}"),
+            };
+            assert!(accepted > 0 && accepted < expected.len());
+            let mut boundary = 0;
+            assert!(!segments.iter().any(|buf| {
+                boundary += buf.len();
+                boundary == accepted
+            }));
+            io::IoSlice::advance_slices(&mut bufs, accepted);
+            assert!(Pin::new(&mut client)
+                .poll_write_vectored(&mut cx, bufs)
+                .is_pending());
+
+            // Split ciphertext writes both inside record headers and inside record bodies.
+            for budget in [37, 4093].into_iter().cycle().take(256) {
+                if accepted == expected.len() {
+                    break;
+                }
+                client.get_mut().budget = budget;
+                match Pin::new(&mut client).poll_write_vectored(&mut cx, bufs) {
+                    Poll::Ready(Ok(n)) => {
+                        assert!(n > 0 && n <= expected.len() - accepted);
+                        accepted += n;
+                        io::IoSlice::advance_slices(&mut bufs, n);
+                    }
+                    Poll::Pending => {}
+                    Poll::Ready(Err(e)) => panic!("write failed: {e}"),
+                }
+            }
+            assert_eq!(accepted, expected.len());
+
+            // A partial drain and a later flush error must not replay accepted plaintext.
+            client.get_mut().budget = 1;
+            assert!(Pin::new(&mut client).poll_flush(&mut cx).is_pending());
+            client.get_mut().budget = usize::MAX;
+            client.get_mut().interrupt_flush = true;
+            match Pin::new(&mut client).poll_flush(&mut cx) {
+                Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::Interrupted),
+                result => panic!("expected flush failure: {result:?}"),
+            }
+            client.flush().await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let mut received = Vec::new();
+            server.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn last_tail_stays_bounded_under_backpressure() {
+        for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+            let (mut client, mut server) = tls_pair_with(version, None).await;
+            client.get_mut().open = false;
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let data: Vec<_> = (0..5 * MAX_RECORD)
+                .map(|offset| (offset ^ (offset >> 8)) as u8)
+                .collect();
+            let consumed = match Pin::new(&mut client).poll_write(&mut cx, &data) {
+                Poll::Ready(Ok(n)) => n,
+                result => panic!("initial buffering failed: {result:?}"),
+            };
+            let buffered = client.0.get_ref().out_buf.len();
+            assert_eq!(consumed, data.len());
+            assert!(buffered > OUT_BUF_CAPACITY);
+            assert!(buffered <= data.len() + 5 * RECORD_OVERHEAD);
+            for _ in 0..4 {
+                assert!(Pin::new(&mut client)
+                    .poll_write(&mut cx, b"extra")
+                    .is_pending());
+                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+            }
+
+            client.get_mut().open = true;
+            client.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            server.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, data);
+        }
+    }
+
+    #[tokio::test]
+    async fn buffer_cap_and_persistent_errors_preserve_consumed_prefix() {
+        for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+            let (mut client, mut server) = tls_pair_with(version, None).await;
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let mut expected: Vec<_> = (0..6 * MAX_RECORD)
+                .map(|offset| (offset ^ (offset >> 8)) as u8)
+                .collect();
+
+            // The cap stops accepting plaintext while the transport is blocked.
+            client.get_mut().open = false;
+            let consumed = match Pin::new(&mut client).poll_write(&mut cx, &expected) {
+                Poll::Ready(Ok(n)) => n,
+                result => panic!("initial buffering failed: {result:?}"),
+            };
+            assert!(consumed > 0 && consumed < expected.len());
+            let buffered = client.0.get_ref().out_buf.len();
+            assert!(buffered >= OUT_BUF_CAPACITY);
+            assert!(Pin::new(&mut client)
+                .poll_write(&mut cx, &expected[consumed..])
+                .is_pending());
+            assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+
+            // A persistent error prevents every later write from accepting more input.
+            client.get_mut().broken = true;
+            for _ in 0..2 {
+                match Pin::new(&mut client).poll_flush(&mut cx) {
+                    Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+                    result => panic!("expected persistent flush failure: {result:?}"),
+                }
+                match Pin::new(&mut client).poll_write(&mut cx, &expected[consumed..]) {
+                    Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+                    result => panic!("expected persistent write failure: {result:?}"),
+                }
+                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+            }
+
+            client.get_mut().broken = false;
+            client.get_mut().open = true;
+            client.write_all(&expected[consumed..]).await.unwrap();
+            client.flush().await.unwrap();
+            assert!(client.0.get_ref().out_buf.is_empty());
+
+            // If the error first occurs after sealing, report the consumed plaintext once.
+            let tail = b"tail-queued-before-reporting-error";
+            client.get_mut().broken = true;
+            assert!(matches!(
+                Pin::new(&mut client).poll_write(&mut cx, tail),
+                Poll::Ready(Ok(n)) if n == tail.len()
+            ));
+            let buffered = client.0.get_ref().out_buf.len();
+            assert!(buffered > 0);
+            for _ in 0..2 {
+                match Pin::new(&mut client).poll_flush(&mut cx) {
+                    Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+                    result => panic!("expected deferred flush failure: {result:?}"),
+                }
+                match Pin::new(&mut client).poll_write(&mut cx, b"unaccepted") {
+                    Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+                    result => panic!("expected deferred write failure: {result:?}"),
+                }
+                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+            }
+
+            client.get_mut().broken = false;
+            client.shutdown().await.unwrap();
+            expected.extend_from_slice(tail);
+            let mut received = Vec::new();
+            server.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+        }
     }
 
     #[test]
