@@ -408,6 +408,7 @@ impl<S> AsyncRead for SslStream<S>
 where
     S: AsyncRead + AsyncWrite,
 {
+    #[inline]
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -437,6 +438,7 @@ where
         self.with_context(ctx, |s| cvt(write_records(s, &[io::IoSlice::new(buf)])))
     }
 
+    #[inline]
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -445,6 +447,7 @@ where
         self.with_context(ctx, |s| cvt(write_records(s, bufs)))
     }
 
+    #[inline]
     fn is_write_vectored(&self) -> bool {
         true
     }
