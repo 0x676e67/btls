@@ -35,22 +35,18 @@ struct StreamWrapper<S> {
     context: usize,
     read_buf: Vec<u8>,
     read_pos: usize,
-    // Sealed records not yet written to `stream`.
     out_buf: Vec<u8>,
-    // Set while sealing the last record of a write, which then goes out with `out_buf`.
     write_through: bool,
-    // Set once the sending phase of `SSL_shutdown` completes; later polls flush the BIO.
     shutdown_sent: bool,
 }
 
-/// Pending ciphertext at which sealing stops and writes return `Pending` until the transport
-/// drains it.
+/// Buffered ciphertext at which writes stop sealing and wait for the transport.
 const OUT_BUF_CAPACITY: usize = 64 * 1024;
 
-/// Largest plaintext BoringSSL seals into one TLS record.
+/// Largest plaintext in one TLS record.
 const MAX_RECORD: usize = 16 * 1024;
 
-/// Per-record room reserved for header, nonce and tag; covers the AEAD suites.
+/// Room reserved per record for header, nonce and tag.
 const RECORD_OVERHEAD: usize = 64;
 
 impl<S> fmt::Debug for StreamWrapper<S>
@@ -143,12 +139,7 @@ impl<S> StreamWrapper<S>
 where
     S: AsyncWrite,
 {
-    #[inline]
-    fn out_pending(&self) -> usize {
-        self.out_buf.len()
-    }
-
-    /// Writes buffered records to `stream`, keeping only what it did not accept.
+    /// Writes buffered records to `stream`, keeping what it does not accept.
     fn drain_out(&mut self) -> io::Result<()> {
         let mut pos = 0;
         let res = loop {
@@ -168,19 +159,16 @@ where
             }
         };
         if pos == self.out_buf.len() {
-            // Like the read buffer, an idle connection holds no write buffer.
             self.out_buf = Vec::new();
         } else {
-            // Partial writes must not leave sent bytes behind, or the buffer grows with traffic.
             self.out_buf.drain(..pos);
         }
         res
     }
 
-    /// Writes buffered records and then `record` in one transport write, buffering whatever
-    /// is not accepted, so the record itself needs no copy.
+    /// Writes buffered records and `record` in one transport write and buffers the rest.
     ///
-    /// Errors and `Pending` leave everything buffered for the drain that follows to report.
+    /// Errors leave everything buffered for the next drain to report.
     fn write_last(&mut self, record: &[u8]) {
         debug_assert_ne!(self.context, 0);
         // SAFETY: same invariants as `parts`; borrowing fields separately leaves `out_buf`
@@ -210,20 +198,12 @@ where
     }
 }
 
-/// Seals `bufs` into records and writes them to the transport in as few writes as possible.
+/// Seals `bufs` into records and writes them with as few transport writes as possible.
 ///
-/// Consecutive slices that fit together share one record, so an HTTP/2 frame header or an
-/// HTTP/1 chunk-size line rides with the data next to it. Only grouped slices are copied; a
-/// slice sealed alone, and every full record cut from a large slice, is sealed in place.
-/// Sealing stops once `OUT_BUF_CAPACITY` is pending. The last record goes to the transport
-/// in the same write as the records buffered ahead of it, so a write that seals one record
-/// copies no ciphertext. Records the transport cannot take yet stay buffered for the next
-/// write or flush.
-///
-/// [`SslStream::new`] enables `SSL_MODE_ENABLE_PARTIAL_WRITE`, so each `SSL_write` seals one
-/// record, and nothing is sealed while the buffer is full; the BIO therefore never refuses a
-/// record here. A refused record would stay pending in BoringSSL and fail any retry with less
-/// data.
+/// Adjacent slices that fit in one record are sealed together. Records are buffered up to
+/// `OUT_BUF_CAPACITY`, and the last one goes out with the buffer instead of being copied.
+/// The BIO accepts every record, so BoringSSL never holds a pending write that a retry with
+/// less data would fail.
 fn write_records<S>(
     s: &mut SslStreamCore<StreamWrapper<S>>,
     bufs: &[io::IoSlice<'_>],
@@ -232,12 +212,12 @@ where
     S: AsyncRead + AsyncWrite,
 {
     let wrapper = s.get_mut();
-    if wrapper.out_pending() > 0 {
-        // Retry buffered records before accepting more plaintext.
+    if !wrapper.out_buf.is_empty() {
+        // Surface errors deferred by an earlier write before accepting more plaintext.
         match wrapper.drain_out() {
             Err(e)
                 if e.kind() != io::ErrorKind::WouldBlock
-                    || wrapper.out_pending() >= OUT_BUF_CAPACITY =>
+                    || wrapper.out_buf.len() >= OUT_BUF_CAPACITY =>
             {
                 return Err(e);
             }
@@ -247,7 +227,6 @@ where
     // Slices may alias, so the sum can exceed `usize::MAX` on 32-bit targets.
     let total = bufs.iter().fold(0usize, |n, b| n.saturating_add(b.len()));
     if total > MAX_RECORD {
-        // Room for the records sealed ahead of the last one.
         let sealed = total.min(OUT_BUF_CAPACITY);
         wrapper
             .out_buf
@@ -257,7 +236,7 @@ where
     let mut written = 0;
     let mut err = None;
     let mut record = Vec::new();
-    // Cleared once a seal comes up short (a smaller fragment size), so the rest batches.
+    // A short seal means a smaller fragment size; batch the rest instead.
     let mut through = true;
     // The next unsealed byte is `bufs[i][off]`.
     let (mut i, mut off) = (0, 0);
@@ -269,7 +248,6 @@ where
             continue;
         }
 
-        // Extend the record with whole slices while they fit.
         let mut len = head.len().min(MAX_RECORD);
         let mut end = i + 1;
         while end < bufs.len() && len + bufs[end].len() <= MAX_RECORD {
@@ -309,15 +287,14 @@ where
             off = 0;
         }
 
-        if s.get_ref().out_pending() >= OUT_BUF_CAPACITY {
+        if s.get_ref().out_buf.len() >= OUT_BUF_CAPACITY {
             break;
         }
     }
 
     let drained = s.get_mut().drain_out();
     if written > 0 {
-        // The plaintext is sealed and buffered, so a retry would send it twice. Later writes or
-        // flushes retry any remaining ciphertext and report errors if the transport still fails.
+        // Sealed plaintext must be reported, or a retry would send it twice.
         return Ok(written);
     }
     match (err, drained) {
@@ -332,11 +309,6 @@ where
     S: AsyncWrite,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Only handshake flights and alerts can get here with a full buffer: `write_records`
-        // starts each `SSL_write` below the cap, and one record is one BIO write.
-        if self.out_pending() >= OUT_BUF_CAPACITY {
-            self.drain_out()?;
-        }
         if self.write_through {
             self.write_last(buf);
         } else {
@@ -375,8 +347,7 @@ fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
 
 /// An asynchronous version of [`btls::ssl::SslStream`].
 ///
-/// Writes are sealed into a buffer and handed to the transport as it accepts them; a write can
-/// complete with records still buffered, so call `flush` (or `shutdown`) before waiting on a
+/// Writes may stay buffered after they complete; call `flush` or `shutdown` before waiting on a
 /// reply or dropping the stream.
 #[derive(Debug)]
 pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
@@ -385,8 +356,8 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     #[inline]
     /// Like [`SslStream::new`](ssl::SslStream::new).
     pub fn new(mut ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
-        // Each `SSL_write` then seals at most one record, whatever the fragment size.
-        ssl.set_mode(SslMode::ENABLE_PARTIAL_WRITE | SslMode::ACCEPT_MOVING_WRITE_BUFFER);
+        // Each `SSL_write` then seals at most one record.
+        ssl.set_mode(SslMode::ENABLE_PARTIAL_WRITE);
         SslStreamCore::new(ssl, StreamWrapper::new(stream)).map(SslStream)
     }
 
@@ -453,8 +424,7 @@ impl<S> SslStream<S> {
     /// Returns a mutable reference to the underlying stream.
     ///
     /// Reading from it directly skips ciphertext that has already been buffered, and its readiness
-    /// (for example `readable()`) does not reflect that ciphertext. Writing to it directly can
-    /// overtake records that are still buffered; flush first.
+    /// (for example `readable()`) does not reflect that ciphertext. Flush before writing to it.
     pub fn get_mut(&mut self) -> &mut S {
         &mut self.0.get_mut().stream
     }
@@ -557,7 +527,7 @@ where
             }))?;
         }
 
-        // close_notify is buffered like any record and must reach the transport first.
+        // close_notify is buffered like any record.
         ready!(self.as_mut().poll_flush(ctx))?;
         self.get_pin_mut().poll_shutdown(ctx)
     }
@@ -640,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn write_buf_bounded_and_released() {
+    fn write_buf_released_when_drained() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let mut wrapper = StreamWrapper::new(Sink {
             budget: 0,
@@ -648,18 +618,14 @@ mod tests {
         });
         wrapper.context = &mut cx as *mut _ as usize;
 
-        // A blocked transport stops buffering once the cap is reached.
-        assert_eq!(
-            wrapper.write(&[1; OUT_BUF_CAPACITY]).unwrap(),
-            OUT_BUF_CAPACITY
-        );
-        let err = wrapper.write(&[2; 10]).unwrap_err();
+        wrapper.write_all(&[1; 100]).unwrap();
+        let err = wrapper.flush().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(wrapper.out_pending(), OUT_BUF_CAPACITY);
+        assert_eq!(wrapper.out_buf.len(), 100);
 
         wrapper.stream.budget = usize::MAX;
         wrapper.flush().unwrap();
-        assert_eq!(wrapper.stream.data.len(), OUT_BUF_CAPACITY);
+        assert_eq!(wrapper.stream.data, [1; 100]);
         assert_eq!(wrapper.out_buf.capacity(), 0);
     }
 
@@ -712,7 +678,7 @@ mod tests {
             let err = wrapper.drain_out().unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         }
-        assert_eq!(wrapper.out_pending(), 3 * CHUNK);
+        assert_eq!(wrapper.out_buf.len(), 3 * CHUNK);
         assert!(wrapper.out_buf.capacity() <= 2 * OUT_BUF_CAPACITY);
     }
 
