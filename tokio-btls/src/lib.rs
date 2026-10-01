@@ -35,8 +35,11 @@ struct StreamWrapper<S> {
     context: usize,
     read_buf: Vec<u8>,
     read_pos: usize,
+    // Sealed records not yet written to `stream`.
     out_buf: Vec<u8>,
+    // Set while sealing the last record of a write, which goes straight to `stream`.
     write_through: bool,
+    // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
     shutdown_sent: bool,
 }
 
@@ -200,7 +203,7 @@ where
 
 /// Seals `bufs` into records and writes them with as few transport writes as possible.
 ///
-/// Adjacent slices that fit in one record are sealed together. Records are buffered up to
+/// Small adjacent slices share records as in a flattened buffer. Records are buffered up to
 /// `OUT_BUF_CAPACITY`, and the last one goes out with the buffer instead of being copied.
 /// The BIO accepts every record, so BoringSSL never holds a pending write that a retry with
 /// less data would fail.
@@ -233,7 +236,7 @@ where
             .reserve(sealed + sealed.div_ceil(MAX_RECORD) * RECORD_OVERHEAD);
     }
 
-    let mut written = 0;
+    let mut written = 0usize;
     let mut err = None;
     let mut record = Vec::new();
     // A short seal means a smaller fragment size; batch the rest instead.
@@ -248,14 +251,25 @@ where
             continue;
         }
 
+        // Top up the record from the next slices; one over half a record is sealed in place
+        // instead, since copying it would cost more than the record it saves.
         let mut len = head.len().min(MAX_RECORD);
-        let mut end = i + 1;
-        while end < bufs.len() && len + bufs[end].len() <= MAX_RECORD {
-            len += bufs[end].len();
-            end += 1;
+        let (mut end, mut tail) = (i + 1, 0);
+        while end < bufs.len() && len < MAX_RECORD {
+            let next = bufs[end].len();
+            if len + next <= MAX_RECORD {
+                len += next;
+                end += 1;
+            } else {
+                if next <= MAX_RECORD / 2 {
+                    tail = MAX_RECORD - len;
+                    len = MAX_RECORD;
+                }
+                break;
+            }
         }
-        s.get_mut().write_through = through && written + len >= total;
-        let res = if len == head.len().min(MAX_RECORD) {
+        s.get_mut().write_through = through && written.saturating_add(len) >= total;
+        let res = if end == i + 1 && tail == 0 {
             s.write(&head[..len])
         } else {
             record.clear();
@@ -263,6 +277,9 @@ where
             record.extend_from_slice(head);
             for buf in &bufs[i + 1..end] {
                 record.extend_from_slice(buf);
+            }
+            if tail > 0 {
+                record.extend_from_slice(&bufs[end][..tail]);
             }
             s.write(&record)
         };
@@ -287,7 +304,10 @@ where
             off = 0;
         }
 
-        if s.get_ref().out_buf.len() >= OUT_BUF_CAPACITY {
+        // The last record is written through, so it never waits on a full buffer.
+        if s.get_ref().out_buf.len() >= OUT_BUF_CAPACITY
+            && total.saturating_sub(written) > MAX_RECORD
+        {
             break;
         }
     }

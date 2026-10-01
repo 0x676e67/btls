@@ -217,10 +217,26 @@ async fn vectored_writes_share_one_record() {
     let addr = listener.local_addr().unwrap();
     let header = b"frame header";
     let payload = vec![7; 1000];
-    let chunk = vec![8; 8 * 1024];
-    let chunked = [&b"2000\r\n"[..], &chunk, b"\r\n"].concat().repeat(4);
+    // HTTP/1 chunked framing around 8 KiB and 16 KiB chunks.
+    let chunks = [
+        (&b"2000\r\n"[..], vec![8; 8 * 1024]),
+        (b"4000\r\n", vec![6; 16 * 1024]),
+    ];
+    let chunked: Vec<Vec<u8>> = chunks
+        .iter()
+        .map(|(size, data)| [size, &data[..], b"\r\n"].concat().repeat(4))
+        .collect();
     let large = vec![9; 100 * 1024];
-    let expected = [&header[..], &payload, &chunked, &large].concat();
+    let expected = [
+        &header[..],
+        &payload,
+        &chunked[0],
+        &chunked[0],
+        &chunked[1],
+        &chunked[1],
+        &large,
+    ]
+    .concat();
 
     let server = async {
         let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
@@ -249,23 +265,35 @@ async fn vectored_writes_share_one_record() {
         assert_eq!(n, header.len() + payload.len());
         assert_eq!(writes.load(Ordering::Relaxed), 1);
 
-        // HTTP/1 chunked framing: size lines and CRLFs share records with the chunk data.
-        wire.lock().unwrap().clear();
-        let mut bufs = Vec::new();
-        for _ in 0..4 {
-            bufs.extend([
-                IoSlice::new(b"2000\r\n"),
-                IoSlice::new(&chunk),
-                IoSlice::new(b"\r\n"),
-            ]);
+        // Record counts for the same bytes written as slices and as one flattened buffer.
+        let mut counts = Vec::new();
+        for ((size, data), flat) in chunks.iter().zip(&chunked) {
+            wire.lock().unwrap().clear();
+            let mut bufs = Vec::new();
+            for _ in 0..4 {
+                bufs.extend([
+                    IoSlice::new(size),
+                    IoSlice::new(data),
+                    IoSlice::new(b"\r\n"),
+                ]);
+            }
+            let mut bufs = &mut bufs[..];
+            while !bufs.is_empty() {
+                let n = stream.write_vectored(bufs).await.unwrap();
+                IoSlice::advance_slices(&mut bufs, n);
+            }
+            stream.flush().await.unwrap();
+            let vectored = records(&wire.lock().unwrap());
+
+            wire.lock().unwrap().clear();
+            stream.write_all(flat).await.unwrap();
+            stream.flush().await.unwrap();
+            counts.push((vectored, records(&wire.lock().unwrap())));
         }
-        let mut bufs = &mut bufs[..];
-        while !bufs.is_empty() {
-            let n = stream.write_vectored(bufs).await.unwrap();
-            IoSlice::advance_slices(&mut bufs, n);
-        }
-        stream.flush().await.unwrap();
-        assert_eq!(records(&wire.lock().unwrap()), 4);
+        // 8 KiB chunks fill records like the flattened buffer.
+        assert_eq!(counts[0], (3, 3));
+        // 16 KiB chunks are sealed in place, so their framing gets records of its own.
+        assert_eq!(counts[1], (9, 5));
 
         stream.write_all(&large).await.unwrap();
         future::poll_fn(|ctx| Pin::new(&mut stream).poll_shutdown(ctx))
