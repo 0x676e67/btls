@@ -16,7 +16,6 @@ include = [
     "/*.toml",
     "/LICENSE-*",
     "/src",
-    "/tests",
 ]
 
 [package.metadata.docs.rs]
