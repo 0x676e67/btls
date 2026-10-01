@@ -37,6 +37,8 @@ struct StreamWrapper<S> {
     read_pos: usize,
     // Sealed records not yet written to `stream`.
     out_buf: Vec<u8>,
+    // Set while sealing the last record of a write, which then goes out with `out_buf`.
+    write_through: bool,
     // Set once the sending phase of `SSL_shutdown` completes; later polls flush the BIO.
     shutdown_sent: bool,
 }
@@ -79,6 +81,7 @@ impl<S> StreamWrapper<S> {
             read_buf: Vec::new(),
             read_pos: 0,
             out_buf: Vec::new(),
+            write_through: false,
             shutdown_sent: false,
         }
     }
@@ -173,6 +176,38 @@ where
         }
         res
     }
+
+    /// Writes buffered records and then `record` in one transport write, buffering whatever
+    /// is not accepted, so the record itself needs no copy.
+    ///
+    /// Errors and `Pending` leave everything buffered for the drain that follows to report.
+    fn write_last(&mut self, record: &[u8]) {
+        debug_assert_ne!(self.context, 0);
+        // SAFETY: same invariants as `parts`; borrowing fields separately leaves `out_buf`
+        // readable while the stream is written.
+        let cx = unsafe { &mut *(self.context as *mut Context<'_>) };
+        let stream = unsafe { Pin::new_unchecked(&mut self.stream) };
+        let pending = self.out_buf.len();
+        let res = if pending == 0 {
+            stream.poll_write(cx, record)
+        } else if stream.is_write_vectored() {
+            let bufs = [io::IoSlice::new(&self.out_buf), io::IoSlice::new(record)];
+            stream.poll_write_vectored(cx, &bufs)
+        } else {
+            Poll::Ready(Ok(0))
+        };
+        let n = match res {
+            Poll::Ready(Ok(n)) => n,
+            Poll::Ready(Err(_)) | Poll::Pending => 0,
+        };
+        if n < pending {
+            self.out_buf.drain(..n);
+            self.out_buf.extend_from_slice(record);
+        } else {
+            self.out_buf.clear();
+            self.out_buf.extend_from_slice(&record[n - pending..]);
+        }
+    }
 }
 
 /// Seals `bufs` into records and writes them to the transport in as few writes as possible.
@@ -180,8 +215,10 @@ where
 /// Consecutive slices that fit together share one record, so an HTTP/2 frame header or an
 /// HTTP/1 chunk-size line rides with the data next to it. Only grouped slices are copied; a
 /// slice sealed alone, and every full record cut from a large slice, is sealed in place.
-/// Sealing stops once `OUT_BUF_CAPACITY` is pending, and all sealed records then go out
-/// together. Records the transport cannot take yet stay buffered for the next write or flush.
+/// Sealing stops once `OUT_BUF_CAPACITY` is pending. The last record goes to the transport
+/// in the same write as the records buffered ahead of it, so a write that seals one record
+/// copies no ciphertext. Records the transport cannot take yet stay buffered for the next
+/// write or flush.
 ///
 /// [`SslStream::new`] enables `SSL_MODE_ENABLE_PARTIAL_WRITE`, so each `SSL_write` seals one
 /// record, and nothing is sealed while the buffer is full; the BIO therefore never refuses a
@@ -209,14 +246,19 @@ where
     }
     // Slices may alias, so the sum can exceed `usize::MAX` on 32-bit targets.
     let total = bufs.iter().fold(0usize, |n, b| n.saturating_add(b.len()));
-    let sealed = total.min(OUT_BUF_CAPACITY);
-    wrapper
-        .out_buf
-        .reserve(sealed + sealed.div_ceil(MAX_RECORD) * RECORD_OVERHEAD);
+    if total > MAX_RECORD {
+        // Room for the records sealed ahead of the last one.
+        let sealed = total.min(OUT_BUF_CAPACITY);
+        wrapper
+            .out_buf
+            .reserve(sealed + sealed.div_ceil(MAX_RECORD) * RECORD_OVERHEAD);
+    }
 
     let mut written = 0;
     let mut err = None;
     let mut record = Vec::new();
+    // Cleared once a seal comes up short (a smaller fragment size), so the rest batches.
+    let mut through = true;
     // The next unsealed byte is `bufs[i][off]`.
     let (mut i, mut off) = (0, 0);
     while i < bufs.len() {
@@ -234,6 +276,7 @@ where
             len += bufs[end].len();
             end += 1;
         }
+        s.get_mut().write_through = through && written + len >= total;
         let res = if len == head.len().min(MAX_RECORD) {
             s.write(&head[..len])
         } else {
@@ -245,6 +288,7 @@ where
             }
             s.write(&record)
         };
+        s.get_mut().write_through = false;
         let mut n = match res {
             Ok(n) => n,
             Err(e) => {
@@ -252,6 +296,7 @@ where
                 break;
             }
         };
+        through &= n == len;
         written += n;
         while n > 0 {
             let left = bufs[i].len() - off;
@@ -292,7 +337,11 @@ where
         if self.out_pending() >= OUT_BUF_CAPACITY {
             self.drain_out()?;
         }
-        self.out_buf.extend_from_slice(buf);
+        if self.write_through {
+            self.write_last(buf);
+        } else {
+            self.out_buf.extend_from_slice(buf);
+        }
         Ok(buf.len())
     }
 
@@ -559,6 +608,28 @@ mod tests {
             Poll::Ready(Ok(n))
         }
 
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let mut written = 0;
+            for buf in bufs {
+                match self.as_mut().poll_write(cx, buf) {
+                    Poll::Ready(Ok(n)) => written += n,
+                    _ => break,
+                }
+            }
+            if written == 0 {
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
@@ -589,6 +660,37 @@ mod tests {
         wrapper.stream.budget = usize::MAX;
         wrapper.flush().unwrap();
         assert_eq!(wrapper.stream.data.len(), OUT_BUF_CAPACITY);
+        assert_eq!(wrapper.out_buf.capacity(), 0);
+    }
+
+    #[test]
+    fn last_record_follows_buffered_records() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut wrapper = StreamWrapper::new(Sink {
+            budget: 0,
+            data: Vec::new(),
+        });
+        wrapper.context = &mut cx as *mut _ as usize;
+
+        wrapper.write_all(b"0123456789").unwrap();
+        wrapper.write_through = true;
+        // The transport stops inside the buffered records.
+        wrapper.stream.budget = 4;
+        wrapper.write_all(b"abcde").unwrap();
+        assert_eq!(wrapper.stream.data, b"0123");
+        assert_eq!(wrapper.out_buf, b"456789abcde");
+
+        // One vectored write takes the buffered records and the head of the last one.
+        wrapper.stream.budget = 15;
+        wrapper.write_all(b"fghij").unwrap();
+        assert_eq!(wrapper.stream.data, b"0123456789abcdefghi");
+        assert_eq!(wrapper.out_buf, b"j");
+
+        // With nothing buffered, the record goes straight out.
+        wrapper.stream.budget = usize::MAX;
+        wrapper.flush().unwrap();
+        wrapper.write_all(b"klm").unwrap();
+        assert_eq!(wrapper.stream.data, b"0123456789abcdefghijklm");
         assert_eq!(wrapper.out_buf.capacity(), 0);
     }
 
