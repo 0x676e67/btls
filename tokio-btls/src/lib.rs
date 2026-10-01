@@ -37,7 +37,7 @@ struct StreamWrapper<S> {
     read_pos: usize,
     // Sealed records not yet written to `stream`.
     out_buf: Vec<u8>,
-    // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
+    // Set once the sending phase of `SSL_shutdown` completes; later polls flush the BIO.
     shutdown_sent: bool,
 }
 
@@ -140,6 +140,7 @@ impl<S> StreamWrapper<S>
 where
     S: AsyncWrite,
 {
+    #[inline]
     fn out_pending(&self) -> usize {
         self.out_buf.len()
     }
@@ -194,7 +195,7 @@ where
 {
     let wrapper = s.get_mut();
     if wrapper.out_pending() > 0 {
-        // Reports an error deferred by an earlier write before more plaintext is accepted.
+        // Retry buffered records before accepting more plaintext.
         match wrapper.drain_out() {
             Err(e)
                 if e.kind() != io::ErrorKind::WouldBlock
@@ -247,8 +248,8 @@ where
 
     let drained = s.get_mut().drain_out();
     if written > 0 {
-        // The plaintext is sealed and buffered, so a retry would send it twice. A transport error
-        // comes back from the next write or flush, which drain the buffer again.
+        // The plaintext is sealed and buffered, so a retry would send it twice. Later writes or
+        // flushes retry any remaining ciphertext and report errors if the transport still fails.
         return Ok(written);
     }
     match (err, drained) {
@@ -459,21 +460,27 @@ where
 
     fn poll_shutdown(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<io::Result<()>> {
         if !self.0.get_ref().shutdown_sent {
-            match self.as_mut().with_context(ctx, |s| s.shutdown()) {
-                Ok(ShutdownResult::Sent) | Ok(ShutdownResult::Received) => {}
-                Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => {}
-                Err(ref e)
-                    if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE =>
-                {
-                    return Poll::Pending;
+            ready!(self.as_mut().with_context(ctx, |s| {
+                match s.shutdown() {
+                    Ok(ShutdownResult::Sent) | Ok(ShutdownResult::Received) => {}
+                    Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => {}
+                    Err(ref e)
+                        if e.code() == ErrorCode::WANT_READ
+                            || e.code() == ErrorCode::WANT_WRITE =>
+                    {
+                        return Poll::Pending;
+                    }
+                    Err(e) => {
+                        return Poll::Ready(Err(e
+                            .into_io_error()
+                            .unwrap_or_else(io::Error::other)));
+                    }
                 }
-                Err(e) => {
-                    return Poll::Ready(Err(e.into_io_error().unwrap_or_else(io::Error::other)));
-                }
-            }
-            // Calling `SSL_shutdown` again would wait for the peer's close_notify instead.
-            self.as_mut()
-                .with_context(ctx, |s| s.get_mut().shutdown_sent = true);
+
+                // Calling `SSL_shutdown` again would wait for the peer's close_notify instead.
+                s.get_mut().shutdown_sent = true;
+                Poll::Ready(Ok(()))
+            }))?;
         }
 
         // close_notify is buffered like any record and must reach the transport first.
