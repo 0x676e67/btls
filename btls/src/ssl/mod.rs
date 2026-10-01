@@ -4013,6 +4013,23 @@ impl SslRef {
         unsafe { cvt(ffi::SSL_set_mtu(self.as_ptr(), mtu as c_uint)) }
     }
 
+    /// Sets the maximum plaintext fragment length for TLS records sent by this connection.
+    ///
+    /// Handshake messages and application data are split into smaller records when needed.
+    /// Values are clamped to `512..=16_384` bytes; the default is `16_384`.
+    /// This is a local sending limit and does not negotiate a record-size limit with the peer.
+    /// DTLS handshake fragmentation is controlled by [`set_mtu`](Self::set_mtu) instead.
+    #[corresponds(SSL_set_max_send_fragment)]
+    pub fn set_max_send_fragment(&mut self, max_send_fragment: usize) -> Result<(), ErrorStack> {
+        // SAFETY: `self` holds a live SSL object; BoringSSL clamps the fragment length.
+        unsafe {
+            cvt(ffi::SSL_set_max_send_fragment(
+                self.as_ptr(),
+                max_send_fragment,
+            ))
+        }
+    }
+
     /// Sets the certificate.
     #[corresponds(SSL_use_certificate)]
     pub fn set_certificate(&mut self, cert: &X509Ref) -> Result<(), ErrorStack> {

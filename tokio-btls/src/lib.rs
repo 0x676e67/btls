@@ -570,7 +570,6 @@ where
 #[cfg(test)]
 mod tests {
     use btls::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVersion};
-    use foreign_types::ForeignType;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
@@ -829,18 +828,14 @@ mod tests {
         connector.set_min_proto_version(Some(version)).unwrap();
         connector.set_max_proto_version(Some(version)).unwrap();
         connector.set_ca_file("tests/cert.pem").unwrap();
-        let ssl = connector
+        let mut ssl = connector
             .build()
             .configure()
             .unwrap()
             .into_ssl("localhost")
             .unwrap();
         if let Some(fragment) = max_fragment {
-            // SAFETY: `ssl` owns a live SSL object and has not been shared or attached to a BIO.
-            assert_eq!(
-                unsafe { btls_sys::SSL_set_max_send_fragment(ssl.as_ptr(), fragment) },
-                1
-            );
+            ssl.set_max_send_fragment(fragment).unwrap();
         }
         let gate = Gate {
             io: client_io,
