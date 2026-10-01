@@ -463,7 +463,7 @@ jobs:
       working-directory: btls-sys/deps/boringssl/ssl/test/runner
       run: >-
         go test -shim-extra-flags=-seal-app-data
-        -test='Basic-*;*KeyUpdate*;*CBCRecordSplitting*;*MaxSendFragment*;Renegotiate-*;*Shutdown*;*EarlyData*;*FalseStart*;*Alert*'
+        -test='Basic-*;TLS-*;*KeyUpdate*;*CBCRecordSplitting*;*MaxSendFragment*;Renegotiate-*;*Shutdown*;*EarlyData*;*FalseStart*;*Alert*'
 
   cross-build:
     name: Cross build from macOS to Linux
