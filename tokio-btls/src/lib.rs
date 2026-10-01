@@ -18,7 +18,7 @@ use std::{
 
 use btls::{
     error::ErrorStack,
-    ssl::{self, ErrorCode, ShutdownResult, Ssl, SslRef, SslStream as SslStreamCore},
+    ssl::{self, ErrorCode, ShutdownResult, Ssl, SslMode, SslRef, SslStream as SslStreamCore},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -177,15 +177,16 @@ where
 
 /// Seals `bufs` into records and writes them to the transport in as few writes as possible.
 ///
-/// Several small slices, such as an HTTP/2 frame header and its payload, share one record.
-/// Larger input is sealed record by record until `OUT_BUF_CAPACITY` is pending, and all
-/// sealed records then go out together. Records the transport cannot take yet stay buffered
-/// for the next write or flush.
+/// Consecutive slices that fit together share one record, so an HTTP/2 frame header or an
+/// HTTP/1 chunk-size line rides with the data next to it. Only grouped slices are copied; a
+/// slice sealed alone, and every full record cut from a large slice, is sealed in place.
+/// Sealing stops once `OUT_BUF_CAPACITY` is pending, and all sealed records then go out
+/// together. Records the transport cannot take yet stay buffered for the next write or flush.
 ///
-/// Each `SSL_write` gets at most one record of plaintext and nothing is sealed while the buffer
-/// is full, so the BIO never refuses a record here whether or not the context enables
-/// `SSL_MODE_ENABLE_PARTIAL_WRITE`. A refused record would stay pending in BoringSSL and fail
-/// any retry with less data.
+/// [`SslStream::new`] enables `SSL_MODE_ENABLE_PARTIAL_WRITE`, so each `SSL_write` seals one
+/// record, and nothing is sealed while the buffer is full; the BIO therefore never refuses a
+/// record here. A refused record would stay pending in BoringSSL and fail any retry with less
+/// data.
 fn write_records<S>(
     s: &mut SslStreamCore<StreamWrapper<S>>,
     bufs: &[io::IoSlice<'_>],
@@ -215,34 +216,56 @@ where
 
     let mut written = 0;
     let mut err = None;
-    if total <= MAX_RECORD && bufs.iter().filter(|b| !b.is_empty()).count() > 1 {
-        let mut record = Vec::with_capacity(total);
-        for buf in bufs {
-            record.extend_from_slice(buf);
+    let mut record = Vec::new();
+    // The next unsealed byte is `bufs[i][off]`.
+    let (mut i, mut off) = (0, 0);
+    while i < bufs.len() {
+        let head = &bufs[i][off..];
+        if head.is_empty() {
+            i += 1;
+            off = 0;
+            continue;
         }
-        match s.write(&record) {
-            Ok(n) => written = n,
-            Err(e) => err = Some(e),
+
+        // Extend the record with whole slices while they fit.
+        let mut len = head.len().min(MAX_RECORD);
+        let mut end = i + 1;
+        while end < bufs.len() && len + bufs[end].len() <= MAX_RECORD {
+            len += bufs[end].len();
+            end += 1;
         }
-    } else {
-        'bufs: for buf in bufs {
-            let mut offset = 0;
-            while offset < buf.len() {
-                let end = buf.len().min(offset + MAX_RECORD);
-                match s.write(&buf[offset..end]) {
-                    Ok(n) => {
-                        offset += n;
-                        written += n;
-                    }
-                    Err(e) => {
-                        err = Some(e);
-                        break 'bufs;
-                    }
-                }
-                if s.get_ref().out_pending() >= OUT_BUF_CAPACITY {
-                    break 'bufs;
-                }
+        let res = if len == head.len().min(MAX_RECORD) {
+            s.write(&head[..len])
+        } else {
+            record.clear();
+            record.reserve(len);
+            record.extend_from_slice(head);
+            for buf in &bufs[i + 1..end] {
+                record.extend_from_slice(buf);
             }
+            s.write(&record)
+        };
+        let mut n = match res {
+            Ok(n) => n,
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        };
+        written += n;
+        while n > 0 {
+            let left = bufs[i].len() - off;
+            if n < left {
+                off += n;
+                break;
+            }
+            n -= left;
+            i += 1;
+            off = 0;
+        }
+
+        if s.get_ref().out_pending() >= OUT_BUF_CAPACITY {
+            break;
         }
     }
 
@@ -312,7 +335,9 @@ pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
 impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     #[inline]
     /// Like [`SslStream::new`](ssl::SslStream::new).
-    pub fn new(ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
+    pub fn new(mut ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
+        // Each `SSL_write` then seals at most one record, whatever the fragment size.
+        ssl.set_mode(SslMode::ENABLE_PARTIAL_WRITE | SslMode::ACCEPT_MOVING_WRITE_BUFFER);
         SslStreamCore::new(ssl, StreamWrapper::new(stream)).map(SslStream)
     }
 

@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context, Poll},
 };
@@ -161,10 +161,21 @@ async fn buffered_reads_preserve_record_boundaries() {
     future::join(server, client).await;
 }
 
-/// Counts writes that reach the transport.
+/// Counts writes that reach the transport and keeps the bytes written.
 struct CountWrites {
     stream: TcpStream,
     writes: Arc<AtomicUsize>,
+    wire: Arc<Mutex<Vec<u8>>>,
+}
+
+/// Number of TLS records in `wire`.
+fn records(wire: &[u8]) -> usize {
+    let (mut count, mut pos) = (0, 0);
+    while pos + 5 <= wire.len() {
+        pos += 5 + u16::from_be_bytes([wire[pos + 3], wire[pos + 4]]) as usize;
+        count += 1;
+    }
+    count
 }
 
 impl AsyncRead for CountWrites {
@@ -184,7 +195,11 @@ impl AsyncWrite for CountWrites {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.writes.fetch_add(1, Ordering::Relaxed);
-        Pin::new(&mut self.stream).poll_write(cx, buf)
+        let res = Pin::new(&mut self.stream).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = res {
+            self.wire.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+        res
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -202,8 +217,10 @@ async fn vectored_writes_share_one_record() {
     let addr = listener.local_addr().unwrap();
     let header = b"frame header";
     let payload = vec![7; 1000];
+    let chunk = vec![8; 8 * 1024];
+    let chunked = [&b"2000\r\n"[..], &chunk, b"\r\n"].concat().repeat(4);
     let large = vec![9; 100 * 1024];
-    let expected = [&header[..], &payload, &large].concat();
+    let expected = [&header[..], &payload, &chunked, &large].concat();
 
     let server = async {
         let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
@@ -217,9 +234,11 @@ async fn vectored_writes_share_one_record() {
 
         let ssl = Ssl::new(acceptor.context()).unwrap();
         let writes = Arc::new(AtomicUsize::new(0));
+        let wire = Arc::new(Mutex::new(Vec::new()));
         let stream = CountWrites {
             stream: listener.accept().await.unwrap().0,
             writes: writes.clone(),
+            wire: wire.clone(),
         };
         let mut stream = SslStream::new(ssl, stream).unwrap();
         Pin::new(&mut stream).accept().await.unwrap();
@@ -229,6 +248,24 @@ async fn vectored_writes_share_one_record() {
         let n = stream.write_vectored(&bufs).await.unwrap();
         assert_eq!(n, header.len() + payload.len());
         assert_eq!(writes.load(Ordering::Relaxed), 1);
+
+        // HTTP/1 chunked framing: size lines and CRLFs share records with the chunk data.
+        wire.lock().unwrap().clear();
+        let mut bufs = Vec::new();
+        for _ in 0..4 {
+            bufs.extend([
+                IoSlice::new(b"2000\r\n"),
+                IoSlice::new(&chunk),
+                IoSlice::new(b"\r\n"),
+            ]);
+        }
+        let mut bufs = &mut bufs[..];
+        while !bufs.is_empty() {
+            let n = stream.write_vectored(bufs).await.unwrap();
+            IoSlice::advance_slices(&mut bufs, n);
+        }
+        stream.flush().await.unwrap();
+        assert_eq!(records(&wire.lock().unwrap()), 4);
 
         stream.write_all(&large).await.unwrap();
         future::poll_fn(|ctx| Pin::new(&mut stream).poll_shutdown(ctx))
