@@ -40,7 +40,8 @@ struct StreamWrapper<S> {
     out_pos: usize,
 }
 
-/// Pending ciphertext beyond which records are written out without waiting for a flush.
+/// Pending ciphertext at which sealing stops and writes return `Pending` until the transport
+/// drains it.
 const OUT_BUF_CAPACITY: usize = 64 * 1024;
 
 /// Largest plaintext BoringSSL seals into one TLS record.
@@ -171,8 +172,10 @@ where
 /// sealed records then go out together. Records the transport cannot take yet stay buffered
 /// for the next write or flush.
 ///
-/// Nothing is sealed while the buffer is full, so the BIO never refuses a record here. A
-/// refused record would stay pending in BoringSSL and fail any retry with less data.
+/// Each `SSL_write` gets at most one record of plaintext and nothing is sealed while the buffer
+/// is full, so the BIO never refuses a record here whether or not the context enables
+/// `SSL_MODE_ENABLE_PARTIAL_WRITE`. A refused record would stay pending in BoringSSL and fail
+/// any retry with less data.
 fn write_records<S>(
     s: &mut SslStreamCore<StreamWrapper<S>>,
     bufs: &[io::IoSlice<'_>],
@@ -205,7 +208,8 @@ where
         'bufs: for buf in bufs {
             let mut offset = 0;
             while offset < buf.len() {
-                match s.write(&buf[offset..]) {
+                let end = buf.len().min(offset + MAX_RECORD);
+                match s.write(&buf[offset..end]) {
                     Ok(n) => {
                         offset += n;
                         written += n;
@@ -237,7 +241,8 @@ where
     S: AsyncWrite,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Only handshake and alert writes can get here with a full buffer.
+        // Only handshake, alert and post-handshake message writes can get here with a full
+        // buffer; `write_records` drains before sealing application data.
         if self.out_pending() >= OUT_BUF_CAPACITY {
             self.drain_out()?;
         }
@@ -274,6 +279,10 @@ fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
 }
 
 /// An asynchronous version of [`btls::ssl::SslStream`].
+///
+/// Writes are sealed into a buffer and handed to the transport as it accepts them; a write can
+/// complete with records still buffered, so call `flush` (or `shutdown`) before waiting on a
+/// reply.
 #[derive(Debug)]
 pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
 

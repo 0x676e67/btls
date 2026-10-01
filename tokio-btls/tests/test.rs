@@ -35,6 +35,7 @@ async fn google() {
     Pin::new(&mut stream).connect().await.unwrap();
 
     stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+    stream.flush().await.unwrap();
 
     let mut buf = vec![];
     stream.read_to_end(&mut buf).await.unwrap();
