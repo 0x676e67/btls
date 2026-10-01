@@ -95,6 +95,8 @@ struct Packer<'a> {
     // The next unsealed byte is `bufs[i][off]`.
     i: usize,
     off: usize,
+    // Largest record to pack: `MAX_RECORD` until a short seal reveals a smaller send fragment.
+    limit: usize,
     scratch: Vec<u8>,
 }
 
@@ -274,7 +276,11 @@ where
                 break;
             }
         };
-        through &= n == len;
+        if n < len {
+            // Pack no more than one fragment, so a smaller one copies no plaintext twice.
+            packer.limit = n;
+            through = false;
+        }
         written += n;
         packer.advance(n);
 
@@ -775,6 +781,7 @@ impl<'a> Packer<'a> {
             bufs,
             i: 0,
             off: 0,
+            limit: MAX_RECORD,
             scratch: Vec::new(),
         }
     }
@@ -795,7 +802,7 @@ impl<'a> Packer<'a> {
             self.off = 0;
         };
 
-        let head_len = head.len().min(MAX_RECORD);
+        let head_len = head.len().min(self.limit);
         let (len, end, tail) = self.pack();
         if len == head_len {
             return Some(&head[..len]);
@@ -821,26 +828,33 @@ impl<'a> Packer<'a> {
         &self.scratch
     }
 
-    /// Chooses a record length, the end of grouped slices, and a prefix of the next slice.
+    /// Chooses a record length of at most `limit`, the end of grouped slices, and a prefix of the
+    /// next slice.
     #[inline]
     fn pack(&self) -> (usize, usize, usize) {
-        let Packer { bufs, i, off, .. } = *self;
-        let head_len = (bufs[i].len() - off).min(MAX_RECORD);
+        let Packer {
+            bufs,
+            i,
+            off,
+            limit,
+            ..
+        } = *self;
+        let head_len = (bufs[i].len() - off).min(limit);
         let mut len = head_len;
         let (mut end, mut tail) = (i + 1, 0);
-        while end < bufs.len() && len < MAX_RECORD {
+        while end < bufs.len() && len < limit {
             let next = bufs[end].len();
-            if len + next <= MAX_RECORD {
+            if len + next <= limit {
                 len += next;
                 end += 1;
             } else {
                 // Avoid copying a prefix from slices larger than half a record to fill it.
                 // An isolated head and final slice already need two records; keep their boundary.
-                if next <= MAX_RECORD / 2
+                if next <= limit / 2
                     && (len > head_len || bufs[end + 1..].iter().any(|buf| !buf.is_empty()))
                 {
-                    tail = MAX_RECORD - len;
-                    len = MAX_RECORD;
+                    tail = limit - len;
+                    len = limit;
                 }
                 break;
             }
@@ -898,7 +912,19 @@ mod tests {
             (&[8192, 8192], 0, 0, (MAX_RECORD, 2, 0)),
             (&[8192, 8193, 1], 0, 0, (8192, 1, 0)),
         ];
-        for &(lengths, i, off, expected) in cases {
+        // After a short seal, records hold at most one 512-byte fragment.
+        let short: &[PackingCase<'_>] = &[
+            (&[16384], 0, 0, (512, 1, 0)),
+            (&[10000, 7000], 0, 9728, (272, 1, 0)),
+            (&[300, 100, 7000], 0, 0, (400, 2, 0)),
+            (&[300, 100, 200, 50], 0, 0, (512, 2, 112)),
+            (&[9, 16384, 9, 16384], 0, 0, (9, 1, 0)),
+            (&[9, 16384, 9, 16384], 1, 16000, (393, 3, 0)),
+        ];
+        let cases = cases.iter().map(|&case| (MAX_RECORD, case));
+        for (limit, (lengths, i, off, expected)) in
+            cases.chain(short.iter().map(|&case| (512, case)))
+        {
             let data: Vec<_> = lengths.iter().map(|&len| vec![0; len]).collect();
             let bufs: Vec<_> = data.iter().map(|buf| io::IoSlice::new(buf)).collect();
             assert_eq!(
@@ -906,12 +932,33 @@ mod tests {
                     bufs: &bufs,
                     i,
                     off,
+                    limit,
                     scratch: Vec::new()
                 }
                 .pack(),
                 expected,
-                "{lengths:?}, {i}, {off}"
+                "{lengths:?}, {i}, {off}, {limit}"
             );
+        }
+
+        // Whole writes: every record fits the limit, and the records add up to the input.
+        let segments: Vec<Vec<u8>> = [0, 3, 16384, 0, 40965, 1, 0, 300, 100, 200, 32771, 9]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| (0..len).map(|offset| (offset as u8) ^ (i as u8)).collect())
+            .collect();
+        let bufs: Vec<_> = segments.iter().map(|buf| io::IoSlice::new(buf)).collect();
+        for limit in [512, 1000, MAX_RECORD] {
+            let mut packer = Packer::new(&bufs);
+            packer.limit = limit;
+            let mut packed = Vec::new();
+            while let Some(record) = packer.next_record() {
+                assert!(!record.is_empty() && record.len() <= limit, "{limit}");
+                packed.extend_from_slice(record);
+                let n = record.len();
+                packer.advance(n);
+            }
+            assert_eq!(packed, segments.concat(), "{limit}");
         }
     }
 
