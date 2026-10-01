@@ -11,6 +11,13 @@ documentation = "https://docs.rs/tokio-btls"
 description = """
 An implementation of SSL streams for Tokio backed by BoringSSL
 """
+include = [
+    "/*.md",
+    "/*.toml",
+    "/LICENSE-*",
+    "/src",
+    "/tests",
+]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
