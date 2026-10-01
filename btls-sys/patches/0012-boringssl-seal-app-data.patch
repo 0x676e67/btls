@@ -27,8 +27,8 @@ limitations under the License.
  ssl/test/bssl_shim.cc    |  81 +++++
  ssl/test/test_config.cc  |   1 +
  ssl/test/test_config.h   |   1 +
- ssl/tls_record.cc        | 182 ++++++++++-
- 11 files changed, 1569 insertions(+), 32 deletions(-)
+ ssl/tls_record.cc        | 183 ++++++++++-
+ 11 files changed, 1570 insertions(+), 32 deletions(-)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 --- a/include/openssl/ssl.h
@@ -1674,7 +1674,7 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
  static size_t tls_seal_scatter_prefix_len(const SSLImpl *ssl, uint8_t type,
                                            size_t in_len) {
    size_t ret = SSL3_RT_HEADER_LENGTH;
-@@ -499,6 +519,150 @@ enum ssl_open_record_t ssl_process_alert(SSLImpl *ssl, uint8_t *out_alert,
+@@ -499,6 +519,151 @@ enum ssl_open_record_t ssl_process_alert(SSLImpl *ssl, uint8_t *out_alert,
    return ssl_open_record_error;
  }
  
@@ -1691,7 +1691,8 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
 +size_t tls_seal_body_iovec_budget(const SSLImpl *ssl) {
 +  // Only AES-GCM gathers. ChaCha20-Poly1305's one-pass assembly takes at most
 +  // two entries, and TLS 1.3 spends one on the content type. CBC stays at one
-+  // until SealScatterTest covers mixed in-place and gathered entries for it.
++  // too: SealScatterTest shows mixed entries seal correctly, but gathering is
++  // unmeasured for CBC.
 +  const SSL_CIPHER *cipher = ssl->s3->aead_write_ctx->cipher();
 +  if ((cipher->algorithm_enc & (SSL_AES128GCM | SSL_AES256GCM)) == 0) {
 +    return 1;
