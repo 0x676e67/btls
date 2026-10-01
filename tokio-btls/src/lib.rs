@@ -921,6 +921,7 @@ mod tests {
         SslAcceptor, SslConnector, SslConnectorBuilder, SslFiletype, SslMethod,
         SslSessionCacheMode, SslVersion,
     };
+    use foreign_types::ForeignTypeRef;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
@@ -1642,6 +1643,65 @@ mod tests {
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"response");
         assert!(tickets.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn key_update_ack_from_a_read_goes_out_first() {
+        /// Pending handshake bytes, or `None` where sealing is unavailable.
+        fn pending(ssl: &SslRef) -> Option<usize> {
+            ssl.seal_app_data_limits()
+                .map(|limits| limits.pending_len())
+        }
+
+        let large = vec![7; 100_000];
+        // Client writes before and after the read that queues the ack, and the client records
+        // in all, close_notify included.
+        let cases: [(&[u8], &[u8], usize); 4] = [
+            // No write: shutdown sends the ack.
+            (b"", b"", 2),
+            // Sealed on the stack.
+            (b"", b"pong", 3),
+            // Sealed behind a record buffered while the transport takes nothing.
+            (b"a", b"b", 4),
+            // Sealed into the buffer.
+            (b"", &large, 9),
+        ];
+        for (early, late, count) in cases {
+            let (mut client, mut server) = tls_pair_with(SslVersion::TLS1_3, None).await;
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            if !early.is_empty() {
+                client.get_mut().open = false;
+                let res = Pin::new(&mut client).poll_write(&mut cx, early);
+                assert!(matches!(res, Poll::Ready(Ok(n)) if n == early.len()));
+            }
+
+            // SAFETY: `server.ssl()` is a live `SSL`.
+            let requested = unsafe {
+                btls_sys::SSL_key_update(server.ssl().as_ptr(), btls_sys::SSL_KEY_UPDATE_REQUESTED)
+            };
+            assert_eq!(requested, 1);
+            server.write_all(b"ping").await.unwrap();
+            let mut buf = [0; 4];
+            client.read_exact(&mut buf).await.unwrap();
+            assert!(pending(client.ssl()).is_none_or(|len| len > 0));
+
+            if !late.is_empty() {
+                if early.is_empty() {
+                    client.write_all(late).await.unwrap();
+                } else {
+                    let res = Pin::new(&mut client).poll_write(&mut cx, late);
+                    assert!(matches!(res, Poll::Ready(Ok(n)) if n == late.len()));
+                    client.get_mut().open = true;
+                }
+                assert!(pending(client.ssl()).is_none_or(|len| len == 0));
+            }
+            client.shutdown().await.unwrap();
+            assert_eq!(records(&client.get_ref().tap).len(), count);
+
+            let mut received = Vec::new();
+            server.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, [early, late].concat());
+        }
     }
 
     #[tokio::test]
