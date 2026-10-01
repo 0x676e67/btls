@@ -79,7 +79,7 @@ fn c_allocs() -> u64 {
 /// AWS-LC. This definition takes precedence over glibc's and forwards to it.
 #[cfg(target_env = "gnu")]
 #[no_mangle]
-extern "C" fn malloc(size: usize) -> *mut std::ffi::c_void {
+unsafe extern "C" fn malloc(size: usize) -> *mut std::ffi::c_void {
     extern "C" {
         fn __libc_malloc(size: usize) -> *mut std::ffi::c_void;
     }
