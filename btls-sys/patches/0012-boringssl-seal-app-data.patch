@@ -17,23 +17,23 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ---
- include/openssl/ssl.h    |  58 ++++
+ include/openssl/ssl.h    |  59 ++++
  ssl/internal.h           |  82 +++++
- ssl/s3_pkt.cc            | 142 ++++++++-
+ ssl/s3_pkt.cc            | 148 ++++++++-
  ssl/ssl_aead_ctx.cc      |  84 +++--
  ssl/ssl_internal_test.cc | 253 +++++++++++++++
  ssl/ssl_lib.cc           |  29 ++
- ssl/ssl_test.cc          | 674 +++++++++++++++++++++++++++++++++++++++
+ ssl/ssl_test.cc          | 681 +++++++++++++++++++++++++++++++++++++++
  ssl/test/bssl_shim.cc    |  81 +++++
  ssl/test/test_config.cc  |   1 +
  ssl/test/test_config.h   |   1 +
  ssl/tls_record.cc        | 182 ++++++++++-
- 11 files changed, 1555 insertions(+), 32 deletions(-)
+ 11 files changed, 1569 insertions(+), 32 deletions(-)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -306,6 +306,64 @@ OPENSSL_EXPORT int SSL_has_pending(const SSL *ssl);
+@@ -306,6 +306,65 @@ OPENSSL_EXPORT int SSL_has_pending(const SSL *ssl);
  // https://crbug.com/466303.
  OPENSSL_EXPORT int SSL_write(SSL *ssl, const void *buf, int num);
  
@@ -83,7 +83,8 @@ diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 +// first. Each record then carries the maximum fragment, the last possibly
 +// fewer, regardless of slice boundaries. Only whole records are written, and
 +// sealing stops before a record that does not fit. Empty slices are skipped
-+// without reading their pointers. No slice may overlap `out`.
++// without reading their pointers. Neither the slices nor the `in` array may
++// overlap `out`.
 +//
 +// On `ssl_seal_app_data_success`, `out[0, *out_len)` must reach the peer
 +// before any later output of `ssl`, including what `SSL_write`,
@@ -209,7 +210,7 @@ diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
      if (is_early_data_write) {
        SSL_HANDSHAKE *hs = ssl->s3->hs.get();
        if (hs->early_data_written >= hs->early_session->ticket_max_early_data) {
-@@ -104,6 +104,146 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
+@@ -104,6 +104,152 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
    }
  }
  
@@ -265,6 +266,12 @@ diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
 +    Span<const CRYPTO_IVEC> in, size_t max_in, size_t *out_consumed) {
 +  *out_len = 0;
 +  *out_consumed = 0;
++  // The slices are read record by record while `out` is written.
++  if (buffers_alias(in.data(), in.size() * sizeof(CRYPTO_IVEC), out.data(),
++                    out.size())) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_OUTPUT_ALIASES_INPUT);
++    return ssl_seal_app_data_error;
++  }
 +  size_t pending;
 +  if (!tls_can_seal_app_data(ssl) ||
 +      !tls_seal_app_data_pending_len(ssl, &pending)) {
@@ -789,7 +796,7 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
-@@ -5275,6 +5275,680 @@ TEST_P(SSLVersionTest, SSLWriteRetry) {
+@@ -5275,6 +5275,687 @@ TEST_P(SSLVersionTest, SSLWriteRetry) {
    }
  }
  
@@ -1289,6 +1296,13 @@ diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
 +    EXPECT_EQ(SSL_get_error(server_.get(), -1), SSL_ERROR_SSL);
 +    EXPECT_TRUE(ExpectSingleError(lib, reason));
 +  };
++
++  // A slice array inside `out` is rejected before anything changes.
++  auto *in_out = reinterpret_cast<CRYPTO_IVEC *>(out.get());
++  in_out[0] = {data.data(), data.size()};
++  expect_error(Span(in_out, 1), ERR_LIB_SSL, SSL_R_OUTPUT_ALIASES_INPUT);
++  EXPECT_EQ(!!server->s3->pending_hs_data, is_tls13());
++  EXPECT_FALSE(server->s3->pending_flight);
 +
 +  // A slice that overlaps `out`, after a valid one.
 +  const CRYPTO_IVEC aliasing[] = {{data.data(), 10},
