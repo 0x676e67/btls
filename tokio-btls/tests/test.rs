@@ -343,6 +343,8 @@ async fn vectored_writes_for_version(version: SslVersion) {
         let mut stream = SslStream::new(ssl, stream).unwrap();
         Pin::new(&mut stream).accept().await.unwrap();
         assert_eq!(stream.ssl().version2(), Some(version));
+        // Without the sealing API (FIPS builds), writes take the `SSL_write` loop.
+        let sealed = stream.ssl().seal_app_data_limits().is_some();
 
         writes.store(0, Ordering::Relaxed);
         vectored_writes.store(0, Ordering::Relaxed);
@@ -363,17 +365,21 @@ async fn vectored_writes_for_version(version: SslVersion) {
                 IoSlice::advance_slices(&mut bufs, n);
             }
             stream.flush().await.unwrap();
-            let vectored = record_lengths(&wire.lock().unwrap()).len();
+            let vectored = record_lengths(&wire.lock().unwrap());
 
             wire.lock().unwrap().clear();
             stream.write_all(&flat).await.unwrap();
             stream.flush().await.unwrap();
-            // Larger slices stay in place, accepting extra framing records to avoid copying them.
-            assert_eq!(
-                (vectored, record_lengths(&wire.lock().unwrap()).len()),
-                counts,
-                "{version:?}: {len}-byte chunks x {count}"
-            );
+            let flattened = record_lengths(&wire.lock().unwrap());
+            let case = format!("{version:?}: {len}-byte chunks x {count}");
+            assert_eq!(flattened.len(), counts.1, "{case}");
+            if sealed {
+                // Sealed records ignore slice boundaries.
+                assert_eq!(vectored, flattened, "{case}");
+            } else {
+                // Larger slices stay in place, accepting extra framing records to avoid copying them.
+                assert_eq!(vectored.len(), counts.0, "{case}");
+            }
         }
         for ((sizes, count), pair) in pair_cases.iter().zip(&pairs) {
             let flat = pair.concat();
@@ -387,7 +393,7 @@ async fn vectored_writes_for_version(version: SslVersion) {
             }
             stream.flush().await.unwrap();
             let lengths = record_lengths(&wire.lock().unwrap());
-            if sizes.len() == 2 {
+            if sizes.len() == 2 && !sealed {
                 // In particular, 8193 + 8192 must not become a full record plus a one-byte tail.
                 assert!(
                     lengths.iter().all(|&len| len >= 64),
@@ -398,13 +404,20 @@ async fn vectored_writes_for_version(version: SslVersion) {
             wire.lock().unwrap().clear();
             stream.write_all(&flat).await.unwrap();
             stream.flush().await.unwrap();
+            let flattened = record_lengths(&wire.lock().unwrap());
             assert_eq!(
-                (lengths.len(), record_lengths(&wire.lock().unwrap()).len()),
+                (lengths.len(), flattened.len()),
                 (*count, *count),
                 "{version:?}: slice lengths {sizes:?}"
             );
+            if sealed {
+                // Sealed records ignore slice boundaries.
+                assert_eq!(lengths, flattened, "{version:?}: slice lengths {sizes:?}");
+            }
         }
-        assert!(vectored_writes.load(Ordering::Relaxed) > 0);
+        // Sealed records go out with plain writes; the `SSL_write` loop sends its last record
+        // together with the buffered ones.
+        assert_eq!(vectored_writes.load(Ordering::Relaxed) > 0, !sealed);
 
         stream.write_all(&large).await.unwrap();
         future::poll_fn(|ctx| Pin::new(&mut stream).poll_shutdown(ctx))
