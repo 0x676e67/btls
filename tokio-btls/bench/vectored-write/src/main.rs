@@ -4,11 +4,13 @@
 //! so only the write path differs. Both sides negotiate TLS 1.3 / AES-128-GCM.
 //!
 //! Modes:
-//!   tcp  - real loopback TCP; reader drains on another thread.
-//!   null - after the handshake the server transport accepts and discards every write, so the
-//!          numbers isolate the CPU cost of the TLS write path (no kernel copies).
+//!   tcp          - real loopback TCP; reader drains on another thread.
+//!   null         - after the handshake the server transport accepts and discards every write, so
+//!                  the numbers isolate the CPU cost of the TLS write path (no kernel copies).
+//!   null-partial - like null, but the transport takes at most 16 KiB per poll and returns
+//!                  `Pending` on every other poll: deterministic backpressure.
 //!
-//! Usage: vbench [tcp|null|both] [filter] [runs]
+//! Usage: vbench [tcp|null|null-partial|both] [filter] [runs]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -16,7 +18,7 @@ use std::{
     io::{self, IoSlice},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicU64, Ordering::Relaxed},
         Arc,
     },
     task::{Context, Poll},
@@ -32,29 +34,60 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
-// ===== allocation counter (Rust heap only, per thread) =====
+// ===== allocation counters (per thread) =====
 
 struct Counting;
 thread_local! {
     static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    static C_ALLOCS: Cell<u64> = const { Cell::new(0) };
+    /// Set while `Counting` runs, so `malloc` skips the Rust allocator's own calls.
+    static IN_RUST: Cell<bool> = const { Cell::new(false) };
 }
+
+/// Runs `f` as one Rust allocation: counted in `ALLOCS`, not in `C_ALLOCS`.
+fn rust_alloc(f: impl FnOnce() -> *mut u8) -> *mut u8 {
+    let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+    let _ = IN_RUST.try_with(|r| r.set(true));
+    let p = f();
+    let _ = IN_RUST.try_with(|r| r.set(false));
+    p
+}
+
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-        System.alloc(l)
+        rust_alloc(|| System.alloc(l))
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         System.dealloc(p, l)
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-        System.realloc(p, l, n)
+        rust_alloc(|| System.realloc(p, l, n))
     }
 }
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 fn allocs() -> u64 {
     ALLOCS.with(|c| c.get())
+}
+
+fn c_allocs() -> u64 {
+    C_ALLOCS.with(|c| c.get())
+}
+
+/// Counts the `malloc` calls that do not come from the Rust allocator. BoringSSL makes them
+/// directly (`SSLBuffer::EnsureCap`, the error queue) and through `OPENSSL_malloc`, as does
+/// AWS-LC. This definition takes precedence over glibc's and forwards to it.
+#[cfg(target_env = "gnu")]
+#[no_mangle]
+extern "C" fn malloc(size: usize) -> *mut std::ffi::c_void {
+    extern "C" {
+        fn __libc_malloc(size: usize) -> *mut std::ffi::c_void;
+    }
+    if !IN_RUST.try_with(Cell::get).unwrap_or(true) {
+        let _ = C_ALLOCS.try_with(|c| c.set(c.get() + 1));
+    }
+    // SAFETY: glibc's `malloc` itself; `free` and `realloc` stay glibc's, so blocks still pair up.
+    unsafe { __libc_malloc(size) }
 }
 
 fn minflt() -> u64 {
@@ -83,7 +116,6 @@ struct Stats {
     eagain: AtomicU64,
     bytes: AtomicU64,
     iovs: AtomicU64,
-    null: AtomicBool,
 }
 
 impl Stats {
@@ -102,9 +134,33 @@ impl Stats {
     }
 }
 
+/// Largest write the `null-partial` transport accepts per poll.
+const PARTIAL_MAX: usize = 16 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    Tcp,
+    Null,
+    NullPartial,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Tcp => "tcp",
+            Mode::Null => "null",
+            Mode::NullPartial => "null-partial",
+        }
+    }
+}
+
 struct Io {
     fd: AsyncFd<std::net::TcpStream>,
     stats: Arc<Stats>,
+    /// Writes go to the socket in `Tcp` mode and are discarded otherwise.
+    mode: Mode,
+    /// `null-partial`: the next write poll returns `Pending`.
+    skip: bool,
 }
 
 impl Io {
@@ -113,7 +169,26 @@ impl Io {
         Io {
             fd: AsyncFd::new(tcp).unwrap(),
             stats,
+            mode: Mode::Tcp,
+            skip: false,
         }
+    }
+
+    /// Discards a write of `len` bytes in the null modes.
+    fn discard(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<usize>> {
+        let mut n = len;
+        if self.mode == Mode::NullPartial {
+            let skip = self.skip;
+            self.skip = !skip;
+            if skip {
+                self.stats.pending.fetch_add(1, Relaxed);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            n = n.min(PARTIAL_MAX);
+        }
+        self.stats.bytes.fetch_add(n as u64, Relaxed);
+        Poll::Ready(Ok(n))
     }
 
     /// Runs `f` (exactly one syscall) when the socket is write-ready, counting calls and EAGAINs.
@@ -154,7 +229,7 @@ impl AsyncRead for Io {
         loop {
             let mut guard = std::task::ready!(self.fd.poll_read_ready(cx))?;
             let unfilled = buf.initialize_unfilled();
-            match guard.try_io(|s| (&*s.get_ref()).read(unfilled)) {
+            match guard.try_io(|s| s.get_ref().read(unfilled)) {
                 Ok(Ok(n)) => {
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
@@ -172,13 +247,13 @@ impl AsyncWrite for Io {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.stats.write.fetch_add(1, Relaxed);
-        self.stats.iovs.fetch_add(1, Relaxed);
-        if self.stats.null.load(Relaxed) {
-            self.stats.bytes.fetch_add(buf.len() as u64, Relaxed);
-            return Poll::Ready(Ok(buf.len()));
+        let io = self.get_mut();
+        io.stats.write.fetch_add(1, Relaxed);
+        io.stats.iovs.fetch_add(1, Relaxed);
+        if io.mode != Mode::Tcp {
+            return io.discard(cx, buf.len());
         }
-        self.poll_sys(cx, |mut s| s.write(buf))
+        io.poll_sys(cx, |mut s| s.write(buf))
     }
 
     fn poll_write_vectored(
@@ -186,14 +261,13 @@ impl AsyncWrite for Io {
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.stats.writev.fetch_add(1, Relaxed);
-        self.stats.iovs.fetch_add(bufs.len() as u64, Relaxed);
-        if self.stats.null.load(Relaxed) {
-            let n: usize = bufs.iter().map(|b| b.len()).sum();
-            self.stats.bytes.fetch_add(n as u64, Relaxed);
-            return Poll::Ready(Ok(n));
+        let io = self.get_mut();
+        io.stats.writev.fetch_add(1, Relaxed);
+        io.stats.iovs.fetch_add(bufs.len() as u64, Relaxed);
+        if io.mode != Mode::Tcp {
+            return io.discard(cx, bufs.iter().map(|b| b.len()).sum());
         }
-        self.poll_sys(cx, |mut s| s.write_vectored(bufs))
+        io.poll_sys(cx, |mut s| s.write_vectored(bufs))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -211,14 +285,8 @@ impl AsyncWrite for Io {
 
 // ===== TLS setup =====
 
-const CERT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/cert.pem"
-);
-const KEY: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/key.pem"
-);
+const CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/cert.pem");
+const KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/key.pem");
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Impl {
@@ -226,6 +294,8 @@ enum Impl {
     Rustls,
 }
 
+// Boxing the rustls stream would add an indirection to its measured path.
+#[allow(clippy::large_enum_variant)]
 enum Server {
     Btls(tokio_btls::SslStream<Io>),
     Rustls(tokio_rustls::server::TlsStream<Io>),
@@ -236,6 +306,12 @@ impl Server {
         match self {
             Server::Btls(s) => &s.get_ref().stats,
             Server::Rustls(s) => &s.get_ref().0.stats,
+        }
+    }
+    fn io(&mut self) -> &mut Io {
+        match self {
+            Server::Btls(s) => s.get_mut(),
+            Server::Rustls(s) => s.get_mut().0,
         }
     }
     fn cipher(&self) -> String {
@@ -352,6 +428,21 @@ fn cases() -> Vec<Case> {
             shape: vec![262144],
             total: 512 * M,
         },
+        Case {
+            name: "8x2KiB",
+            shape: vec![2048; 8],
+            total: 256 * M,
+        },
+        Case {
+            name: "4x4KiB",
+            shape: vec![4096; 4],
+            total: 256 * M,
+        },
+        Case {
+            name: "10000B+7000B",
+            shape: vec![10000, 7000],
+            total: 256 * M,
+        },
     ]
 }
 
@@ -365,9 +456,11 @@ struct Sample {
     writev: u64,
     sys: u64,
     eagain: u64,
+    pending: u64,
     iovs: u64,
     cipher_bytes: u64,
     allocs: u64,
+    c_allocs: u64,
     faults: u64,
     plain: u64,
 }
@@ -380,7 +473,7 @@ async fn write_all_vectored<W: AsyncWrite + Unpin>(
     let mut iov: Vec<IoSlice<'_>> = msg.iter().map(|b| IoSlice::new(b)).collect();
     let mut bufs = &mut iov[..];
     while !bufs.is_empty() {
-        let n = w.write_vectored(bufs).await?;
+        let n = std::future::poll_fn(|cx| poll_tls_write(Pin::new(&mut *w), cx, bufs)).await?;
         *calls += 1;
         if n == 0 {
             return Err(io::ErrorKind::WriteZero.into());
@@ -390,7 +483,19 @@ async fn write_all_vectored<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn run_one(imp: Impl, case: &Case, null: bool) -> (Sample, String) {
+/// One poll of the TLS write path, out of line so callgrind can collect only this
+/// (`--toggle-collect='*poll_tls_write*'`). `black_box` keeps it from becoming a tail call.
+#[inline(never)]
+fn poll_tls_write<W: AsyncWrite>(
+    w: Pin<&mut W>,
+    cx: &mut Context<'_>,
+    bufs: &[IoSlice<'_>],
+) -> Poll<io::Result<usize>> {
+    std::hint::black_box(w.poll_write_vectored(cx, bufs))
+}
+
+fn run_one(imp: Impl, case: &Case, mode: Mode) -> (Sample, String) {
+    let null = mode != Mode::Tcp;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let scale: usize = std::env::var("VB_SCALE")
@@ -468,12 +573,11 @@ fn run_one(imp: Impl, case: &Case, null: bool) -> (Sample, String) {
 
         let data: Vec<Vec<u8>> = case.shape.iter().map(|&n| vec![0xa5u8; n]).collect();
         let msg: Vec<&[u8]> = data.iter().map(|v| &v[..]).collect();
-        if null {
-            server.stats().null.store(true, Relaxed);
-        }
+        server.io().mode = mode;
         server.stats().reset();
         let mut calls = 0u64;
         let a0 = allocs();
+        let ca0 = c_allocs();
         let f0 = minflt();
         let c0 = thread_cpu();
         let t0 = Instant::now();
@@ -484,6 +588,7 @@ fn run_one(imp: Impl, case: &Case, null: bool) -> (Sample, String) {
         let cpu = (thread_cpu() - c0).as_secs_f64();
         let wall_w = t0.elapsed();
         let a1 = allocs();
+        let ca1 = c_allocs();
         let faults = minflt() - f0;
         let st = server.stats();
         let mut sample = Sample {
@@ -495,13 +600,15 @@ fn run_one(imp: Impl, case: &Case, null: bool) -> (Sample, String) {
             writev: st.writev.load(Relaxed),
             sys: st.sys.load(Relaxed),
             eagain: st.eagain.load(Relaxed),
+            pending: st.pending.load(Relaxed),
             iovs: st.iovs.load(Relaxed),
             cipher_bytes: st.bytes.load(Relaxed),
             allocs: a1 - a0,
+            c_allocs: ca1 - ca0,
             faults,
             plain: expected,
         };
-        st.null.store(false, Relaxed);
+        server.io().mode = Mode::Tcp;
         if null {
             dispatch!(&mut server, s => { let _ = s.shutdown().await; });
             drop(server);
@@ -530,17 +637,20 @@ fn main() {
     let mode = args.get(1).map(String::as_str).unwrap_or("both");
     let filter = args.get(2).cloned().unwrap_or_default();
     let runs: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
-    let modes: &[bool] = match mode {
-        "tcp" => &[false],
-        "null" => &[true],
-        _ => &[false, true],
+    let modes: &[Mode] = match mode {
+        "tcp" => &[Mode::Tcp],
+        "null" => &[Mode::Null],
+        "null-partial" => &[Mode::NullPartial],
+        _ => &[Mode::Tcp, Mode::Null],
     };
     println!(
-        "| mode | case | impl | MiB/s | writer CPU ns/KiB | reader CPU ns/KiB | TLS calls/msg | transport calls/MiB | write/writev | iovs/writev | syscalls/MiB | EAGAIN/MiB | records/MiB | Rust allocs/MiB | writer page faults/MiB |"
+        "| mode | case | impl | MiB/s | writer CPU ns/KiB | reader CPU ns/KiB | TLS calls/msg | transport calls/MiB | write/writev | iovs/writev | syscalls/MiB | EAGAIN/MiB | records/MiB | Rust allocs/MiB | writer page faults/MiB | transport polls/msg | transport Pending/MiB | C allocs/MiB |"
     );
-    println!("|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|");
+    println!(
+        "|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
     let mut printed_cipher = false;
-    for &null in modes {
+    for &mode in modes {
         for case in cases().iter().filter(|c| c.name.contains(&filter)) {
             let only = std::env::var("VB_IMPL").unwrap_or_default();
             for imp in [Impl::Btls, Impl::Rustls]
@@ -549,7 +659,7 @@ fn main() {
             {
                 let mut samples = Vec::new();
                 for _ in 0..runs {
-                    let (s, cipher) = run_one(imp, case, null);
+                    let (s, cipher) = run_one(imp, case, mode);
                     if !printed_cipher {
                         eprintln!("{imp:?} cipher: {cipher}");
                     }
@@ -564,8 +674,8 @@ fn main() {
                 // TLS 1.3 AES-GCM: 5 header + 1 inner type + 16 tag.
                 let records = (s.cipher_bytes.saturating_sub(s.plain)) as f64 / 22.0;
                 println!(
-                    "| {} | {} | {:?} | {:.0} | {:.0} | {:.0} | {:.2} | {:.1} | {}/{} | {:.2} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} |",
-                    if null { "null" } else { "tcp" },
+                    "| {} | {} | {:?} | {:.0} | {:.0} | {:.0} | {:.2} | {:.1} | {}/{} | {:.2} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} | {:.2} | {:.1} | {:.1} |",
+                    mode.name(),
                     case.name,
                     imp,
                     mib / s.secs,
@@ -581,6 +691,9 @@ fn main() {
                     records / mib,
                     s.allocs as f64 / mib,
                     s.faults as f64 / mib,
+                    tw / msgs,
+                    s.pending as f64 / mib,
+                    s.c_allocs as f64 / mib,
                 );
             }
         }

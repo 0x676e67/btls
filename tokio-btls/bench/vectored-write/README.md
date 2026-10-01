@@ -4,13 +4,14 @@ Compares the vectored write path of `tokio-btls` (branch `demo/tokio-btls-vector
 with `tokio-rustls` 0.26.6 + `rustls` 0.23.45 (aws-lc-rs). Both negotiate TLS 1.3 with AES-128-GCM.
 
 Measured on a 4 vCPU cloud VM over loopback. Tables show the median of 5 runs for TCP and 7 runs for null mode.
-Raw output is in [`results/`](results).
+Raw output is in [`results/`](results). [`results/baseline/`](results/baseline) holds the raw output and callgrind
+counts of the write path before `SSL_seal_app_data`, measured on a faster VM.
 
 ## Running
 
 ```sh
 cargo build --release
-./target/release/vbench [tcp|null|both] [case-filter] [runs]
+./target/release/vbench [tcp|null|null-partial|both] [case-filter] [runs]
 VB_IMPL=btls|rustls VB_SCALE=N ./target/release/vbench ...   # one impl / N times less data
 ```
 
@@ -19,9 +20,17 @@ VB_IMPL=btls|rustls VB_SCALE=N ./target/release/vbench ...   # one impl / N time
 - `tcp` mode uses loopback TCP through a counting `AsyncFd` transport. It counts every `write`/`writev`
   syscall and every EAGAIN exactly.
 - `null` mode makes the transport discard ciphertext after the handshake, so it measures TLS CPU only.
+- `null-partial` mode discards too, but takes at most 16 KiB per poll and returns `Pending` on every other
+  poll, so backpressure is deterministic.
 - Record counts are derived from ciphertext overhead, at 22 B per TLS 1.3 record.
+- "transport polls/msg" counts every `write`/`writev` call on the transport, including those that return
+  `Pending` (counted in "transport Pending/MiB").
 - "Rust allocs" counts the writer thread's global allocator. It includes one Vec per message made by the
-  harness and excludes BoringSSL's C mallocs.
+  harness.
+- "C allocs" counts the writer thread's other `malloc` calls (glibc only): BoringSSL's per-record write
+  buffer and `OPENSSL_malloc`, or AWS-LC's.
+- For callgrind, `--toggle-collect='*poll_tls_write*'` collects only the TLS write calls, for example
+  `VB_IMPL=btls VB_SCALE=16 valgrind --tool=callgrind --toggle-collect='*poll_tls_write*' ./target/release/vbench null 1x100B 1`.
 
 ## Summary
 
