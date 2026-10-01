@@ -18,17 +18,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ---
  include/openssl/ssl.h    |  58 ++++
- ssl/internal.h           |  81 +++++
+ ssl/internal.h           |  82 +++++
  ssl/s3_pkt.cc            | 142 ++++++++-
  ssl/ssl_aead_ctx.cc      |  84 +++--
- ssl/ssl_internal_test.cc | 250 +++++++++++++++
+ ssl/ssl_internal_test.cc | 253 +++++++++++++++
  ssl/ssl_lib.cc           |  29 ++
  ssl/ssl_test.cc          | 674 +++++++++++++++++++++++++++++++++++++++
  ssl/test/bssl_shim.cc    |  81 +++++
  ssl/test/test_config.cc  |   1 +
  ssl/test/test_config.h   |   1 +
- ssl/tls_record.cc        | 164 +++++++++-
- 11 files changed, 1533 insertions(+), 32 deletions(-)
+ ssl/tls_record.cc        | 182 ++++++++++-
+ 11 files changed, 1555 insertions(+), 32 deletions(-)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 --- a/include/openssl/ssl.h
@@ -117,7 +117,7 @@ diff --git a/ssl/internal.h b/ssl/internal.h
    bool GetIV(const uint8_t **out_iv, size_t *out_iv_len) const;
  
   private:
-@@ -3740,6 +3749,78 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
+@@ -3740,6 +3749,79 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
  int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
                         size_t *out_bytes_written, Span<const uint8_t> in);
  
@@ -143,24 +143,25 @@ diff --git a/ssl/internal.h b/ssl/internal.h
 +    Span<const CRYPTO_IVEC> in, size_t max_in, size_t *out_consumed);
 +
 +// SealInput reads the caller's slices for `tls_seal_app_data`, at most
-+// `max_in` bytes, and rejects pieces that overlap `out`.
++// `max_in` bytes. `tls_plan_seal_body` consumes it and rejects pieces that
++// overlap `out`.
 +class SealInput {
 + public:
 +  SealInput(Span<const CRYPTO_IVEC> slices, size_t max_in,
 +            Span<const uint8_t> out)
 +      : slices_(slices), remaining_(max_in), out_(out) {}
 +
-+  // Next sets `*out_piece` to the next input of at most `max` bytes, or to an
-+  // empty span once the input or `max_in` is exhausted. Empty slices are
-+  // skipped without reading their pointers. It returns false if the next
-+  // slice is NULL or overlaps `out`.
-+  bool Next(size_t max, Span<const uint8_t> *out_piece);
-+
 +  // Available returns how many of the next `limit` bytes exist, without
 +  // consuming or validating them.
 +  size_t Available(size_t limit) const;
 +
 + private:
++  // The planner walks the slices itself, so the cursor stays in registers
++  // while it copies short pieces.
++  friend bool tls_plan_seal_body(SealInput *input, size_t want, uint8_t *body,
++                                 size_t budget, CRYPTO_IOVEC *out_iovecs,
++                                 size_t *out_num, size_t *out_len);
++
 +  Span<const CRYPTO_IVEC> slices_;
 +  size_t index_ = 0, offset_ = 0, remaining_;
 +  Span<const uint8_t> out_;
@@ -492,7 +493,7 @@ diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
  #include <openssl/ssl.h>
  
  #include "../crypto/test/test_util.h"
-@@ -612,6 +618,250 @@ TEST(SSLTest, ECHPublicName) {
+@@ -612,6 +618,253 @@ TEST(SSLTest, ECHPublicName) {
    EXPECT_FALSE(ssl_is_valid_ech_public_name(StringAsBytes("0X01.")));
  }
  
@@ -505,15 +506,18 @@ diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
 +    state ^= state << 17;
 +    return static_cast<size_t>(state);
 +  };
-+  // Short lengths come first. Most slices are drawn from those.
-+  static const size_t kLens[] = {0,    1,    9,    15,    16,    17,   32,
++  // Short lengths come first, covering each size class of the inline copy.
++  // Most slices are drawn from those.
++  static const size_t kLens[] = {0,    1,    2,    3,    4,     7,    8,
++                                 9,    15,   16,   17,   31,    32,   33,
 +                                 1024, 4095, 4096, 4097, 16384, 40960};
++  static const size_t kNumShort = 14;
 +  static const size_t kWants[] = {1, 512, 16384};
 +  static const size_t kBudgets[] = {1, 2, 15, 16};
 +
 +  for (int iter = 0; iter < 1000; iter++) {
 +    SCOPED_TRACE(iter);
-+    const size_t num_lens = rand() % 4 == 0 ? std::size(kLens) : 7;
++    const size_t num_lens = rand() % 4 == 0 ? std::size(kLens) : kNumShort;
 +    std::vector<size_t> lens(rand() % 601);
 +    size_t total = 0;
 +    for (size_t &len : lens) {
@@ -1656,38 +1660,10 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
  static size_t tls_seal_scatter_prefix_len(const SSLImpl *ssl, uint8_t type,
                                            size_t in_len) {
    size_t ret = SSL3_RT_HEADER_LENGTH;
-@@ -499,6 +519,132 @@ enum ssl_open_record_t ssl_process_alert(SSLImpl *ssl, uint8_t *out_alert,
+@@ -499,6 +519,150 @@ enum ssl_open_record_t ssl_process_alert(SSLImpl *ssl, uint8_t *out_alert,
    return ssl_open_record_error;
  }
  
-+bool SealInput::Next(size_t max, Span<const uint8_t> *out_piece) {
-+  max = std::min(max, remaining_);
-+  while (max > 0 && index_ < slices_.size()) {
-+    const CRYPTO_IVEC &slice = slices_[index_];
-+    if (offset_ == slice.len) {  // also skips empty slices
-+      index_++;
-+      offset_ = 0;
-+      continue;
-+    }
-+    if (slice.in == nullptr) {
-+      OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
-+      return false;
-+    }
-+    const size_t n = std::min(slice.len - offset_, max);
-+    Span<const uint8_t> piece(slice.in + offset_, n);
-+    if (buffers_alias(piece.data(), piece.size(), out_.data(), out_.size())) {
-+      OPENSSL_PUT_ERROR(SSL, SSL_R_OUTPUT_ALIASES_INPUT);
-+      return false;
-+    }
-+    offset_ += n;
-+    remaining_ -= n;
-+    *out_piece = piece;
-+    return true;
-+  }
-+  *out_piece = {};
-+  return true;
-+}
-+
 +size_t SealInput::Available(size_t limit) const {
 +  limit = std::min(limit, remaining_);
 +  size_t n = 0;
@@ -1710,43 +1686,89 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
 +         (ssl_protocol_version(ssl) >= TLS1_3_VERSION ? 1 : 0);
 +}
 +
++// seal_copy copies `len` bytes of a piece into the record body. Pieces of at
++// most 32 bytes, as from many small slices, are copied with fixed-size moves
++// rather than a call.
++static void seal_copy(uint8_t *dst, const uint8_t *src, size_t len) {
++  if (len > 32) {
++    OPENSSL_memcpy(dst, src, len);
++  } else if (len >= 16) {
++    OPENSSL_memcpy(dst, src, 16);
++    OPENSSL_memcpy(dst + len - 16, src + len - 16, 16);
++  } else if (len >= 8) {
++    OPENSSL_memcpy(dst, src, 8);
++    OPENSSL_memcpy(dst + len - 8, src + len - 8, 8);
++  } else if (len >= 4) {
++    OPENSSL_memcpy(dst, src, 4);
++    OPENSSL_memcpy(dst + len - 4, src + len - 4, 4);
++  } else if (len > 0) {
++    dst[0] = src[0];
++    dst[len / 2] = src[len / 2];
++    dst[len - 1] = src[len - 1];
++  }
++}
++
 +bool tls_plan_seal_body(SealInput *input, size_t want, uint8_t *body,
 +                        size_t budget, CRYPTO_IOVEC *out_iovecs,
 +                        size_t *out_num, size_t *out_len) {
++  // Work on local copies, which `body` cannot alias.
++  const Span<const CRYPTO_IVEC> slices = input->slices_;
++  const Span<const uint8_t> out = input->out_;
++  size_t index = input->index_, offset = input->offset_;
++  const size_t limit = std::min(want, input->remaining_);
 +  size_t n = 0, pos = 0, run = 0;  // body[run, pos) is the open copied run
-+  while (pos < want) {
-+    Span<const uint8_t> piece;
-+    if (!input->Next(want - pos, &piece)) {
++  while (pos < limit && index < slices.size()) {
++    const CRYPTO_IVEC &slice = slices[index];
++    if (offset == slice.len) {  // an empty slice; its pointer is not read
++      index++;
++      offset = 0;
++      continue;
++    }
++    if (slice.in == nullptr) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
 +      OPENSSL_memset(body, 0, pos);
 +      return false;
 +    }
-+    if (piece.empty()) {
-+      break;  // the input ended before `want`
++    const size_t len = std::min(slice.len - offset, limit - pos);
++    const uint8_t *piece = slice.in + offset;
++    if (buffers_alias(piece, len, out.data(), out.size())) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_OUTPUT_ALIASES_INPUT);
++      OPENSSL_memset(body, 0, pos);
++      return false;
 +    }
-+    const bool whole = pos == 0 && piece.size() == want;
-+    const bool last = pos + piece.size() == want;
++    offset += len;
++    if (offset == slice.len) {
++      index++;
++      offset = 0;
++    }
++
++    const bool whole = pos == 0 && len == want;
++    const bool last = pos + len == want;
 +    const size_t open = pos > run ? 1 : 0;
 +    // Gathering spends a slot on the open run, one on the piece and, unless
 +    // the record ends here, keeps one for whatever follows.
-+    if (whole || (piece.size() >= kSealGatherMin &&
++    if (whole || (len >= kSealGatherMin &&
 +                  n + open + 1 + (last ? 0 : 1) <= budget)) {
 +      if (open) {
 +        BSSL_CHECK(n < budget);
 +        out_iovecs[n++] = {body + run, body + run, pos - run};
 +      }
 +      BSSL_CHECK(n < budget);
-+      out_iovecs[n++] = {body + pos, piece.data(), piece.size()};
-+      pos += piece.size();
++      out_iovecs[n++] = {body + pos, piece, len};
++      pos += len;
 +      run = pos;
 +    } else {
-+      OPENSSL_memcpy(body + pos, piece.data(), piece.size());
-+      pos += piece.size();
++      seal_copy(body + pos, piece, len);
++      pos += len;
 +    }
 +  }
 +  if (pos > run) {
 +    BSSL_CHECK(n < budget);
 +    out_iovecs[n++] = {body + run, body + run, pos - run};
 +  }
++  input->index_ = index;
++  input->offset_ = offset;
++  input->remaining_ -= pos;
 +  *out_num = n;
 +  *out_len = pos;
 +  return true;
