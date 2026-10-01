@@ -35,9 +35,10 @@ struct StreamWrapper<S> {
     context: usize,
     read_buf: Vec<u8>,
     read_pos: usize,
-    // Sealed records not yet written to `stream`: `out_buf[out_pos..]`.
+    // Sealed records not yet written to `stream`.
     out_buf: Vec<u8>,
-    out_pos: usize,
+    // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
+    shutdown_sent: bool,
 }
 
 /// Pending ciphertext at which sealing stops and writes return `Pending` until the transport
@@ -78,7 +79,7 @@ impl<S> StreamWrapper<S> {
             read_buf: Vec::new(),
             read_pos: 0,
             out_buf: Vec::new(),
-            out_pos: 0,
+            shutdown_sent: false,
         }
     }
 }
@@ -140,28 +141,36 @@ where
     S: AsyncWrite,
 {
     fn out_pending(&self) -> usize {
-        self.out_buf.len() - self.out_pos
+        self.out_buf.len()
     }
 
-    /// Writes buffered records to `stream` until none remain.
+    /// Writes buffered records to `stream`, keeping only what it did not accept.
     fn drain_out(&mut self) -> io::Result<()> {
-        while self.out_pos < self.out_buf.len() {
+        let mut pos = 0;
+        let res = loop {
+            if pos == self.out_buf.len() {
+                break Ok(());
+            }
             debug_assert_ne!(self.context, 0);
             // SAFETY: same invariants as `parts`; borrowing fields separately leaves `out_buf`
             // readable while the stream is written.
             let cx = unsafe { &mut *(self.context as *mut Context<'_>) };
             let stream = unsafe { Pin::new_unchecked(&mut self.stream) };
-            match stream.poll_write(cx, &self.out_buf[self.out_pos..]) {
-                Poll::Ready(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
-                Poll::Ready(Ok(n)) => self.out_pos += n,
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Pending => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            match stream.poll_write(cx, &self.out_buf[pos..]) {
+                Poll::Ready(Ok(0)) => break Err(io::ErrorKind::WriteZero.into()),
+                Poll::Ready(Ok(n)) => pos += n,
+                Poll::Ready(Err(e)) => break Err(e),
+                Poll::Pending => break Err(io::Error::from(io::ErrorKind::WouldBlock)),
             }
+        };
+        if pos == self.out_buf.len() {
+            // Like the read buffer, an idle connection holds no write buffer.
+            self.out_buf = Vec::new();
+        } else {
+            // Partial writes must not leave sent bytes behind, or the buffer grows with traffic.
+            self.out_buf.drain(..pos);
         }
-        // Like the read buffer, an idle connection holds no write buffer.
-        self.out_buf = Vec::new();
-        self.out_pos = 0;
-        Ok(())
+        res
     }
 }
 
@@ -184,10 +193,20 @@ where
     S: AsyncRead + AsyncWrite,
 {
     let wrapper = s.get_mut();
-    if wrapper.out_pending() >= OUT_BUF_CAPACITY {
-        wrapper.drain_out()?;
+    if wrapper.out_pending() > 0 {
+        // Reports an error deferred by an earlier write before more plaintext is accepted.
+        match wrapper.drain_out() {
+            Err(e)
+                if e.kind() != io::ErrorKind::WouldBlock
+                    || wrapper.out_pending() >= OUT_BUF_CAPACITY =>
+            {
+                return Err(e);
+            }
+            _ => {}
+        }
     }
-    let total: usize = bufs.iter().map(|b| b.len()).sum();
+    // Slices may alias, so the sum can exceed `usize::MAX` on 32-bit targets.
+    let total = bufs.iter().fold(0usize, |n, b| n.saturating_add(b.len()));
     let sealed = total.min(OUT_BUF_CAPACITY);
     wrapper
         .out_buf
@@ -226,13 +245,16 @@ where
         }
     }
 
-    match s.get_mut().drain_out() {
-        Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
-        _ => {}
+    let drained = s.get_mut().drain_out();
+    if written > 0 {
+        // The plaintext is sealed and buffered, so a retry would send it twice. A transport error
+        // comes back from the next write or flush, which drain the buffer again.
+        return Ok(written);
     }
-    match err {
-        Some(e) if written == 0 => Err(e),
-        _ => Ok(written),
+    match (err, drained) {
+        (Some(e), _) => Err(e),
+        (None, Err(e)) if e.kind() != io::ErrorKind::WouldBlock => Err(e),
+        (None, _) => Ok(0),
     }
 }
 
@@ -241,8 +263,8 @@ where
     S: AsyncWrite,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Only handshake, alert and post-handshake message writes can get here with a full
-        // buffer; `write_records` drains before sealing application data.
+        // Only handshake flights and alerts can get here with a full buffer: `write_records`
+        // starts each `SSL_write` below the cap, and one record is one BIO write.
         if self.out_pending() >= OUT_BUF_CAPACITY {
             self.drain_out()?;
         }
@@ -282,7 +304,7 @@ fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
 ///
 /// Writes are sealed into a buffer and handed to the transport as it accepts them; a write can
 /// complete with records still buffered, so call `flush` (or `shutdown`) before waiting on a
-/// reply.
+/// reply or dropping the stream.
 #[derive(Debug)]
 pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
 
@@ -356,7 +378,8 @@ impl<S> SslStream<S> {
     /// Returns a mutable reference to the underlying stream.
     ///
     /// Reading from it directly skips ciphertext that has already been buffered, and its readiness
-    /// (for example `readable()`) does not reflect that ciphertext.
+    /// (for example `readable()`) does not reflect that ciphertext. Writing to it directly can
+    /// overtake records that are still buffered; flush first.
     pub fn get_mut(&mut self) -> &mut S {
         &mut self.0.get_mut().stream
     }
@@ -432,15 +455,22 @@ where
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<io::Result<()>> {
-        match self.as_mut().with_context(ctx, |s| s.shutdown()) {
-            Ok(ShutdownResult::Sent) | Ok(ShutdownResult::Received) => {}
-            Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => {}
-            Err(ref e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {
-                return Poll::Pending;
+        if !self.0.get_ref().shutdown_sent {
+            match self.as_mut().with_context(ctx, |s| s.shutdown()) {
+                Ok(ShutdownResult::Sent) | Ok(ShutdownResult::Received) => {}
+                Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => {}
+                Err(ref e)
+                    if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE =>
+                {
+                    return Poll::Pending;
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(e.into_io_error().unwrap_or_else(io::Error::other)));
+                }
             }
-            Err(e) => {
-                return Poll::Ready(Err(e.into_io_error().unwrap_or_else(io::Error::other)));
-            }
+            // Calling `SSL_shutdown` again would wait for the peer's close_notify instead.
+            self.as_mut()
+                .with_context(ctx, |s| s.get_mut().shutdown_sent = true);
         }
 
         // close_notify is buffered like any record and must reach the transport first.
@@ -451,6 +481,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use btls::ssl::{SslAcceptor, SslConnector, SslFiletype, SslMethod};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
     use super::*;
 
     /// Yields the given bytes in one read, then stays pending.
@@ -470,9 +503,9 @@ mod tests {
         }
     }
 
-    /// Takes every write while open, stays pending while closed.
+    /// Takes up to `budget` bytes, then stays pending.
     struct Sink {
-        open: bool,
+        budget: usize,
         data: Vec<u8>,
     }
 
@@ -482,11 +515,13 @@ mod tests {
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            if !self.open {
+            if self.budget == 0 {
                 return Poll::Pending;
             }
-            self.data.extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
+            let n = buf.len().min(self.budget);
+            self.budget -= n;
+            self.data.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -502,7 +537,7 @@ mod tests {
     fn write_buf_bounded_and_released() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let mut wrapper = StreamWrapper::new(Sink {
-            open: false,
+            budget: 0,
             data: Vec::new(),
         });
         wrapper.context = &mut cx as *mut _ as usize;
@@ -516,10 +551,143 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(wrapper.out_pending(), OUT_BUF_CAPACITY);
 
-        wrapper.stream.open = true;
+        wrapper.stream.budget = usize::MAX;
         wrapper.flush().unwrap();
         assert_eq!(wrapper.stream.data.len(), OUT_BUF_CAPACITY);
         assert_eq!(wrapper.out_buf.capacity(), 0);
+    }
+
+    #[test]
+    fn write_buf_bounded_under_partial_writes() {
+        const CHUNK: usize = 16 * 1024;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut wrapper = StreamWrapper::new(Sink {
+            budget: 0,
+            data: Vec::new(),
+        });
+        wrapper.context = &mut cx as *mut _ as usize;
+
+        wrapper.write_all(&[0; 3 * CHUNK]).unwrap();
+        for _ in 0..64 {
+            wrapper.write_all(&[1; CHUNK]).unwrap();
+            // The transport takes one record's worth per drain and never catches up.
+            wrapper.stream.budget = CHUNK;
+            let err = wrapper.drain_out().unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(wrapper.out_pending(), 3 * CHUNK);
+        assert!(wrapper.out_buf.capacity() <= 2 * OUT_BUF_CAPACITY);
+    }
+
+    /// Duplex transport whose writes can be held back, or fail once with `Interrupted`.
+    struct Gate {
+        io: DuplexStream,
+        open: bool,
+        interrupt: bool,
+    }
+
+    impl AsyncRead for Gate {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Gate {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if mem::take(&mut self.interrupt) {
+                return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
+            }
+            if !self.open {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    async fn tls_pair() -> (SslStream<Gate>, SslStream<DuplexStream>) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor
+            .set_private_key_file("tests/key.pem", SslFiletype::PEM)
+            .unwrap();
+        acceptor
+            .set_certificate_chain_file("tests/cert.pem")
+            .unwrap();
+        let acceptor = acceptor.build();
+        let mut server = SslStream::new(Ssl::new(acceptor.context()).unwrap(), server_io).unwrap();
+
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        connector.set_ca_file("tests/cert.pem").unwrap();
+        let ssl = connector
+            .build()
+            .configure()
+            .unwrap()
+            .into_ssl("localhost")
+            .unwrap();
+        let gate = Gate {
+            io: client_io,
+            open: true,
+            interrupt: false,
+        };
+        let mut client = SslStream::new(ssl, gate).unwrap();
+
+        let (connected, accepted) = tokio::join!(
+            Pin::new(&mut client).connect(),
+            Pin::new(&mut server).accept()
+        );
+        connected.unwrap();
+        accepted.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn shutdown_resumes_after_backpressure() {
+        let (mut client, mut server) = tls_pair().await;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        // close_notify is queued, but the transport takes nothing yet.
+        client.get_mut().open = false;
+        assert!(Pin::new(&mut client).poll_shutdown(&mut cx).is_pending());
+
+        client.get_mut().open = true;
+        let res = Pin::new(&mut client).poll_shutdown(&mut cx);
+        assert!(matches!(res, Poll::Ready(Ok(()))));
+
+        let mut buf = Vec::new();
+        server.read_to_end(&mut buf).await.unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sealed_write_survives_transport_error() {
+        let (mut client, mut server) = tls_pair().await;
+
+        // The record is sealed before the transport fails; reporting the error would make the
+        // caller send the plaintext again.
+        client.get_mut().interrupt = true;
+        assert_eq!(client.write(b"headerpayload").await.unwrap(), 13);
+        client.shutdown().await.unwrap();
+
+        let mut buf = Vec::new();
+        server.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"headerpayload");
     }
 
     #[test]
