@@ -1180,11 +1180,13 @@ mod tests {
 
     /// Duplex transport whose writes can stall, fail once, or keep returning `BrokenPipe`.
     ///
+    /// A spent `budget` stalls writes, or fails them with `TimedOut` if `fail_when_spent` is set.
     /// It counts write polls and copies the bytes it accepts into `tap`.
     struct Gate {
         io: DuplexStream,
         open: bool,
         budget: usize,
+        fail_when_spent: bool,
         interrupt: bool,
         interrupt_flush: bool,
         broken: bool,
@@ -1214,6 +1216,9 @@ mod tests {
             }
             if mem::take(&mut self.interrupt) {
                 return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
+            }
+            if self.open && self.budget == 0 && self.fail_when_spent {
+                return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
             }
             if !self.open || self.budget == 0 {
                 return Poll::Pending;
@@ -1289,6 +1294,7 @@ mod tests {
             io: client_io,
             open: true,
             budget: usize::MAX,
+            fail_when_spent: false,
             interrupt: false,
             interrupt_flush: false,
             broken: false,
@@ -1353,6 +1359,43 @@ mod tests {
         let mut buf = Vec::new();
         server.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"headerpayload");
+    }
+
+    #[tokio::test]
+    async fn sealed_records_survive_a_failed_drain() {
+        for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+            let (mut client, mut server) = tls_pair_with(version, None).await;
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let data: Vec<_> = (0..3 * MAX_RECORD)
+                .map(|offset| (offset ^ (offset >> 8)) as u8)
+                .collect();
+
+            // The transport takes part of the records, then fails. The sealed plaintext must be
+            // reported, or the caller would send it again.
+            client.get_mut().budget = 20_000;
+            client.get_mut().fail_when_spent = true;
+            let n = match Pin::new(&mut client).poll_write(&mut cx, &data) {
+                Poll::Ready(Ok(n)) => n,
+                result => panic!("expected the sealed length: {result:?}"),
+            };
+            assert_eq!(n, data.len());
+            assert_eq!(client.get_ref().tap.len(), 20_000);
+            let buffered = client.0.get_ref().out_buf.len();
+            assert!(buffered > n - 20_000);
+
+            // The buffered rest stays put, and the error surfaces on the next call.
+            match Pin::new(&mut client).poll_flush(&mut cx) {
+                Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+                result => panic!("expected the deferred error: {result:?}"),
+            }
+            assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+
+            client.get_mut().budget = usize::MAX;
+            client.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            server.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, data);
+        }
     }
 
     #[tokio::test]
