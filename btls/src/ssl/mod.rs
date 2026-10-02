@@ -4065,8 +4065,9 @@ impl SslRef {
     /// Returns `Ok(None)`, changing nothing, when writes must go through
     /// [`SslStream::ssl_write`] or `out` cannot hold the pending handshake records and the first
     /// record; [`seal_app_data_limits`](Self::seal_app_data_limits) tells which. Records ignore
-    /// slice boundaries. The first `written` bytes of `out` must reach the peer before anything
-    /// the connection writes later, including a shutdown or an alert.
+    /// slice boundaries, and a success consumes at least one byte unless `max_in` is 0 or `bufs`
+    /// holds no bytes. The first `written` bytes of `out` must reach the peer before anything the
+    /// connection writes later, including a shutdown or an alert.
     #[corresponds(SSL_seal_app_data)]
     pub fn seal_app_data(
         &mut self,

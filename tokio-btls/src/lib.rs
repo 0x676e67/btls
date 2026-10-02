@@ -19,7 +19,10 @@ use std::{
 
 use btls::{
     error::ErrorStack,
-    ssl::{self, ErrorCode, ShutdownResult, Ssl, SslMode, SslRef, SslStream as SslStreamCore},
+    ssl::{
+        self, ErrorCode, SealLimits, ShutdownResult, Ssl, SslMode, SslRef,
+        SslStream as SslStreamCore,
+    },
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -56,8 +59,8 @@ struct StreamWrapper<S> {
     transport: Transport<S>,
     read_buf: ReadBuffer,
     out_buf: OutBuffer,
-    // Set while sealing the last record of a write, which goes straight to the transport;
-    // `write` clears it if the transport returns `Pending` or an error.
+    // Set while sealing the last record of a write, which goes straight to the transport unless
+    // `out_buf` is blocked.
     write_through: bool,
     // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
     shutdown_sent: bool,
@@ -90,6 +93,10 @@ struct OutBuffer {
     bytes: Vec<u8>,
     // `bytes[..pos]` is written. `pos < bytes.len()` unless both are 0.
     pos: usize,
+    // Set when the transport refuses records in `retry` or `write_last`; while set, a write only
+    // buffers its records. `retry` recomputes it as each write starts, so it is stale between
+    // writes, and `StreamWrapper::flush` ignores it.
+    blocked: bool,
 }
 
 /// Packs the slices of one write into the plaintext of successive records.
@@ -106,76 +113,8 @@ struct Packer<'a> {
     scratch: Vec<u8>,
 }
 
-/// Seals `bufs` into records and writes them with as few transport writes as possible.
-///
-/// BoringSSL seals records across slice boundaries straight into caller memory: on the stack for
-/// a write of at most `MAX_RECORD` bytes with nothing buffered, otherwise after the buffered
-/// records, within [`seal_budget`]. [`ssl_write_records`] handles the states it declines. Either
-/// way, a transport that returned `Pending` in this call is not polled again.
-fn write_records<S>(
-    s: &mut SslStreamCore<StreamWrapper<S>>,
-    bufs: &[io::IoSlice<'_>],
-) -> io::Result<usize>
-where
-    S: AsyncRead + AsyncWrite,
-{
-    let wrapper = s.get_mut();
-    wrapper.out_buf.retry(&mut wrapper.transport)?;
-    // Records stay buffered after a retry only if the transport returned `Pending`, which
-    // registered the waker.
-    let blocked = !wrapper.out_buf.is_empty();
-    // Slices may alias, so the sum can exceed `usize::MAX` on 32-bit targets.
-    let total = bufs.iter().fold(0usize, |n, b| n.saturating_add(b.len()));
-    if total > 0 && total <= MAX_RECORD && !blocked {
-        match seal_on_stack(s, bufs, total)? {
-            Some(n) if n < total => {
-                // The stack records are buffered; the rest follows them in the same transport
-                // write. `n < total`, the exact sum here, so the advance stays in bounds.
-                let mut slices = bufs.to_vec();
-                let mut rest = &mut slices[..];
-                io::IoSlice::advance_slices(&mut rest, n);
-                // Sealed plaintext must be reported; an error after it recurs on the next call.
-                return Ok(n + write_buffered(s, rest, total - n, false).unwrap_or(0));
-            }
-            Some(n) => return Ok(n),
-            None => {}
-        }
-    }
-    write_buffered(s, bufs, total, blocked)
-}
-
-/// Seals `bufs` after the buffered records, through [`seal_into_out_buf`] where BoringSSL allows
-/// it, otherwise with [`ssl_write_records`].
-fn write_buffered<S>(
-    s: &mut SslStreamCore<StreamWrapper<S>>,
-    bufs: &[io::IoSlice<'_>],
-    total: usize,
-    blocked: bool,
-) -> io::Result<usize>
-where
-    S: AsyncRead + AsyncWrite,
-{
-    if total > 0 {
-        if let Some(limits) = s.ssl().seal_app_data_limits() {
-            let budget = seal_budget(
-                limits.max_fragment(),
-                limits.record_overhead(),
-                limits.pending_len(),
-                s.get_ref().out_buf.len(),
-                total,
-            );
-            if let Some(max_out) = limits.sealed_len(budget) {
-                if let Some(n) = seal_into_out_buf(s, bufs, budget, max_out, blocked)? {
-                    return Ok(n);
-                }
-            }
-        }
-    }
-    ssl_write_records(s, bufs, total, blocked)
-}
-
 /// Plaintext to seal in one call: stop once about `OUT_BUF_CAPACITY` of ciphertext is buffered,
-/// but take a final tail of at most `MAX_RECORD` bytes too, like [`ssl_write_records`].
+/// but take a final tail of at most `MAX_RECORD` bytes too, like [`SslStream::ssl_write_records`].
 ///
 /// `pending` handshake bytes go out ahead of the records, after the `buffered` ones.
 fn seal_budget(
@@ -197,149 +136,6 @@ fn seal_budget(
         total
     } else {
         cap
-    }
-}
-
-/// Seals a write of at most `MAX_RECORD` bytes on the stack and sends it with one transport
-/// write.
-///
-/// Records that cannot all fit, with small send fragments or a large pending flight, are buffered
-/// instead for the caller to send with the rest. Returns `Ok(None)` if BoringSSL declines,
-/// changing nothing, or seals no plaintext.
-#[inline(never)] // keep the 17 KiB frame out of `write_records`
-fn seal_on_stack<S>(
-    s: &mut SslStreamCore<StreamWrapper<S>>,
-    bufs: &[io::IoSlice<'_>],
-    total: usize,
-) -> io::Result<Option<usize>>
-where
-    S: AsyncRead + AsyncWrite,
-{
-    let mut out = [MaybeUninit::<u8>::uninit(); SEAL_STACK_LEN];
-    let sealed = match s.ssl_mut().seal_app_data(bufs, total, &mut out) {
-        Ok(Some(sealed)) => sealed,
-        Ok(None) => return Ok(None),
-        Err(e) => return Err(io::Error::other(ssl::Error::from(e))),
-    };
-    // SAFETY: `seal_app_data` initialized the first `written` bytes of `out`, and `written` is at
-    // most `out.len()`.
-    let records = unsafe { slice::from_raw_parts(out.as_ptr().cast::<u8>(), sealed.written) };
-    let wrapper = s.get_mut();
-    debug_assert!(wrapper.out_buf.is_empty(), "sealing wrote to the BIO");
-    if sealed.consumed < total {
-        wrapper.out_buf.push(records);
-    } else {
-        // What the transport does not take stays buffered; an error surfaces on the next call.
-        wrapper.out_buf.write_last(&mut wrapper.transport, records);
-    }
-    Ok((sealed.consumed > 0).then_some(sealed.consumed))
-}
-
-/// Seals up to `budget` plaintext bytes after the buffered records, then drains them unless the
-/// transport is `blocked`.
-///
-/// `max_out` is the output room the budget needs. Returns `Ok(None)` if BoringSSL declines,
-/// changing nothing, or seals no plaintext.
-fn seal_into_out_buf<S>(
-    s: &mut SslStreamCore<StreamWrapper<S>>,
-    bufs: &[io::IoSlice<'_>],
-    budget: usize,
-    max_out: usize,
-    blocked: bool,
-) -> io::Result<Option<usize>>
-where
-    S: AsyncRead + AsyncWrite,
-{
-    // The buffer lives behind the BIO, so move it out while the `SslRef` is borrowed mutably.
-    let (mut out, pos) = s.get_mut().out_buf.take(max_out);
-    let res = s
-        .ssl_mut()
-        .seal_app_data(bufs, budget, &mut out.spare_capacity_mut()[..max_out]);
-    if let Ok(Some(sealed)) = res {
-        // SAFETY: `seal_app_data` initialized the first `written` bytes of the spare capacity,
-        // and `written` is at most `max_out`, which `take` made room for.
-        unsafe { out.set_len(out.len() + sealed.written) };
-    }
-    let wrapper = s.get_mut();
-    wrapper.out_buf.restore(out, pos);
-    let consumed = match res {
-        Ok(Some(sealed)) if sealed.consumed > 0 => sealed.consumed,
-        Ok(_) => return Ok(None),
-        Err(e) => return Err(io::Error::other(ssl::Error::from(e))),
-    };
-    if !blocked {
-        // A drain error leaves the records buffered for the next call to report.
-        let _ = wrapper.out_buf.drain(&mut wrapper.transport);
-    }
-    Ok(Some(consumed))
-}
-
-/// Seals `bufs` with one `SSL_write` per record and writes them with as few transport writes as
-/// possible.
-///
-/// Small adjacent slices share records as in a flattened buffer. Sealing stops once buffered
-/// ciphertext reaches `OUT_BUF_CAPACITY`, except when at most `MAX_RECORD` plaintext bytes remain.
-/// The last record goes out with the buffer when possible; backpressure can leave it buffered too,
-/// and then the transport is not polled again. The BIO accepts every record, so BoringSSL never
-/// holds a pending write that a retry with less data would fail.
-fn ssl_write_records<S>(
-    s: &mut SslStreamCore<StreamWrapper<S>>,
-    bufs: &[io::IoSlice<'_>],
-    total: usize,
-    mut blocked: bool,
-) -> io::Result<usize>
-where
-    S: AsyncRead + AsyncWrite,
-{
-    s.get_mut().out_buf.reserve(total);
-
-    let mut written = 0usize;
-    let mut err = None;
-    let mut packer = Packer::new(bufs);
-    // A short seal means a smaller fragment size; batch the rest instead. A blocked transport
-    // would refuse the last record too.
-    let mut through = !blocked;
-    while let Some(plaintext) = packer.next_record() {
-        let len = plaintext.len();
-        let last = through && written.saturating_add(len) >= total;
-        s.get_mut().write_through = last;
-        let res = s.write(plaintext);
-        blocked |= last && !mem::take(&mut s.get_mut().write_through);
-        let n = match res {
-            Ok(n) => n,
-            Err(e) => {
-                err = Some(e);
-                break;
-            }
-        };
-        if n < len {
-            // Pack no more than one fragment, so a smaller one copies no plaintext twice.
-            packer.limit = n;
-            through = false;
-        }
-        written += n;
-        packer.advance(n);
-
-        // Finish a tail of at most one default record, even if backpressure leaves it buffered.
-        if s.get_ref().out_buf.is_full() && total.saturating_sub(written) > MAX_RECORD {
-            break;
-        }
-    }
-
-    let wrapper = s.get_mut();
-    let drained = if blocked {
-        Ok(())
-    } else {
-        wrapper.out_buf.drain(&mut wrapper.transport)
-    };
-    if written > 0 {
-        // Sealed plaintext must be reported, or a retry would send it twice.
-        return Ok(written);
-    }
-    match (err, drained) {
-        (Some(e), _) => Err(e),
-        (None, Err(e)) if e.kind() != io::ErrorKind::WouldBlock => Err(e),
-        (None, _) => Ok(0),
     }
 }
 
@@ -463,6 +259,156 @@ impl<S> SslStream<S> {
     }
 }
 
+impl<S: AsyncRead + AsyncWrite> SslStream<S> {
+    /// Seals `bufs` into records and writes them with as few transport writes as possible.
+    ///
+    /// BoringSSL seals records across slice boundaries straight into caller memory: on the stack
+    /// for a write of at most `MAX_RECORD` bytes with nothing buffered, otherwise after the
+    /// buffered records, within [`seal_budget`]. [`Self::ssl_write_records`] handles the states it
+    /// declines. Either way, once the transport refuses records in this write, later ones are only
+    /// buffered. Only BoringSSL's own flush inside `SSL_write`, after a handshake or an alert,
+    /// ignores this, and a `Pending` there is not tracked by the final drain.
+    fn write_records(
+        s: &mut SslStreamCore<StreamWrapper<S>>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> io::Result<usize> {
+        let wrapper = s.get_mut();
+        wrapper.out_buf.retry(&mut wrapper.transport)?;
+        // Slices may alias, so the sum can exceed `usize::MAX` on 32-bit targets.
+        let total = bufs.iter().fold(0usize, |n, b| n.saturating_add(b.len()));
+        if total == 0 {
+            // Sealing nothing would still send the pending handshake records. Past this point every
+            // seal consumes at least one byte, so no path reports `Ok(0)`.
+            return Ok(0);
+        }
+        if total <= MAX_RECORD && wrapper.out_buf.is_empty() {
+            match Self::seal_on_stack(s, bufs, total)? {
+                Some(n) if n < total => {
+                    // The stack records are buffered; the rest follows them in the same transport
+                    // write. `n < total`, the exact sum here, so the advance stays in bounds.
+                    let mut slices = bufs.to_vec();
+                    let mut rest = &mut slices[..];
+                    io::IoSlice::advance_slices(&mut rest, n);
+                    // Sealed plaintext must be reported; an error after it recurs on the next call.
+                    return Ok(n + Self::write_buffered(s, rest, total - n).unwrap_or(0));
+                }
+                Some(n) => return Ok(n),
+                None => {}
+            }
+        }
+        Self::write_buffered(s, bufs, total)
+    }
+
+    /// Seals `bufs` after the buffered records and drains them unless the transport is blocked, or
+    /// writes them with [`Self::ssl_write_records`] where BoringSSL declines.
+    fn write_buffered(
+        s: &mut SslStreamCore<StreamWrapper<S>>,
+        bufs: &[io::IoSlice<'_>],
+        total: usize,
+    ) -> io::Result<usize> {
+        if let Some(limits) = s.ssl().seal_app_data_limits() {
+            // The buffer lives behind the BIO; move it out while the `SslRef` is borrowed mutably.
+            let mut out_buf = mem::take(&mut s.get_mut().out_buf);
+            let sealed = out_buf.seal(s.ssl_mut(), limits, bufs, total);
+            let wrapper = s.get_mut();
+            debug_assert!(wrapper.out_buf.is_empty(), "sealing wrote to the BIO");
+            wrapper.out_buf = out_buf;
+            if let Some(n) = sealed? {
+                wrapper.out_buf.drain_unless_blocked(&mut wrapper.transport);
+                return Ok(n);
+            }
+        }
+        Self::ssl_write_records(s, bufs, total)
+    }
+
+    /// Seals a write of at most `MAX_RECORD` bytes on the stack and sends it with one transport
+    /// write.
+    ///
+    /// Records that cannot all fit, with small send fragments or a large pending flight, are
+    /// buffered instead for the caller to send with the rest. Returns `Ok(None)` if BoringSSL
+    /// declines, changing nothing.
+    #[inline(never)] // keep the 17 KiB frame out of `write_records`
+    fn seal_on_stack(
+        s: &mut SslStreamCore<StreamWrapper<S>>,
+        bufs: &[io::IoSlice<'_>],
+        total: usize,
+    ) -> io::Result<Option<usize>> {
+        let mut out = [MaybeUninit::<u8>::uninit(); SEAL_STACK_LEN];
+        let sealed = match s.ssl_mut().seal_app_data(bufs, total, &mut out) {
+            Ok(Some(sealed)) => sealed,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(io::Error::other(ssl::Error::from(e))),
+        };
+        // SAFETY: `seal_app_data` initialized the first `written` bytes of `out`, and `written` is
+        // at most `out.len()`.
+        let records = unsafe { slice::from_raw_parts(out.as_ptr().cast::<u8>(), sealed.written) };
+        let wrapper = s.get_mut();
+        debug_assert!(wrapper.out_buf.is_empty(), "sealing wrote to the BIO");
+        if sealed.consumed < total {
+            wrapper.out_buf.push(records);
+        } else {
+            // What the transport does not take stays buffered; an error surfaces on the next call.
+            wrapper.out_buf.write_last(&mut wrapper.transport, records);
+        }
+        Ok(Some(sealed.consumed))
+    }
+
+    /// Seals `bufs` with one `SSL_write` per record and writes them with as few transport writes as
+    /// possible.
+    ///
+    /// Small adjacent slices share records as in a flattened buffer. Sealing stops once buffered
+    /// ciphertext reaches `OUT_BUF_CAPACITY`, except when at most `MAX_RECORD` plaintext bytes
+    /// remain. The last record goes out with the buffer when possible; backpressure can leave it
+    /// buffered too, and records are only buffered once the transport refuses one. The BIO accepts
+    /// every record, so BoringSSL never holds a pending write that a retry with less data would
+    /// fail.
+    fn ssl_write_records(
+        s: &mut SslStreamCore<StreamWrapper<S>>,
+        bufs: &[io::IoSlice<'_>],
+        total: usize,
+    ) -> io::Result<usize> {
+        s.get_mut().out_buf.reserve(total);
+
+        let mut written = 0usize;
+        let mut err = None;
+        let mut packer = Packer::new(bufs);
+        // A short seal means a smaller fragment size; batch the rest instead.
+        let mut through = true;
+        while let Some(plaintext) = packer.next_record() {
+            let len = plaintext.len();
+            s.get_mut().write_through = through && written.saturating_add(len) >= total;
+            let n = match s.write(plaintext) {
+                Ok(n) => n,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            };
+            if n < len {
+                // Pack no more than one fragment, so a smaller one copies no plaintext twice.
+                packer.limit = n;
+                through = false;
+            }
+            written += n;
+            packer.advance(n);
+
+            // Finish a tail of at most one default record, even if backpressure leaves it buffered.
+            if s.get_ref().out_buf.is_full() && total.saturating_sub(written) > MAX_RECORD {
+                break;
+            }
+        }
+
+        let wrapper = s.get_mut();
+        wrapper.write_through = false;
+        wrapper.out_buf.drain_unless_blocked(&mut wrapper.transport);
+        match err {
+            Some(e) if written == 0 => Err(e),
+            // Sealed plaintext must be reported, or a retry would send it twice.
+            _ => Ok(written),
+        }
+    }
+}
+
 impl<S> AsyncRead for SslStream<S>
 where
     S: AsyncRead + AsyncWrite,
@@ -494,7 +440,9 @@ where
 {
     #[inline]
     fn poll_write(self: Pin<&mut Self>, ctx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        self.with_context(ctx, |s| cvt(write_records(s, &[io::IoSlice::new(buf)])))
+        self.with_context(ctx, |s| {
+            cvt(Self::write_records(s, &[io::IoSlice::new(buf)]))
+        })
     }
 
     #[inline]
@@ -503,7 +451,7 @@ where
         ctx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.with_context(ctx, |s| cvt(write_records(s, bufs)))
+        self.with_context(ctx, |s| cvt(Self::write_records(s, bufs)))
     }
 
     #[inline]
@@ -584,9 +532,9 @@ where
     S: AsyncWrite,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.write_through {
-            // A transport that refused the record is not polled again in this write.
-            self.write_through = self.out_buf.write_last(&mut self.transport, buf);
+        // Once `out_buf` is blocked, no record goes straight to the transport.
+        if self.write_through && !self.out_buf.blocked {
+            self.out_buf.write_last(&mut self.transport, buf);
         } else {
             self.out_buf.push(buf);
         }
@@ -720,26 +668,38 @@ impl OutBuffer {
         self.bytes.reserve(extra);
     }
 
-    /// Moves the buffer and its written length out, with spare capacity for `extra` bytes, so
-    /// records can be sealed after the buffered ones while the `SslRef` is borrowed.
-    #[inline]
-    fn take(&mut self, extra: usize) -> (Vec<u8>, usize) {
-        self.make_room(extra);
-        (mem::take(&mut self.bytes), mem::take(&mut self.pos))
-    }
-
-    /// Puts back what [`take`](Self::take) moved out.
+    /// Seals as much of `bufs` as [`seal_budget`] allows after the buffered records.
     ///
-    /// Sealing does no transport I/O, so nothing reached the BIO meanwhile; bytes that did stay
-    /// buffered after the records.
+    /// Returns the plaintext sealed, or `Ok(None)` if BoringSSL declines.
     #[inline]
-    fn restore(&mut self, bytes: Vec<u8>, pos: usize) {
-        debug_assert!(self.bytes.is_empty(), "sealing wrote to the BIO");
-        let stray = mem::replace(&mut self.bytes, bytes);
-        self.pos = pos;
-        if !stray.is_empty() {
-            self.push(&stray);
-        }
+    fn seal(
+        &mut self,
+        ssl: &mut SslRef,
+        limits: SealLimits,
+        bufs: &[io::IoSlice<'_>],
+        total: usize,
+    ) -> io::Result<Option<usize>> {
+        let budget = seal_budget(
+            limits.max_fragment(),
+            limits.record_overhead(),
+            limits.pending_len(),
+            self.len(),
+            total,
+        );
+        let Some(max_out) = limits.sealed_len(budget) else {
+            return Ok(None);
+        };
+        self.make_room(max_out);
+        let out = &mut self.bytes.spare_capacity_mut()[..max_out];
+        let sealed = match ssl.seal_app_data(bufs, budget, out) {
+            Ok(Some(sealed)) => sealed,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(io::Error::other(ssl::Error::from(e))),
+        };
+        // SAFETY: `seal_app_data` initialized the first `written` bytes of the spare capacity,
+        // and `written` is at most `max_out`, which `make_room` reserved.
+        unsafe { self.bytes.set_len(self.bytes.len() + sealed.written) };
+        Ok(Some(sealed.consumed))
     }
 
     /// Whether buffered ciphertext has reached `OUT_BUF_CAPACITY`.
@@ -758,7 +718,7 @@ impl OutBuffer {
         }
     }
 
-    /// Retries buffered records before a write accepts more plaintext.
+    /// Retries buffered records as a write starts, setting `blocked` if the transport refuses them.
     ///
     /// Fails on transport errors, and on backpressure once the buffer is full.
     #[inline]
@@ -766,12 +726,28 @@ impl OutBuffer {
     where
         S: AsyncWrite,
     {
-        if self.bytes.is_empty() {
-            return Ok(());
+        if !self.bytes.is_empty() {
+            match self.drain(transport) {
+                Err(e) if e.kind() != io::ErrorKind::WouldBlock || self.is_full() => return Err(e),
+                _ => {}
+            }
         }
-        match self.drain(transport) {
-            Err(e) if e.kind() != io::ErrorKind::WouldBlock || self.is_full() => Err(e),
-            _ => Ok(()),
+        // Records stay buffered only if the transport returned `Pending`, which registered the
+        // waker.
+        self.blocked = !self.bytes.is_empty();
+        Ok(())
+    }
+
+    /// Ends a write by draining the records unless `blocked`.
+    ///
+    /// An error leaves them buffered for the next `retry` to report.
+    #[inline]
+    fn drain_unless_blocked<S>(&mut self, transport: &mut Transport<S>)
+    where
+        S: AsyncWrite,
+    {
+        if !self.blocked {
+            let _ = self.drain(transport);
         }
     }
 
@@ -801,9 +777,9 @@ impl OutBuffer {
 
     /// Writes buffered records and `record` in one transport write and buffers the rest.
     ///
-    /// Returns `false` if the transport returned `Pending` or an error, which leaves the unwritten
+    /// Sets `blocked` if the transport returns `Pending` or an error, which leaves the unwritten
     /// bytes buffered for the next drain to retry.
-    fn write_last<S>(&mut self, transport: &mut Transport<S>, record: &[u8]) -> bool
+    fn write_last<S>(&mut self, transport: &mut Transport<S>, record: &[u8])
     where
         S: AsyncWrite,
     {
@@ -818,9 +794,12 @@ impl OutBuffer {
             // Let the next drain combine the buffer and record into one write.
             Poll::Ready(Ok(0))
         };
-        let (n, ready) = match res {
-            Poll::Ready(Ok(n)) => (n, true),
-            Poll::Ready(Err(_)) | Poll::Pending => (0, false),
+        let n = match res {
+            Poll::Ready(Ok(n)) => n,
+            Poll::Ready(Err(_)) | Poll::Pending => {
+                self.blocked = true;
+                0
+            }
         };
         if n < pending {
             self.pos += n;
@@ -830,7 +809,6 @@ impl OutBuffer {
             self.pos = 0;
             self.bytes.extend_from_slice(&record[n - pending..]);
         }
-        ready
     }
 }
 
@@ -851,7 +829,7 @@ impl<'a> Packer<'a> {
     /// Skips empty slices and returns the plaintext of the next record, or `None` once every
     /// slice is sealed.
     ///
-    /// Always inlined: it is the body of the `write_records` loop.
+    /// Always inlined: it is the body of the `ssl_write_records` loop.
     #[inline(always)]
     fn next_record(&mut self) -> Option<&[u8]> {
         let bufs = self.bufs;
@@ -1185,16 +1163,10 @@ mod tests {
             let record: Vec<u8> = (0..1 + i % 74).map(|j| (i ^ j) as u8).collect();
             expected.extend_from_slice(&record);
             wrapper.transport.stream.budget = 37;
-            match i % 3 {
-                0 => wrapper.out_buf.push(&record),
-                1 => {
-                    wrapper.out_buf.write_last(&mut wrapper.transport, &record);
-                }
-                _ => {
-                    let (mut bytes, pos) = wrapper.out_buf.take(record.len());
-                    bytes.extend_from_slice(&record);
-                    wrapper.out_buf.restore(bytes, pos);
-                }
+            if i % 3 == 1 {
+                wrapper.out_buf.write_last(&mut wrapper.transport, &record);
+            } else {
+                wrapper.out_buf.push(&record);
             }
             let _ = wrapper.out_buf.drain(&mut wrapper.transport);
             assert!(!wrapper.out_buf.is_empty());
@@ -1684,8 +1656,11 @@ mod tests {
         client.get_mut().open = false;
         let polls = client.get_ref().polls;
         let bufs = [io::IoSlice::new(&[4; 100])];
-        let res = Pin::new(&mut client)
-            .with_context(&mut cx, |s| ssl_write_records(s, &bufs, 100, false));
+        let res = Pin::new(&mut client).with_context(&mut cx, |s| {
+            // `retry` resets this as each write starts; this call bypasses it.
+            s.get_mut().out_buf.blocked = false;
+            SslStream::ssl_write_records(s, &bufs, 100)
+        });
         assert_eq!(res.unwrap(), 100);
         assert_eq!(client.get_ref().polls, polls + 1);
         assert!(!client.0.get_ref().out_buf.is_empty());
