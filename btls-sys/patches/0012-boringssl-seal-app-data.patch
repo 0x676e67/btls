@@ -17,18 +17,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ---
- include/openssl/ssl.h    |  59 ++++
- ssl/internal.h           |  82 +++++
- ssl/s3_pkt.cc            | 148 +++++++-
+ include/openssl/ssl.h    |  62 ++++
+ ssl/internal.h           |  84 +++++
+ ssl/s3_pkt.cc            | 148 ++++++++-
  ssl/ssl_aead_ctx.cc      |  84 +++--
- ssl/ssl_internal_test.cc | 253 ++++++++++++++
- ssl/ssl_lib.cc           |  29 ++
- ssl/ssl_test.cc          | 709 +++++++++++++++++++++++++++++++++++++++
+ ssl/ssl_internal_test.cc | 253 +++++++++++++++
+ ssl/ssl_lib.cc           |  24 ++
+ ssl/ssl_test.cc          | 818 +++++++++++++++++++++++++++++++++++++++++++++++
  ssl/test/bssl_shim.cc    |  81 +++++
  ssl/test/test_config.cc  |   1 +
  ssl/test/test_config.h   |   1 +
- ssl/tls_record.cc        | 183 +++++++++-
- 11 files changed, 1598 insertions(+), 32 deletions(-)
+ ssl/tls_record.cc        | 189 ++++++++++-
+ 11 files changed, 1713 insertions(+), 32 deletions(-)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 --- a/include/openssl/ssl.h
@@ -121,7 +121,7 @@ diff --git a/ssl/internal.h b/ssl/internal.h
    bool GetIV(const uint8_t **out_iv, size_t *out_iv_len) const;
  
   private:
-@@ -3740,6 +3749,80 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
+@@ -3740,6 +3749,81 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
  int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
                         size_t *out_bytes_written, Span<const uint8_t> in);
  
@@ -172,7 +172,8 @@ diff --git a/ssl/internal.h b/ssl/internal.h
 +};
 +
 +// kSealGatherMin is the shortest piece encrypted straight from the caller's
-+// slice into the record. Each gathered piece is one more CRYPTO_gcm128_encrypt
++// slice when a record mixes pieces; a record filled by a single piece is always
++// encrypted from it. Each gathered piece is one more CRYPTO_gcm128_encrypt
 +// call, which costs about as much as copying a few KiB, so shorter pieces are
 +// copied into the record and encrypted there. 1, 2 and 8 KiB measured no
 +// better.
@@ -1836,8 +1837,8 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
 +}
 +
 +size_t tls_seal_body_iovec_budget(const SSLImpl *ssl) {
-+  // Every cipher encrypts a record taken whole from one piece straight from
-+  // the caller's slice. Only AES-GCM gathers several pieces into one record:
++  // Every cipher encrypts a record filled by a single piece straight from the
++  // caller's slice. Only AES-GCM gathers several pieces into one record:
 +  // ChaCha20-Poly1305's one-pass assembly takes at most two entries, and TLS
 +  // 1.3 spends one on the content type. CBC stays at one entry too:
 +  // SealScatterTest shows mixed entries seal correctly, but gathering them is
