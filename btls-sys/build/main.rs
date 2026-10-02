@@ -968,7 +968,7 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
     let bindings = builder.generate()?;
     let mut source_code = Vec::new();
     bindings
-        .write(Box::new(&mut source_code))
+        .write(&mut source_code)
         .map_err(|e| format!("Couldn't serialize bindings: {e}"))?;
     ensure_err_lib_enum_is_named(&mut source_code);
     let bindings_path = config.out_dir.join("bindings.rs");

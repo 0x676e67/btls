@@ -17,6 +17,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
+    clippy::manual_div_ceil,
     clippy::ptr_offset_with_cast,
     clippy::useless_transmute,
     dead_code,
