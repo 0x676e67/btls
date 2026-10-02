@@ -11,6 +11,14 @@ documentation = "https://docs.rs/tokio-btls"
 description = """
 An implementation of SSL streams for Tokio backed by BoringSSL
 """
+include = [
+    "/*.md",
+    "/*.toml",
+    "/LICENSE-*",
+    "/src",
+    # Read by the unit tests in src/lib.rs.
+    "/tests/*.pem",
+]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
@@ -34,6 +42,7 @@ btls = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+btls-sys = { workspace = true }
+foreign-types = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = [ "full" ] }
-anyhow = { workspace = true }
