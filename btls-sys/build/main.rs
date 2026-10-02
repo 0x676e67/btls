@@ -878,9 +878,10 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         .merge_extern_blocks(true)
         .prepend_enum_name(true)
         .blocklist_type("max_align_t") // Not supported by bindgen on all targets, not used by BoringSSL
-        // System headers declare the C allocator with `size_t` spelled as a
-        // builtin, so bindgen emits `c_ulong` instead of `usize`. Rust 1.99
-        // rejects such runtime symbol declarations
+        // The C allocator functions are clang builtins, and libclang reports
+        // them without the `size_t` typedef, so bindgen emits `c_ulong` instead
+        // of `usize` (https://github.com/rust-lang/rust-bindgen/issues/1770).
+        // Rust 1.99 flags such declarations of runtime symbols
         // (`suspicious_runtime_symbol_definitions`). Use `libc` for these.
         .blocklist_function("malloc|calloc|realloc|free")
         .clang_args(get_extra_clang_args_for_bindgen(config))
