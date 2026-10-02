@@ -522,6 +522,7 @@ impl<S> Read for StreamWrapper<S>
 where
     S: AsyncRead,
 {
+    #[inline]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.read_buf.read(&mut self.transport, buf)
     }
