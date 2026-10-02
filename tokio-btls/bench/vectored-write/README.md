@@ -1,11 +1,14 @@
 # Vectored write benchmark: tokio-btls vs tokio-rustls
 
-Compares the vectored write path of `tokio-btls` (branch `demo/tokio-btls-vectored-write`, 53594cc, BoringSSL)
-with `tokio-rustls` 0.26.6 + `rustls` 0.23.45 (aws-lc-rs). Both negotiate TLS 1.3 with AES-128-GCM.
+Compares the vectored write path of `tokio-btls` (BoringSSL) with `tokio-rustls` 0.26.6 + `rustls` 0.23.45
+(aws-lc-rs). Both negotiate TLS 1.3 with AES-128-GCM. "Before" is tokio-btls at `b4a667b`, which makes one
+`SSL_write` per record. "After" is `3a490de`, which seals with `SSL_seal_app_data` (patch 0012).
 
-Measured on a 4 vCPU cloud VM over loopback. Tables show the median of 5 runs for TCP and 7 runs for null mode.
-Raw output is in [`results/`](results). [`results/baseline/`](results/baseline) holds the raw output and callgrind
-counts of the write path before `SSL_seal_app_data`, measured on a faster VM.
+Measured on a 4 vCPU cloud VM with VAES and AVX-512, over loopback. Before, after and rustls runs are
+interleaved. Each table cell is the median of the round medians: 5 rounds of 7 runs pinned to one core for
+null mode, 3 such rounds for `null-partial`, and 2 rounds of 5 unpinned runs for TCP. Raw output, callgrind
+counts and the tuning sweep are in [`results/`](results). [`results/baseline/`](results/baseline) holds the
+write path before the switch, measured on the same VM.
 
 ## Running
 
@@ -34,70 +37,109 @@ VB_IMPL=btls|rustls VB_SCALE=N ./target/release/vbench ...   # one impl / N time
 
 ## Summary
 
-- **Syscalls are a tie.** Both stacks make one `write`/`writev` per ~64 KiB call and merge buffered
-  records under backpressure. The one exception favors btls. An input slightly over 64 KiB, such as four h2
-  DATA frames, costs rustls two TLS calls and twice the syscalls (32 vs 16 per MiB). This is because rustls
-  caps the plaintext it accepts at 64 KiB per call.
-- **Large aligned writes cost about the same CPU**, roughly 212–228 ns/KiB on both. Each stack makes one extra
-  memcpy per byte: rustls copies plaintext into a Vec per record, and btls copies ciphertext into `out_buf`
-  for every record except the last one of a call.
-- **btls loses on fixed per-record cost.** A 100 B write takes 44% more CPU (4525 vs 3132 ns/KiB), and batches
-  of small slices take 8–23% more. Callgrind places about 90% of the instructions per write inside
-  BoringSSL's `SSL_write`, which sweeps the error queue, mallocs and frees the write buffer per record, and
-  makes a BIO round trip. The tokio-btls wrapper itself costs about 316 instructions per call, against about
-  527 for tokio-rustls.
-- **btls emits extra tiny records for `[9 B header, 16 KiB payload]` shapes**: 128 vs 80 records/MiB. That
-  costs 16% more writer CPU in null mode and a few percent more on the reader.
-- **On real TCP, throughput gaps mostly fall within run-to-run noise** (±15–20% on this VM). rustls came out
-  ahead in most large-write runs, and btls writer CPU was 10–20% higher there.
+- **btls now costs less CPU than rustls on every shape except the smallest.** Sealing into caller memory
+  cut btls writer CPU by 9–27% in null mode. btls is now 4–29% below rustls, except 1×100B (+15%, down
+  from +57%) and 64×64B (+3%, down from +14%).
+- **No per-record overhead in BoringSSL.** btls makes no C allocation per record (C allocs/MiB 64 → 0 on
+  the large shapes) and no `SSL_write` call after the handshake. Callgrind counts 699 fewer instructions
+  per 100 B write (3,518 → 2,819, against 2,448 for rustls) and 54,000–67,000 fewer per 64 KiB call
+  (about 156,000, against about 221,000 for rustls).
+- **Full records across slices.** `[9 B header, 16 KiB payload]` shapes now make 80 records/MiB, as
+  rustls does, down from 128. Small-slice shapes need half the Rust allocations, because the packing
+  scratch Vec is gone.
+- **Syscalls stay a tie, except for h2.** Both stacks make one transport write per ~64 KiB call. btls still
+  takes inputs slightly over 64 KiB in one call, while rustls needs two calls and twice the syscalls (32 vs
+  16 per MiB). After the handshake every btls transport write is a plain `write`, with no `writev`.
+- **On real TCP, btls writer CPU fell on every row**, by 6–27%. It is below rustls on every shape except
+  h2 (473 vs 420 ns/KiB). Reader CPU fell by up to 21% (1×256KiB: +0.4%). 1×100B polls the transport
+  once per message, down from 2.62. Round medians swing by up to 21% on this VM, so read the TCP ratios
+  as tendencies.
 
 ## CPU cost of the write path (null transport)
 
-Lower is better. "b / r" columns list btls first, then rustls.
+Lower is better. "a / r" columns list btls after, then rustls.
 
-| Shape per call | btls ns/KiB | rustls ns/KiB | btls Δ | records/MiB b / r | transport calls/MiB b / r | Rust allocs/MiB b / r |
+| Shape per call | btls before ns/KiB | btls after ns/KiB | rustls ns/KiB | after vs before | after vs rustls | records/MiB a / r | transport calls/MiB a / r | Rust allocs/MiB a / r |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1×100B | 4167 | 3058 | 2648 | −27% | +15% | 10487 / 10486 | 10486 / 10486 | 10486 / 20972 |
+| 64×64B | 276 | 250 | 243 | −9% | +3% | 256 / 256 | 256 / 256 | 256 / 768 |
+| 512×32B | 297 | 256 | 274 | −14% | −7% | 64 / 64 | 64 / 64 | 64 / 192 |
+| 16×1KiB | 121 | 101 | 111 | −17% | −9% | 64 / 64 | 64 / 64 | 64 / 192 |
+| 4×(9B+16KiB) | 129 | 97 | 124 | −25% | −22% | 80 / 80 | 16 / 32 | 32 / 112 |
+| 4×16KiB | 107 | 86 | 121 | −20% | −29% | 64 / 64 | 16 / 16 | 32 / 96 |
+| 2×64KiB | 111 | 87 | 121 | −22% | −28% | 64 / 64 | 16 / 16 | 24 / 80 |
+| 1×256KiB | 111 | 87 | 120 | −22% | −28% | 64 / 64 | 16 / 16 | 20 / 68 |
+| 8×2KiB | 115 | 99 | 107 | −14% | −7% | 64 / 64 | 64 / 64 | 64 / 192 |
+| 4×4KiB | 115 | 94 | 106 | −18% | −11% | 64 / 64 | 64 / 64 | 64 / 192 |
+| 10000B+7000B | 127 | 111 | 116 | −13% | −4% | 123 / 123 | 62 / 62 | 123 / 247 |
+
+Before, btls made 128 records/MiB on 4×(9B+16KiB) and twice the Rust allocations on 64×64B, 512×32B,
+16×1KiB, 8×2KiB and 4×4KiB. Its other counters were the same. It also made one C allocation per record;
+after, it makes none (0.1/MiB on 1×100B, from the handshake).
+
+### With backpressure (`null-partial`)
+
+| Shape per call | btls before ns/KiB | btls after ns/KiB | rustls ns/KiB | after vs before | TLS calls/msg b / a / r | transport calls/MiB b / a / r |
 |---|---:|---:|---:|---:|---:|---:|
-| 1×100B | 4525 | 3132 | +44% | 10487 / 10486 | 10486 / 10486 | 10486 / 20972 |
-| 64×64B | 426 | 346 | +23% | 256 / 256 | 256 / 256 | 512 / 768 |
-| 512×32B | 399 | 371 | +8% | 64 / 64 | 64 / 64 | 128 / 192 |
-| 16×1KiB | 243 | 220 | +10% | 64 / 64 | 64 / 64 | 128 / 192 |
-| 4×(9B+16KiB) | 253 | 218 | +16% | 128 / 80 | 16 / 32 | 32 / 112 |
-| 4×16KiB | 212 | 216 | −2% | 64 / 64 | 16 / 16 | 32 / 96 |
-| 2×64KiB | 220 | 228 | −4% | 64 / 64 | 16 / 16 | 24 / 80 |
-| 1×256KiB | 212 | 223 | −5% | 64 / 64 | 16 / 16 | 20 / 68 |
+| 1×100B | 4549 | 3577 | 2691 | −21% | 1 / 1 / 1 | 20972 / 20972 / 10486 |
+| 64×64B | 304 | 279 | 248 | −8% | 1 / 1 / 1 | 512 / 512 / 256 |
+| 512×32B | 330 | 286 | 279 | −13% | 1 / 1 / 1 | 256 / 128 / 128 |
+| 16×1KiB | 175 | 150 | 135 | −14% | 1 / 1 / 1 | 256 / 128 / 128 |
+| 4×(9B+16KiB) | 197 | 126 | 136 | −36% | 2 / 4 / 4 | 128 / 128 / 128 |
+| 4×16KiB | 190 | 128 | 136 | −33% | 2 / 3 / 4 | 128 / 128 / 128 |
+| 2×64KiB | 191 | 124 | 134 | −35% | 4 / 7 / 8 | 128 / 128 / 128 |
+| 1×256KiB | 187 | 119 | 130 | −36% | 8 / 15 / 16 | 128 / 128 / 128 |
+| 8×2KiB | 175 | 150 | 129 | −14% | 1 / 1 / 1 | 256 / 128 / 128 |
+| 4×4KiB | 180 | 129 | 129 | −28% | 1 / 1 / 1 | 256 / 128 / 128 |
+| 10000B+7000B | 146 | 135 | 137 | −8% | 1 / 1 / 1 | 247 / 128 / 128 |
+
+A call that finds the transport blocked no longer polls it again. Large writes therefore take more TLS
+calls, as rustls's do, and 16 KiB writes make half the transport calls. Partial writes also advance an
+offset instead of shifting the buffer.
 
 ## Loopback TCP
 
 No EAGAIN occurred in any run, because the reader kept up. Batching under load came from tokio's coop
-budget, which applied to both stacks equally. Writer CPU includes the kernel copy.
+budget, which applied to both stacks equally. Writer CPU includes the kernel copy. "b / a / r" columns list
+btls before, btls after, then rustls.
 
-| Shape per call | MiB/s b / r | writer ns/KiB b / r | reader ns/KiB b / r | syscalls/MiB b / r | iovs per writev b / r |
+| Shape per call | MiB/s b / a / r | writer ns/KiB b / a / r | reader ns/KiB b / a / r | syscalls/MiB a / r | transport polls/msg b / a / r |
 |---|---:|---:|---:|---:|---:|
-| 1×100B | 108 / 92 | 9019 / 10399 | 6116 / 6368 | 2024 / 2048 | 2 / 49.7 |
-| 64×64B | 387 / 451 | 2398 / 2123 | 1785 / 1634 | 229 / 231 | 2 / 2.0 |
-| 512×32B | 676 / 786 | 1428 / 1214 | 790 / 671 | 62.5 / 63 | 2 / 1.1 |
-| 16×1KiB | 1257 / 1411 | 768 / 680 | 659 / 679 | 62.5 / 63 | 2 / 1.1 |
-| 4×(9B+16KiB) | 1273 / 1403 | 739 / 652 | 639 / 617 | 16 / 32 | 2 / 2.5 |
-| 4×16KiB | 1267 / 1303 | 755 / 689 | 630 / 574 | 16 / 16 | 2 / 4 |
-| 2×64KiB | 1245 / 1562 | 755 / 619 | 593 / 560 | 16 / 16 | 2 / 4 |
-| 1×256KiB | 1274 / 1512 | 756 / 643 | 544 / 515 | 16 / 16 | 2 / 4 |
+| 1×100B | 127 / 157 / 127 | 7658 / 6176 / 7678 | 5631 / 4434 / 4753 | 2024 / 2048 | 2.62 / 1.00 / 1.02 |
+| 64×64B | 591 / 640 / 583 | 1654 / 1525 / 1674 | 1180 / 1084 / 1143 | 229 / 231 | 1.23 / 1.01 / 1.02 |
+| 512×32B | 1042 / 1168 / 1072 | 936 / 836 / 912 | 535 / 494 / 514 | 62.5 / 63 | 1.07 / 1.02 / 1.02 |
+| 16×1KiB | 1638 / 1783 / 1502 | 595 / 548 / 656 | 465 / 447 / 466 | 62.5 / 63 | 1.07 / 1.02 / 1.02 |
+| 4×(9B+16KiB) | 1944 / 2070 / 2327 | 502 / 473 / 420 | 399 / 363 / 376 | 16 / 32 | 1.02 / 1.02 / 2.03 |
+| 4×16KiB | 1924 / 2098 / 2046 | 504 / 465 / 477 | 367 / 363 / 354 | 16 / 16 | 1.02 / 1.02 / 1.02 |
+| 2×64KiB | 1794 / 2090 / 2052 | 544 / 467 / 476 | 380 / 357 / 362 | 16 / 16 | 2.05 / 2.03 / 2.03 |
+| 1×256KiB | 1781 / 2090 / 2054 | 548 / 467 / 475 | 372 / 373 / 362 | 16 / 16 | 4.09 / 4.06 / 4.06 |
+| 8×2KiB | 1693 / 1837 / 1680 | 577 / 532 / 582 | 462 / 439 / 448 | 62.5 / 63 | 1.07 / 1.02 / 1.02 |
+| 4×4KiB | 1682 / 2118 / 1656 | 580 / 461 / 590 | 472 / 414 / 456 | 62.5 / 63 | 1.07 / 1.02 / 1.02 |
+| 10000B+7000B | 1628 / 2239 / 1625 | 600 / 436 / 596 | 471 / 414 / 478 | 60.3 / 60.7 | 1.07 / 1.02 / 1.02 |
 
-Repeat runs of the same case swung by up to ±20%. For example, 16×1KiB btls ran at 839, 966, 1248 and
-871 MiB/s. Read the throughput column as a tendency only. The counters are deterministic.
+btls syscalls/MiB did not change. Round medians of one row swung by up to 21%; for example, the two h2
+rounds of btls after were 17% apart. Read the throughput column as a tendency only. The counters are
+deterministic.
 
 ## How each stack writes
 
 **tokio-btls**
 
-- `is_write_vectored` returns true. Each call seals at most ~64 KiB of ciphertext into `out_buf`, plus one
-  final record of up to 16 KiB.
-- `pack_record` copies small adjacent slices into a single record. A slice of 8 KiB or more is sealed in
-  place with no plaintext copy, even when that leaves a small record in front of it.
-- Every record is one `SSL_write` call (`ENABLE_PARTIAL_WRITE`). BoringSSL mallocs and frees its write
-  buffer for each record and clears the error queue on every call.
-- Records before the last one are copied into `out_buf`. The last record goes out directly with
-  `writev([out_buf, record])`, so a single record of up to 16 KiB is sent with no extra copy.
-- Under backpressure, sealed bytes are reported as written and kept in the buffer.
+- `is_write_vectored` returns true. A call first retries buffered ciphertext. If the transport returns
+  `Pending`, the call does not poll it again.
+- A write of up to 16 KiB with nothing buffered is sealed by one `SSL_seal_app_data` call into a 17 KiB
+  stack buffer and sent with one `write`. Records that do not fit there (small send fragments, a large
+  ticket flight) are buffered, and the rest of the write follows them in the same transport write.
+- Larger writes, and writes behind buffered records, are sealed straight into `out_buf`'s spare capacity.
+  Sealing stops at about 64 KiB of ciphertext but takes a final tail of up to 16 KiB in the same call. Then
+  `out_buf` is drained with one `write`.
+- BoringSSL fills every record across slice boundaries. With AES-GCM, pieces of 4 KiB or more are
+  encrypted where they are; shorter ones are copied into the record. There is no per-record `malloc`, no
+  BIO round trip, and the error queue is cleared only when it holds an error.
+- Under backpressure, sealed bytes are reported as written and kept in the buffer. Partial writes advance
+  an offset into it.
+- States that `SSL_seal_app_data` declines, such as a handshake in progress or a FIPS build, fall back to
+  one `SSL_write` per record. Small slices are packed into records no larger than the send fragment.
 
 **tokio-rustls / rustls**
 
@@ -110,23 +152,16 @@ Repeat runs of the same case swung by up to ±20%. For example, 16×1KiB btls ra
 
 ## Improvement ideas for tokio-btls
 
-1. **Gather sealing in BoringSSL.** This is the largest win. BoringSSL already seals through
-   `EVP_AEAD_CTX_sealv` with an iovec list (`aead_aes_gcm_tls13_sealv` shows up in the profile). A small btls
-   patch could add an `SSL_write` variant that takes `CRYPTO_IOVEC`s and passes them through to
-   `SealScatter`. That would remove the `record` copy for small slices and resolve the header vs payload
-   trade-off, giving full records with no plaintext copy.
-2. **Seal several records per `SSL_write` into caller memory.** The fixed cost per record (error-queue sweep,
-   write-buffer malloc/free, BIO round trip) is what loses the small-write cases. One fix is a patch that
-   keeps the write buffer allocated. Another is letting one call seal up to N records straight into
-   `out_buf`, which would also remove the ciphertext copy into `out_buf`.
-3. **Fill records after tiny heads.** In a measured experiment, `pack_record` was allowed to fill past a large
-   next slice when the record so far was under 1 KiB. On 4×(9B+16KiB), records dropped from 128 to 80 per
-   MiB and reader CPU fell 6–16% over three runs (580/623/567 vs 617/717/672 ns/KiB). Writer CPU in null
-   mode rose from 253 to 277 ns/KiB, because every byte is now copied, as rustls does. Idea 1 gets the
-   same benefit without the copy.
-4. **Stop polling a transport that just returned Pending.** With small writes, btls polls the transport 2.6
-   times per message (drain, write-through, drain) against 1.0 for rustls: 27,457 vs 10,662 calls per MiB.
-   The extra polls all return Pending, so they are cheap, but a per-call "transport pending" flag would skip
-   them.
-5. **Keep the "one record past the cap" rule.** It already spares btls the two-call split that rustls pays on
-   inputs slightly over 64 KiB.
+1. **Gather sealing in BoringSSL.** Done: patch 0012 seals through `EVP_AEAD_CTX_sealv` with pieces of 4 KiB
+   or more left in place. A sweep of 1, 2 and 8 KiB found no better threshold.
+2. **Seal several records per call into caller memory.** Done: `SSL_seal_app_data` seals a whole call into
+   the stack buffer or `out_buf`. It removes the per-record `malloc`, the BIO round trip and the ciphertext
+   copy into `out_buf`.
+3. **Fill records after tiny heads.** Done through idea 1, without the plaintext copy: 4×(9B+16KiB) makes 80
+   records/MiB, and its TCP reader CPU fell 9%.
+4. **Stop polling a transport that just returned Pending.** Done: TCP 1×100B polls 1.00 times per message,
+   against 2.62 before and 1.02 for rustls.
+5. **Keep the "one record past the cap" rule.** Kept. It still spares btls the two-call split that rustls
+   pays on inputs slightly over 64 KiB.
+6. **Trim the per-call fixed cost.** 1×100B still costs 15% more CPU than rustls: 2,819 instructions per
+   call against 2,448. Patch 0012 could look up the protocol version and seal overhead once per call.
