@@ -42,7 +42,7 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
-@@ -11590,6 +11590,53 @@ TEST(SSLTest, ErrorSyscallAfterCloseNotify) {
+@@ -11618,6 +11618,53 @@ TEST(SSLTest, ErrorSyscallAfterCloseNotify) {
    write_failed = false;
  }
  
