@@ -126,12 +126,36 @@ where
     let blocked = !wrapper.out_buf.is_empty();
     // Slices may alias, so the sum can exceed `usize::MAX` on 32-bit targets.
     let total = bufs.iter().fold(0usize, |n, b| n.saturating_add(b.len()));
-    if total > 0 {
-        if total <= MAX_RECORD && !blocked {
-            if let Some(n) = seal_on_stack(s, bufs, total)? {
-                return Ok(n);
+    if total > 0 && total <= MAX_RECORD && !blocked {
+        match seal_on_stack(s, bufs, total)? {
+            Some(n) if n < total => {
+                // The stack records are buffered; the rest follows them in the same transport
+                // write. `n < total`, the exact sum here, so the advance stays in bounds.
+                let mut slices = bufs.to_vec();
+                let mut rest = &mut slices[..];
+                io::IoSlice::advance_slices(&mut rest, n);
+                // Sealed plaintext must be reported; an error after it recurs on the next call.
+                return Ok(n + write_buffered(s, rest, total - n, false).unwrap_or(0));
             }
+            Some(n) => return Ok(n),
+            None => {}
         }
+    }
+    write_buffered(s, bufs, total, blocked)
+}
+
+/// Seals `bufs` after the buffered records, through [`seal_into_out_buf`] where BoringSSL allows
+/// it, otherwise with [`ssl_write_records`].
+fn write_buffered<S>(
+    s: &mut SslStreamCore<StreamWrapper<S>>,
+    bufs: &[io::IoSlice<'_>],
+    total: usize,
+    blocked: bool,
+) -> io::Result<usize>
+where
+    S: AsyncRead + AsyncWrite,
+{
+    if total > 0 {
         if let Some(limits) = s.ssl().seal_app_data_limits() {
             let budget = seal_budget(
                 limits.max_fragment(),
@@ -179,7 +203,9 @@ fn seal_budget(
 /// Seals a write of at most `MAX_RECORD` bytes on the stack and sends it with one transport
 /// write.
 ///
-/// Returns `Ok(None)` if BoringSSL declines, changing nothing, or seals no plaintext.
+/// Records that cannot all fit, with small send fragments or a large pending flight, are buffered
+/// instead for the caller to send with the rest. Returns `Ok(None)` if BoringSSL declines,
+/// changing nothing, or seals no plaintext.
 #[inline(never)] // keep the 17 KiB frame out of `write_records`
 fn seal_on_stack<S>(
     s: &mut SslStreamCore<StreamWrapper<S>>,
@@ -200,8 +226,12 @@ where
     let records = unsafe { slice::from_raw_parts(out.as_ptr().cast::<u8>(), sealed.written) };
     let wrapper = s.get_mut();
     debug_assert!(wrapper.out_buf.is_empty(), "sealing wrote to the BIO");
-    // What the transport does not take stays buffered; an error surfaces on the next call.
-    wrapper.out_buf.write_last(&mut wrapper.transport, records);
+    if sealed.consumed < total {
+        wrapper.out_buf.push(records);
+    } else {
+        // What the transport does not take stays buffered; an error surfaces on the next call.
+        wrapper.out_buf.write_last(&mut wrapper.transport, records);
+    }
     Ok((sealed.consumed > 0).then_some(sealed.consumed))
 }
 
@@ -1253,15 +1283,16 @@ mod tests {
         max_fragment: Option<usize>,
     ) -> (SslStream<Gate>, SslStream<DuplexStream>) {
         let connector = SslConnector::builder(SslMethod::tls()).unwrap();
-        tls_pair_from(connector, version, max_fragment).await
+        tls_pair_from(connector, version, max_fragment, None).await
     }
 
-    /// Connects a client built from `connector` to a server; the client's transport counts and
-    /// taps only what is written after the handshake.
+    /// Connects a client built from `connector` to a server, both limited to `ciphers` if set;
+    /// the client's transport counts and taps only what is written after the handshake.
     async fn tls_pair_from(
         mut connector: SslConnectorBuilder,
         version: SslVersion,
         max_fragment: Option<usize>,
+        ciphers: Option<&str>,
     ) -> (SslStream<Gate>, SslStream<DuplexStream>) {
         // Keep the complete test payload in the transport while writes are polled manually.
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
@@ -1269,6 +1300,10 @@ mod tests {
         let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
         acceptor.set_min_proto_version(Some(version)).unwrap();
         acceptor.set_max_proto_version(Some(version)).unwrap();
+        if let Some(ciphers) = ciphers {
+            acceptor.set_cipher_list(ciphers).unwrap();
+            connector.set_cipher_list(ciphers).unwrap();
+        }
         acceptor
             .set_private_key_file("tests/key.pem", SslFiletype::PEM)
             .unwrap();
@@ -1663,6 +1698,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stack_overflow_goes_out_in_the_same_write() {
+        // 32 CBC records of 512 bytes need more than `SEAL_STACK_LEN`.
+        let connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        let (mut client, mut server) = tls_pair_from(
+            connector,
+            SslVersion::TLS1_2,
+            Some(512),
+            Some("ECDHE-RSA-AES128-SHA"),
+        )
+        .await;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let data: Vec<u8> = (0..MAX_RECORD).map(|i| (i % 251) as u8).collect();
+
+        let limits = client.ssl().seal_app_data_limits();
+        let res = Pin::new(&mut client).poll_write(&mut cx, &data);
+        assert!(matches!(res, Poll::Ready(Ok(MAX_RECORD))), "{res:?}");
+        if let Some(limits) = limits {
+            assert!(limits.sealed_len(MAX_RECORD).unwrap() > SEAL_STACK_LEN);
+            assert_eq!(client.get_ref().polls, 1);
+            assert_eq!(records(&client.get_ref().tap).len(), MAX_RECORD / 512);
+            assert!(client.0.get_ref().out_buf.is_empty());
+        }
+
+        client.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        server.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, data);
+    }
+
+    #[tokio::test]
     async fn first_server_write_carries_tickets() {
         let tickets = Arc::new(AtomicUsize::new(0));
         let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
@@ -1671,7 +1736,8 @@ mod tests {
         connector.set_new_session_callback(move |_, _| {
             counter.fetch_add(1, Ordering::Relaxed);
         });
-        let (mut client, mut server) = tls_pair_from(connector, SslVersion::TLS1_3, None).await;
+        let (mut client, mut server) =
+            tls_pair_from(connector, SslVersion::TLS1_3, None, None).await;
 
         // The server defers its tickets to the first write, which seals them ahead of the data.
         let before = server.ssl().seal_app_data_limits();
