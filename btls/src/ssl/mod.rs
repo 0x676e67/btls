@@ -2112,6 +2112,10 @@ impl SslContextBuilder {
     /// fixed once the ClientHello is built or parsed. This currently applies
     /// to stream TLS, not DTLS, QUIC, or split handshakes.
     ///
+    /// TLS 1.3 early data is sent before the server's limit is known, so 0-RTT
+    /// records may use the protocol maximum. A server whose limit is below
+    /// that maximum neither issues early-data tickets nor accepts early data.
+    ///
     /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_record_size_limit)]
