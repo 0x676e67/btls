@@ -18,8 +18,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ---
  ssl/ssl_lib.cc  |  7 +++++--
- ssl/ssl_test.cc | 47 +++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 52 insertions(+), 2 deletions(-)
+ ssl/ssl_test.cc | 48 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 53 insertions(+), 2 deletions(-)
 
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 --- a/ssl/ssl_lib.cc
@@ -42,7 +42,7 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
-@@ -11618,6 +11618,53 @@ TEST(SSLTest, ErrorSyscallAfterCloseNotify) {
+@@ -11727,6 +11727,54 @@ TEST(SSLTest, ErrorSyscallAfterCloseNotify) {
    write_failed = false;
  }
  
@@ -65,7 +65,8 @@ diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
 +    ERR_add_error_data(1, "stale");
 +    if (pop) {
-+      // A popped slot keeps its packed value.
++      // Popping clears the slot and empties the queue; only its data string
++      // stays owned by the error state until the next error call.
 +      const char *data;
 +      int flags;
 +      EXPECT_NE(ERR_get_error_line_data(nullptr, nullptr, &data, &flags), 0u);
