@@ -1,0 +1,1863 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gngpp <gngppz@gmail.com>
+Date: Thu, 1 Oct 2026 00:00:00 +0800
+Subject: [PATCH 12/12] boringssl: seal application data into caller memory
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+---
+ include/openssl/ssl.h    |  59 ++++
+ ssl/internal.h           |  82 +++++
+ ssl/s3_pkt.cc            | 148 +++++++-
+ ssl/ssl_aead_ctx.cc      |  84 +++--
+ ssl/ssl_internal_test.cc | 253 ++++++++++++++
+ ssl/ssl_lib.cc           |  29 ++
+ ssl/ssl_test.cc          | 709 +++++++++++++++++++++++++++++++++++++++
+ ssl/test/bssl_shim.cc    |  81 +++++
+ ssl/test/test_config.cc  |   1 +
+ ssl/test/test_config.h   |   1 +
+ ssl/tls_record.cc        | 183 +++++++++-
+ 11 files changed, 1598 insertions(+), 32 deletions(-)
+
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -306,6 +306,65 @@ OPENSSL_EXPORT int SSL_has_pending(const SSL *ssl);
+ // https://crbug.com/466303.
+ OPENSSL_EXPORT int SSL_write(SSL *ssl, const void *buf, int num);
+ 
++// Sealing application data into caller memory.
++//
++// These functions are a btls extension. A caller that owns the transport's
++// output buffer can seal application data records straight into it, which
++// skips the write buffer, the `BIO` and a copy per record. They never read
++// from or write to the transport. Whenever they decline, write with
++// `SSL_write`, which handles every other state of the connection.
++
++// ssl_seal_app_data_result_t is the result of `SSL_seal_app_data`.
++enum ssl_seal_app_data_result_t BORINGSSL_ENUM_INT {
++  // ssl_seal_app_data_success means `*out_len` bytes were written to `out`
++  // and `*out_consumed` bytes of input were sealed.
++  ssl_seal_app_data_success,
++  // ssl_seal_app_data_declined means nothing was changed. Either the
++  // connection is in a state only `SSL_write` handles, or `out` cannot hold
++  // the pending handshake records and the first record.
++  // `SSL_seal_app_data_limits` tells the two apart.
++  ssl_seal_app_data_declined,
++  // ssl_seal_app_data_error means nothing was handed to the caller. The error
++  // queue describes the failure, and `SSL_get_error` returns `SSL_ERROR_SSL`
++  // for it.
++  ssl_seal_app_data_error,
++};
++
++// SSL_seal_app_data_limits returns one if `SSL_seal_app_data` can seal
++// application data on `ssl` now, and zero otherwise. On success it sets
++// `*out_max_fragment` to the most plaintext bytes in one record,
++// `*out_record_overhead` to the most bytes one record adds to its plaintext,
++// and `*out_pending_len` to the most bytes of pending handshake records, such
++// as a KeyUpdate or NewSessionTicket, written before the data. Sealing `n`
++// bytes needs at most `*out_pending_len + n + ceil(n / *out_max_fragment) *
++// *out_record_overhead` bytes of output. The values hold until `ssl` is next
++// used. This function has no side effects.
++OPENSSL_EXPORT int SSL_seal_app_data_limits(const SSL *ssl,
++                                            size_t *out_max_fragment,
++                                            size_t *out_record_overhead,
++                                            size_t *out_pending_len);
++
++// SSL_seal_app_data seals up to `max_in` bytes, taken in order from the
++// `num_in` slices at `in`, as TLS application data records into `out`, which
++// has room for `max_out` bytes. It performs no transport I/O.
++//
++// Handshake records that `SSL_write` would send before the data are written
++// first. Each record then carries the maximum fragment, the last possibly
++// fewer, regardless of slice boundaries. Only whole records are written, and
++// sealing stops before a record that does not fit. Empty slices are skipped
++// without reading their pointers. Neither the slices nor the `in` array may
++// overlap `out`.
++//
++// On `ssl_seal_app_data_success`, `out[0, *out_len)` must reach the peer
++// before any later output of `ssl`, including what `SSL_write`,
++// `SSL_shutdown` or an alert hands to the `BIO`. If the input is non-empty,
++// `*out_consumed` is at least one. It is less than the input if `out` filled
++// up or a later record could not be sealed; in the latter case the next call
++// reports the error.
++OPENSSL_EXPORT enum ssl_seal_app_data_result_t SSL_seal_app_data(
++    SSL *ssl, uint8_t *out, size_t *out_len, size_t max_out,
++    const CRYPTO_IVEC *in, size_t num_in, size_t max_in, size_t *out_consumed);
++
+ // SSL_KEY_UPDATE_REQUESTED indicates that the peer should reply to a KeyUpdate
+ // message with its own, thus updating traffic secrets for both directions on
+ // the connection.
+diff --git a/ssl/internal.h b/ssl/internal.h
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -567,6 +567,15 @@ class SSLAEADContext {
+                    Span<const uint8_t> header, const uint8_t *in, size_t in_len,
+                    const uint8_t *extra_in, size_t extra_in_len);
+ 
++  // SealScatterv is `SealScatter` with the record body given as `body`. The
++  // entries' `out` ranges tile one contiguous region in order. Each entry's
++  // `in` equals its `out` or overlaps no output. `body.size()`, plus one if
++  // `extra_in_len` is non-zero, is at most `CRYPTO_IOVEC_MAX`.
++  bool SealScatterv(uint8_t *out_prefix, Span<const CRYPTO_IOVEC> body,
++                    uint8_t *out_suffix, uint8_t type, uint16_t record_version,
++                    uint64_t seqnum, Span<const uint8_t> header,
++                    const uint8_t *extra_in, size_t extra_in_len);
++
+   bool GetIV(const uint8_t **out_iv, size_t *out_iv_len) const;
+ 
+  private:
+@@ -3740,6 +3749,79 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
+ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
+                        size_t *out_bytes_written, Span<const uint8_t> in);
+ 
++// tls_app_data_fragment returns the most plaintext in one application data
++// record, before any 0-RTT budget. `tls_write_app_data` and
++// `tls_seal_app_data` both use it; a peer `record_size_limit` (RFC 8449)
++// would also apply here.
++size_t tls_app_data_fragment(const SSLImpl *ssl);
++
++// tls_can_seal_app_data returns whether `tls_seal_app_data` can seal now
++// without transport I/O or the handshake.
++bool tls_can_seal_app_data(const SSLImpl *ssl);
++
++// tls_seal_app_data_pending_len sets `*out_len` to an upper bound on the
++// handshake bytes that must precede new application data. It returns false on
++// overflow.
++bool tls_seal_app_data_pending_len(const SSLImpl *ssl, size_t *out_len);
++
++// tls_seal_app_data implements `SSL_seal_app_data` after the error state is
++// reset.
++enum ssl_seal_app_data_result_t tls_seal_app_data(
++    SSLImpl *ssl, Span<uint8_t> out, size_t *out_len,
++    Span<const CRYPTO_IVEC> in, size_t max_in, size_t *out_consumed);
++
++// SealInput reads the caller's slices for `tls_seal_app_data`, at most
++// `max_in` bytes. `tls_plan_seal_body` consumes it and rejects pieces that
++// overlap `out`.
++class SealInput {
++ public:
++  SealInput(Span<const CRYPTO_IVEC> slices, size_t max_in,
++            Span<const uint8_t> out)
++      : slices_(slices), remaining_(max_in), out_(out) {}
++
++  // Available returns how many of the next `limit` bytes exist, without
++  // consuming or validating them.
++  size_t Available(size_t limit) const;
++
++ private:
++  // The planner walks the slices itself, so the cursor stays in registers
++  // while it copies short pieces.
++  friend bool tls_plan_seal_body(SealInput *input, size_t want, uint8_t *body,
++                                 size_t budget, CRYPTO_IOVEC *out_iovecs,
++                                 size_t *out_num, size_t *out_len);
++
++  Span<const CRYPTO_IVEC> slices_;
++  size_t index_ = 0, offset_ = 0, remaining_;
++  Span<const uint8_t> out_;
++};
++
++// kSealGatherMin is the shortest piece encrypted from where it is. Each
++// gathered piece is one more CRYPTO_gcm128_encrypt call, which costs about as
++// much as copying a few KiB, so shorter pieces are copied into the record and
++// encrypted in place. Tune with tokio-btls/bench/vectored-write.
++inline constexpr size_t kSealGatherMin = 4096;
++
++// tls_plan_seal_body lays out the next record body of at most `want` bytes at
++// `body` and writes its pieces to `out_iovecs`, at most `budget` of them, in
++// order. Pieces it does not gather are copied to `body`. On failure it zeroes
++// what it copied.
++bool tls_plan_seal_body(SealInput *input, size_t want, uint8_t *body,
++                        size_t budget, CRYPTO_IOVEC *out_iovecs,
++                        size_t *out_num, size_t *out_len);
++
++// tls_seal_body_iovec_budget returns how many body pieces one record may use
++// with the current write cipher.
++size_t tls_seal_body_iovec_budget(const SSLImpl *ssl);
++
++// tls_seal_app_data_record seals the next record of at most `want` input
++// bytes at the start of `out`, which has room for `want` plus
++// `SSL_max_seal_overhead`. `*out_consumed` is zero once the input is
++// exhausted.
++bool tls_seal_app_data_record(SSLImpl *ssl, Span<uint8_t> out,
++                              SealInput *input, size_t want,
++                              size_t prefix_len, size_t budget,
++                              size_t *out_len, size_t *out_consumed);
++
+ bool tls_new(SSLImpl *ssl);
+ void tls_free(SSLImpl *ssl);
+ 
+diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
+--- a/ssl/s3_pkt.cc
++++ b/ssl/s3_pkt.cc
+@@ -64,7 +64,7 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
+   const bool is_early_data_write =
+       !ssl->server && SSL_in_early_data(ssl) && ssl->s3->hs->can_early_write;
+   for (;;) {
+-    size_t max_send_fragment = ssl->max_send_fragment;
++    size_t max_send_fragment = tls_app_data_fragment(ssl);
+     if (is_early_data_write) {
+       SSL_HANDSHAKE *hs = ssl->s3->hs.get();
+       if (hs->early_data_written >= hs->early_session->ticket_max_early_data) {
+@@ -104,6 +104,152 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
+   }
+ }
+ 
++size_t tls_app_data_fragment(const SSLImpl *ssl) {
++  return ssl->max_send_fragment;
++}
++
++bool tls_can_seal_app_data(const SSLImpl *ssl) {
++  return !SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
++         ssl->do_handshake != nullptr &&
++         // Handshake, 0-RTT, False Start, half-RTT and renegotiation need
++         // `SSL_write`.
++         !SSL_in_init(ssl) &&
++         // close_notify or a fatal alert was sent, or one is being dispatched
++         // (`ssl_send_alert_impl` sets both).
++         ssl->s3->write_shutdown == ssl_shutdown_none &&
++         ssl->s3->aead_write_ctx != nullptr &&
++         !ssl->s3->aead_write_ctx->is_null_cipher() &&
++         // Unflushed records and owed retries go through the `BIO` first.
++         ssl->s3->write_buffer.empty() && ssl->s3->pending_write.empty() &&
++         ssl->s3->unreported_bytes_written == 0 &&
++         // TLS 1.0 CBC 1/n-1 splitting stays in `tls_seal_scatter_record`.
++         !ssl_needs_record_splitting(ssl);
++}
++
++bool tls_seal_app_data_pending_len(const SSLImpl *ssl, size_t *out_len) {
++  size_t len = 0;
++  if (ssl->s3->pending_flight != nullptr) {
++    len = ssl->s3->pending_flight->length - ssl->s3->pending_flight_offset;
++  }
++  if (ssl->s3->pending_hs_data != nullptr &&
++      ssl->s3->pending_hs_data->length != 0) {
++    // `tls_flush_pending_hs_data` seals it as one record.
++    const size_t sealed =
++        ssl->s3->pending_hs_data->length + SSL_max_seal_overhead(ssl);
++    if (sealed < ssl->s3->pending_hs_data->length || len + sealed < len) {
++      return false;
++    }
++    len += sealed;
++  }
++  *out_len = len;
++  return true;
++}
++
++// seal_fits returns whether `room` holds `pending` bytes and one record of `n`
++// plaintext bytes.
++static bool seal_fits(size_t room, size_t pending, size_t n, size_t overhead) {
++  return room >= pending && room - pending >= (n == 0 ? 0 : n + overhead);
++}
++
++enum ssl_seal_app_data_result_t tls_seal_app_data(
++    SSLImpl *ssl, Span<uint8_t> out, size_t *out_len,
++    Span<const CRYPTO_IVEC> in, size_t max_in, size_t *out_consumed) {
++  *out_len = 0;
++  *out_consumed = 0;
++  // The slices are read record by record while `out` is written.
++  if (buffers_alias(in.data(), in.size() * sizeof(CRYPTO_IVEC), out.data(),
++                    out.size())) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_OUTPUT_ALIASES_INPUT);
++    return ssl_seal_app_data_error;
++  }
++  size_t pending;
++  if (!tls_can_seal_app_data(ssl) ||
++      !tls_seal_app_data_pending_len(ssl, &pending)) {
++    return ssl_seal_app_data_declined;
++  }
++  const size_t frag = tls_app_data_fragment(ssl);
++  const size_t overhead = SSL_max_seal_overhead(ssl);
++  SealInput input(in, max_in, out);
++
++  // Decline before changing anything if `out` cannot hold the pending records
++  // and the first record. `Available` walks the slices only when the room is
++  // tight and `max_in` may overstate the input.
++  size_t first = std::min(frag, max_in);
++  if (!seal_fits(out.size(), pending, first, overhead)) {
++    first = input.Available(first);
++    if (!seal_fits(out.size(), pending, first, overhead)) {
++      return ssl_seal_app_data_declined;
++    }
++  }
++
++  // As in `do_tls_write`, seal queued handshake messages into the flight. For
++  // TLS this does no I/O.
++  if (!tls_flush_pending_hs_data(ssl)) {
++    return ssl_seal_app_data_error;
++  }
++  Span<const uint8_t> flight;
++  if (ssl->s3->pending_flight != nullptr) {
++    flight =
++        Span(reinterpret_cast<const uint8_t *>(ssl->s3->pending_flight->data),
++             ssl->s3->pending_flight->length)
++            .subspan(ssl->s3->pending_flight_offset);
++  }
++  if (flight.size() > pending) {
++    // The bound above is wrong. Never write past it.
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return ssl_seal_app_data_error;
++  }
++
++  // Records go after the flight. The flight is copied in front only once a
++  // record is sealed, so an error never hands anything over.
++  const size_t prefix_len =
++      SSL3_RT_HEADER_LENGTH + ssl->s3->aead_write_ctx->ExplicitNonceLen();
++  const size_t budget = tls_seal_body_iovec_budget(ssl);
++  size_t pos = flight.size(), consumed = 0;
++  bool failed = false;
++  while (consumed < max_in) {
++    size_t want = std::min(frag, max_in - consumed);
++    if (out.size() - pos < want + overhead) {
++      want = input.Available(want);
++      if (want == 0 || out.size() - pos < want + overhead) {
++        break;  // whole records only
++      }
++    }
++    size_t record_len, record_in;
++    if (!tls_seal_app_data_record(ssl, out.subspan(pos), &input, want,
++                                  prefix_len, budget, &record_len,
++                                  &record_in)) {
++      failed = true;
++      break;
++    }
++    if (record_in == 0) {
++      break;  // the input ended before `max_in`
++    }
++    pos += record_len;
++    consumed += record_in;
++  }
++  if (failed && consumed == 0) {
++    return ssl_seal_app_data_error;  // the flight stays queued
++  }
++  if (failed) {
++    // The sealed records advanced the sequence number and must be sent. The
++    // cause recurs on the next call, which reports it.
++    ERR_clear_error();
++  }
++  if (!flight.empty()) {
++    OPENSSL_memcpy(out.data(), flight.data(), flight.size());
++    ssl->s3->pending_flight.reset();
++    ssl->s3->pending_flight_offset = 0;
++  }
++  if (pos != 0) {
++    // As in `do_tls_write`, progress uncorks KeyUpdate acknowledgments.
++    ssl->s3->key_update_pending = false;
++  }
++  *out_len = pos;
++  *out_consumed = consumed;
++  return ssl_seal_app_data_success;
++}
++
+ // tls_seal_align_prefix_len returns the length of the prefix before the start
+ // of the bulk of the ciphertext when sealing a record with `ssl`. Callers may
+ // use this to align buffers.
+diff --git a/ssl/ssl_aead_ctx.cc b/ssl/ssl_aead_ctx.cc
+--- a/ssl/ssl_aead_ctx.cc
++++ b/ssl/ssl_aead_ctx.cc
+@@ -296,28 +296,45 @@ bool SSLAEADContext::Open(Span<uint8_t> *out, uint8_t type,
+   return true;
+ }
+ 
+-bool SSLAEADContext::SealScatter(uint8_t *out_prefix, uint8_t *out,
+-                                 uint8_t *out_suffix, uint8_t type,
+-                                 uint16_t record_version, uint64_t seqnum,
+-                                 Span<const uint8_t> header, const uint8_t *in,
+-                                 size_t in_len, const uint8_t *extra_in,
+-                                 size_t extra_in_len) {
++bool SSLAEADContext::SealScatterv(uint8_t *out_prefix,
++                                  Span<const CRYPTO_IOVEC> body,
++                                  uint8_t *out_suffix, uint8_t type,
++                                  uint16_t record_version, uint64_t seqnum,
++                                  Span<const uint8_t> header,
++                                  const uint8_t *extra_in,
++                                  size_t extra_in_len) {
++  if (body.size() + (extra_in_len != 0 ? 1 : 0) > CRYPTO_IOVEC_MAX) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  // The body is one record, so its length cannot overflow.
++  size_t in_len = 0;
++  for (const CRYPTO_IOVEC &v : body) {
++    in_len += v.len;
++  }
+   const size_t prefix_len = ExplicitNonceLen();
+   size_t suffix_len;
+   if (!SuffixLen(&suffix_len, in_len, extra_in_len)) {
+     OPENSSL_PUT_ERROR(SSL, SSL_R_RECORD_TOO_LARGE);
+     return false;
+   }
+-  if ((in != out && buffers_alias(in, in_len, out, in_len)) ||
+-      buffers_alias(in, in_len, out_prefix, prefix_len) ||
+-      buffers_alias(in, in_len, out_suffix, suffix_len)) {
+-    OPENSSL_PUT_ERROR(SSL, SSL_R_OUTPUT_ALIASES_INPUT);
+-    return false;
++  // Each entry is in place or reads from outside the record. This also covers
++  // the explicit nonce, which is `prefix_len` bytes when it is in the record.
++  const uint8_t *body_out = body.empty() ? nullptr : body[0].out;
++  for (const CRYPTO_IOVEC &v : body) {
++    if ((v.in != v.out && buffers_alias(v.in, v.len, body_out, in_len)) ||
++        buffers_alias(v.in, v.len, out_prefix, prefix_len) ||
++        buffers_alias(v.in, v.len, out_suffix, suffix_len)) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_OUTPUT_ALIASES_INPUT);
++      return false;
++    }
+   }
+ 
+   if (is_null_cipher() || CRYPTO_fuzzer_mode_enabled()) {
+     // Handle the initial NULL cipher.
+-    OPENSSL_memmove(out, in, in_len);
++    for (const CRYPTO_IOVEC &v : body) {
++      OPENSSL_memmove(v.out, v.in, v.len);
++    }
+     OPENSSL_memmove(out_suffix, extra_in, extra_in_len);
+     return true;
+   }
+@@ -356,10 +373,7 @@ bool SSLAEADContext::SealScatter(uint8_t *out_prefix, uint8_t *out,
+   // Emit the variable nonce if included in the record.
+   if (variable_nonce_included_in_record_) {
+     assert(!xor_fixed_nonce_);
+-    if (buffers_alias(in, in_len, out_prefix, variable_nonce_len_)) {
+-      OPENSSL_PUT_ERROR(SSL, SSL_R_OUTPUT_ALIASES_INPUT);
+-      return false;
+-    }
++    assert(prefix_len == variable_nonce_len_);
+     OPENSSL_memcpy(out_prefix, nonce + fixed_nonce_.size(),
+                    variable_nonce_len_);
+   }
+@@ -372,12 +386,38 @@ bool SSLAEADContext::SealScatter(uint8_t *out_prefix, uint8_t *out,
+     }
+   }
+ 
+-  size_t written_suffix_len;
+-  bool result = !!EVP_AEAD_CTX_seal_scatter(
+-      ctx_.get(), out, out_suffix, &written_suffix_len, suffix_len, nonce,
+-      nonce_len, in, in_len, extra_in, extra_in_len, ad.data(), ad.size());
+-  assert(!result || written_suffix_len == suffix_len);
+-  return result;
++  // This is `EVP_AEAD_CTX_seal_scatter` with the body split into entries:
++  // `extra_in` is encrypted to the start of the suffix and the tag follows.
++  CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++  size_t num_iovecs = 0;
++  for (const CRYPTO_IOVEC &v : body) {
++    iovecs[num_iovecs++] = v;
++  }
++  if (extra_in_len != 0) {
++    iovecs[num_iovecs++] = {out_suffix, extra_in, extra_in_len};
++  }
++  const CRYPTO_IVEC aad = {ad.data(), ad.size()};
++  size_t tag_len;
++  // On failure, `EVP_AEAD_CTX_sealv` zeroes every output and the tag.
++  if (!EVP_AEAD_CTX_sealv(ctx_.get(), iovecs, num_iovecs,
++                          out_suffix + extra_in_len, &tag_len,
++                          suffix_len - extra_in_len, nonce, nonce_len, &aad,
++                          1)) {
++    return false;
++  }
++  assert(tag_len + extra_in_len == suffix_len);
++  return true;
++}
++
++bool SSLAEADContext::SealScatter(uint8_t *out_prefix, uint8_t *out,
++                                 uint8_t *out_suffix, uint8_t type,
++                                 uint16_t record_version, uint64_t seqnum,
++                                 Span<const uint8_t> header, const uint8_t *in,
++                                 size_t in_len, const uint8_t *extra_in,
++                                 size_t extra_in_len) {
++  const CRYPTO_IOVEC body = {out, in, in_len};
++  return SealScatterv(out_prefix, Span(&body, 1), out_suffix, type,
++                      record_version, seqnum, header, extra_in, extra_in_len);
+ }
+ 
+ bool SSLAEADContext::Seal(uint8_t *out, size_t *out_len, size_t max_out_len,
+diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
+--- a/ssl/ssl_internal_test.cc
++++ b/ssl/ssl_internal_test.cc
+@@ -12,9 +12,15 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++#include <iterator>
++#include <utility>
++#include <vector>
++
+ #include <gtest/gtest.h>
+ 
+ #include <openssl/aead.h>
++#include <openssl/err.h>
++#include <openssl/rand.h>
+ #include <openssl/ssl.h>
+ 
+ #include "../crypto/test/test_util.h"
+@@ -612,6 +618,253 @@ TEST(SSLTest, ECHPublicName) {
+   EXPECT_FALSE(ssl_is_valid_ech_public_name(StringAsBytes("0X01.")));
+ }
+ 
++TEST(SealPlanTest, Properties) {
++  // xorshift64 with a fixed seed, so failures reproduce.
++  uint64_t state = 0x2545f4914f6cdd1d;
++  auto rand = [&]() -> size_t {
++    state ^= state << 13;
++    state ^= state >> 7;
++    state ^= state << 17;
++    return static_cast<size_t>(state);
++  };
++  // Short lengths come first, covering each size class of the inline copy.
++  // Most slices are drawn from those.
++  static const size_t kLens[] = {0,    1,    2,    3,    4,     7,    8,
++                                 9,    15,   16,   17,   31,    32,   33,
++                                 1024, 4095, 4096, 4097, 16384, 40960};
++  static const size_t kNumShort = 14;
++  static const size_t kWants[] = {1, 512, 16384};
++  static const size_t kBudgets[] = {1, 2, 15, 16};
++
++  for (int iter = 0; iter < 1000; iter++) {
++    SCOPED_TRACE(iter);
++    const size_t num_lens = rand() % 4 == 0 ? std::size(kLens) : kNumShort;
++    std::vector<size_t> lens(rand() % 601);
++    size_t total = 0;
++    for (size_t &len : lens) {
++      len = kLens[rand() % num_lens];
++      total += len;
++    }
++    std::vector<uint8_t> data(total);
++    for (uint8_t &b : data) {
++      b = static_cast<uint8_t>(rand());
++    }
++    const size_t want = kWants[rand() % std::size(kWants)];
++    const size_t budget = kBudgets[rand() % std::size(kBudgets)];
++    const size_t max_in = rand() % 2 == 0 ? SIZE_MAX : rand() % (total + 1);
++    SCOPED_TRACE(want);
++    SCOPED_TRACE(budget);
++
++    std::vector<uint8_t> body(want);
++    // Empty slices carry pointers that must not be read, including one
++    // inside the output.
++    std::vector<CRYPTO_IVEC> slices;
++    size_t pos = 0;
++    for (size_t len : lens) {
++      slices.push_back({len == 0 ? body.data() + body.size() / 2
++                                 : data.data() + pos,
++                        len});
++      pos += len;
++    }
++
++    SealInput input(slices, max_in, body);
++    const size_t n = std::min(max_in, total);
++    size_t offset = 0;
++    // Plan up to 64 records; with `want` of one byte, the rest adds nothing.
++    for (int record = 0; record < 64 && offset < n; record++) {
++      const size_t expected_len = std::min(want, n - offset);
++      ASSERT_EQ(input.Available(want), expected_len);
++      ASSERT_EQ(input.Available(1), std::min(size_t{1}, expected_len));
++
++      CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++      size_t num, len;
++      ASSERT_TRUE(tls_plan_seal_body(&input, want, body.data(), budget, iovecs,
++                                     &num, &len));
++      ASSERT_EQ(len, expected_len);
++      ASSERT_GE(num, 1u);
++      ASSERT_LE(num, budget);
++      size_t done = 0;
++      for (size_t i = 0; i < num; i++) {
++        SCOPED_TRACE(i);
++        const CRYPTO_IOVEC &v = iovecs[i];
++        ASSERT_EQ(v.out, body.data() + done);
++        ASSERT_GT(v.len, 0u);
++        ASSERT_LE(done + v.len, len);
++        const uint8_t *src = data.data() + offset + done;
++        if (v.in == v.out) {
++          // A copied run.
++          EXPECT_EQ(Bytes(v.out, v.len), Bytes(src, v.len));
++        } else {
++          // A gathered piece is read from where it is.
++          EXPECT_EQ(v.in, src);
++          EXPECT_TRUE(v.len >= kSealGatherMin || (num == 1 && v.len == want));
++        }
++        done += v.len;
++      }
++      EXPECT_EQ(done, len);
++      offset += len;
++    }
++    if (offset == n) {
++      CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++      size_t num, len;
++      ASSERT_TRUE(tls_plan_seal_body(&input, want, body.data(), budget, iovecs,
++                                     &num, &len));
++      EXPECT_EQ(len, 0u);
++      EXPECT_EQ(num, 0u);
++    }
++  }
++
++  // A NULL or overlapping slice fails the plan and zeroes what was copied.
++  uint8_t data[100];
++  OPENSSL_memset(data, 0x42, sizeof(data));
++  std::vector<uint8_t> body(512);
++  const CRYPTO_IVEC null_slice[] = {{data, sizeof(data)}, {nullptr, 1}};
++  const CRYPTO_IVEC aliasing[] = {{data, sizeof(data)},
++                                  {body.data() + 300, 1}};
++  for (const auto &[slices, reason] :
++       {std::pair(Span(null_slice), ERR_R_PASSED_NULL_PARAMETER),
++        std::pair(Span(aliasing), SSL_R_OUTPUT_ALIASES_INPUT)}) {
++    SCOPED_TRACE(reason);
++    OPENSSL_memset(body.data(), 0xaa, body.size());
++    SealInput input(slices, SIZE_MAX, body);
++    CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++    size_t num, len;
++    EXPECT_FALSE(tls_plan_seal_body(&input, body.size(), body.data(),
++                                    CRYPTO_IOVEC_MAX, iovecs, &num, &len));
++    EXPECT_TRUE(ErrorEquals(ERR_get_error(), ERR_LIB_SSL, reason));
++    std::vector<uint8_t> expected(body.size(), 0xaa);
++    OPENSSL_memset(expected.data(), 0, sizeof(data));
++    EXPECT_EQ(Bytes(body), Bytes(expected));
++  }
++}
++
++TEST(SealScatterTest, GatherMatchesContiguous) {
++  struct Test {
++    uint16_t cipher;
++    uint16_t version;
++    // deterministic is false if each record has a random explicit IV.
++    bool deterministic;
++  };
++  const Test kTests[] = {
++      {SSL_CIPHER_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS1_2_VERSION, true},
++      {SSL_CIPHER_AES_256_GCM_SHA384, TLS1_3_VERSION, true},
++      {SSL_CIPHER_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, TLS1_2_VERSION,
++       true},
++      {SSL_CIPHER_CHACHA20_POLY1305_SHA256, TLS1_3_VERSION, true},
++      // TLS 1.0 CBC chains each record's IV from the previous record.
++      {SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS1_VERSION, true},
++      {SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS1_2_VERSION, false},
++      {SSL_CIPHER_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA, TLS1_2_VERSION, false},
++  };
++  static const size_t kCuts[] = {0, 1, 15, 16, 17, 4095, 4096, 4097};
++  std::vector<uint8_t> plaintext(9000);
++  RAND_bytes(plaintext.data(), plaintext.size());
++
++  for (const Test &t : kTests) {
++    const SSL_CIPHER *cipher = SSL_get_cipher_by_value(t.cipher);
++    ASSERT_TRUE(cipher);
++    SCOPED_TRACE(SSL_CIPHER_standard_name(cipher));
++    SCOPED_TRACE(t.version);
++
++    const EVP_AEAD *aead;
++    size_t mac_key_len, fixed_iv_len;
++    ASSERT_TRUE(ssl_cipher_get_evp_aead(&aead, &mac_key_len, &fixed_iv_len,
++                                        cipher, t.version));
++    // CBC ciphers pass the MAC key and IV inside the `EVP_AEAD` key.
++    const size_t enc_key_len =
++        EVP_AEAD_key_length(aead) -
++        (mac_key_len == 0 ? 0 : mac_key_len + fixed_iv_len);
++    uint8_t keys[3][EVP_AEAD_MAX_KEY_LENGTH];
++    RAND_bytes(&keys[0][0], sizeof(keys));
++    auto make = [&](evp_aead_direction_t direction) {
++      return SSLAEADContext::Create(
++          direction, t.version, cipher, Span(keys[0]).first(enc_key_len),
++          Span(keys[1]).first(mac_key_len), Span(keys[2]).first(fixed_iv_len));
++    };
++    UniquePtr<SSLAEADContext> contiguous = make(evp_aead_seal),
++                              gathered = make(evp_aead_seal),
++                              open_contiguous = make(evp_aead_open),
++                              open_gathered = make(evp_aead_open);
++    ASSERT_TRUE(contiguous && gathered && open_contiguous && open_gathered);
++
++    const bool tls13 = t.version >= TLS1_3_VERSION;
++    const uint8_t inner_type = SSL3_RT_APPLICATION_DATA;
++    const size_t extra_in_len = tls13 ? 1 : 0;
++    const uint16_t record_version = tls13 ? TLS1_2_VERSION : t.version;
++    const size_t len = plaintext.size();
++    const size_t prefix_len = contiguous->ExplicitNonceLen();
++    size_t suffix_len;
++    ASSERT_TRUE(contiguous->SuffixLen(&suffix_len, len, extra_in_len));
++    const size_t record_len = prefix_len + len + suffix_len;
++    const uint8_t header[SSL3_RT_HEADER_LENGTH] = {
++        SSL3_RT_APPLICATION_DATA, static_cast<uint8_t>(record_version >> 8),
++        static_cast<uint8_t>(record_version), static_cast<uint8_t>(record_len >> 8),
++        static_cast<uint8_t>(record_len)};
++
++    uint64_t seq = 0;
++    for (size_t cut : kCuts) {
++      for (bool gather_first : {false, true}) {
++        SCOPED_TRACE(cut);
++        SCOPED_TRACE(gather_first);
++        std::vector<uint8_t> a(record_len), b(record_len);
++        ASSERT_TRUE(contiguous->SealScatter(
++            a.data(), a.data() + prefix_len, a.data() + prefix_len + len,
++            SSL3_RT_APPLICATION_DATA, record_version, seq, header,
++            plaintext.data(), len, &inner_type, extra_in_len));
++
++        // Alternate copied and gathered entries at `cut` and `cut + 100`.
++        uint8_t *body = b.data() + prefix_len;
++        std::vector<CRYPTO_IOVEC> entries;
++        const size_t bounds[] = {0, cut, cut + 100, len};
++        bool gather = gather_first;
++        for (size_t i = 0; i + 1 < std::size(bounds); i++, gather = !gather) {
++          const size_t start = bounds[i], n = bounds[i + 1] - start;
++          if (n == 0) {
++            continue;
++          }
++          if (gather) {
++            entries.push_back({body + start, plaintext.data() + start, n});
++          } else {
++            OPENSSL_memcpy(body + start, plaintext.data() + start, n);
++            entries.push_back({body + start, body + start, n});
++          }
++        }
++        ASSERT_TRUE(gathered->SealScatterv(
++            b.data(), entries, body + len, SSL3_RT_APPLICATION_DATA,
++            record_version, seq, header, &inner_type, extra_in_len));
++
++        if (t.deterministic) {
++          EXPECT_EQ(Bytes(a), Bytes(b));
++        } else {
++          // A random explicit IV makes the bytes differ. Both must open.
++          for (auto &[record, opener] :
++               {std::pair(&a, open_contiguous.get()),
++                std::pair(&b, open_gathered.get())}) {
++            Span<uint8_t> opened;
++            ASSERT_TRUE(opener->Open(&opened, SSL3_RT_APPLICATION_DATA,
++                                     record_version, seq, header,
++                                     Span(*record)));
++            EXPECT_EQ(Bytes(opened), Bytes(plaintext));
++          }
++        }
++        seq++;
++      }
++    }
++
++    // One entry more than `CRYPTO_IOVEC_MAX` allows is rejected.
++    std::vector<uint8_t> out(record_len);
++    std::vector<CRYPTO_IOVEC> too_many;
++    for (size_t i = 0; i < CRYPTO_IOVEC_MAX + 1 - extra_in_len; i++) {
++      too_many.push_back({out.data() + prefix_len + i, plaintext.data() + i, 1});
++    }
++    EXPECT_FALSE(gathered->SealScatterv(
++        out.data(), too_many, out.data() + prefix_len + too_many.size(),
++        SSL3_RT_APPLICATION_DATA, record_version, seq, header, &inner_type,
++        extra_in_len));
++    EXPECT_TRUE(ErrorEquals(ERR_get_error(), ERR_LIB_SSL, ERR_R_INTERNAL_ERROR));
++  }
++}
++
+ }  // namespace
+ BSSL_NAMESPACE_END
+ #endif  // !BORINGSSL_SHARED_LIBRARY
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -1022,6 +1022,35 @@ int SSL_write(SSL *ssl, const void *buf, int num) {
+   return ret <= 0 ? ret : static_cast<int>(bytes_written);
+ }
+ 
++int SSL_seal_app_data_limits(const SSL *ssl, size_t *out_max_fragment,
++                             size_t *out_record_overhead,
++                             size_t *out_pending_len) {
++  const auto *ssl_impl = FromOpaque(ssl);
++  size_t pending;
++  if (!tls_can_seal_app_data(ssl_impl) ||
++      !tls_seal_app_data_pending_len(ssl_impl, &pending)) {
++    return 0;
++  }
++  *out_max_fragment = tls_app_data_fragment(ssl_impl);
++  *out_record_overhead = SSL_max_seal_overhead(ssl);
++  *out_pending_len = pending;
++  return 1;
++}
++
++enum ssl_seal_app_data_result_t SSL_seal_app_data(
++    SSL *ssl, uint8_t *out, size_t *out_len, size_t max_out,
++    const CRYPTO_IVEC *in, size_t num_in, size_t max_in, size_t *out_consumed) {
++  auto *ssl_impl = FromOpaque(ssl);
++  // Like `ssl_reset_error_state`, but without sweeping an empty queue. Sealing
++  // makes no system calls, so `errno` is irrelevant.
++  ssl_impl->s3->rwstate = SSL_ERROR_NONE;
++  if (ERR_peek_error() != 0) {
++    ERR_clear_error();
++  }
++  return tls_seal_app_data(ssl_impl, Span(out, max_out), out_len,
++                           Span(in, num_in), max_in, out_consumed);
++}
++
+ int SSL_key_update(SSL *ssl, int request_type) {
+   auto *ssl_impl = FromOpaque(ssl);
+   ssl_reset_error_state(ssl_impl);
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -5275,6 +5275,691 @@ TEST_P(SSLVersionTest, SSLWriteRetry) {
+   }
+ }
+ 
++// SealCipher is a cipher suite `SSL_seal_app_data` is tested with. TLS 1.3
++// suites are selected through the server's AES hardware override and policy.
++struct SealCipher {
++  uint16_t id;
++  bool aes_hw = true;
++  bool cnsa = false;
++};
++
++static const SealCipher kSealCiphers[] = {
++    {SSL_CIPHER_AES_128_GCM_SHA256},
++    {SSL_CIPHER_AES_256_GCM_SHA384, /*aes_hw=*/true, /*cnsa=*/true},
++    {SSL_CIPHER_CHACHA20_POLY1305_SHA256, /*aes_hw=*/false},
++    {SSL_CIPHER_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
++    {SSL_CIPHER_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
++    {SSL_CIPHER_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256},
++    {SSL_CIPHER_ECDHE_RSA_WITH_AES_128_CBC_SHA},
++    {SSL_CIPHER_ECDHE_RSA_WITH_AES_256_CBC_SHA384},
++};
++
++static bool SealCipherApplies(const SealCipher &cipher, uint16_t version) {
++  const SSL_CIPHER *c = SSL_get_cipher_by_value(cipher.id);
++  return c != nullptr && SSL_CIPHER_get_min_version(c) <= version &&
++         version <= SSL_CIPHER_get_max_version(c);
++}
++
++// ConfigureSealCipher makes `client_ctx` and `server_ctx` negotiate `cipher`.
++static bool ConfigureSealCipher(SSL_CTX *client_ctx, SSL_CTX *server_ctx,
++                                const SealCipher &cipher, uint16_t version) {
++  if (version >= TLS1_3_VERSION) {
++    SSL_CTX_set_aes_hw_override_for_testing(server_ctx, cipher.aes_hw);
++    return !cipher.cnsa ||
++           SSL_CTX_set_compliance_policy(server_ctx,
++                                         ssl_compliance_policy_cnsa_202407);
++  }
++  const char *name =
++      SSL_CIPHER_standard_name(SSL_get_cipher_by_value(cipher.id));
++  return SSL_CTX_set_strict_cipher_list(client_ctx, name) &&
++         SSL_CTX_set_strict_cipher_list(server_ctx, name);
++}
++
++// SealNoIO calls `SSL_seal_app_data` with `ssl`'s write `BIO` replaced by one
++// that fails the test when written to or flushed.
++static ssl_seal_app_data_result_t SealNoIO(SSL *ssl, Span<uint8_t> out,
++                                           size_t *out_len,
++                                           Span<const CRYPTO_IVEC> in,
++                                           size_t max_in,
++                                           size_t *out_consumed) {
++  UniquePtr<BIO_METHOD> method(BIO_meth_new(0, "tripwire"));
++  BSSL_CHECK(method);
++  BSSL_CHECK(BIO_meth_set_write(
++      method.get(), [](BIO *bio, const char *in_, int len) -> int {
++        ADD_FAILURE() << "SSL_seal_app_data wrote to the BIO";
++        return -1;
++      }));
++  BSSL_CHECK(BIO_meth_set_ctrl(
++      method.get(), [](BIO *bio, int cmd, long larg, void *parg) -> long {
++        if (cmd == BIO_CTRL_FLUSH) {
++          ADD_FAILURE() << "SSL_seal_app_data flushed the BIO";
++        }
++        return 0;
++      }));
++  UniquePtr<BIO> tripwire(BIO_new(method.get()));
++  BSSL_CHECK(tripwire);
++  BIO_set_init(tripwire.get(), 1);
++
++  BIO *wbio = SSL_get_wbio(ssl);
++  if (wbio != nullptr) {
++    BIO_up_ref(wbio);
++  }
++  SSL_set0_wbio(ssl, tripwire.release());
++  ssl_seal_app_data_result_t ret =
++      SSL_seal_app_data(ssl, out.data(), out_len, out.size(), in.data(),
++                        in.size(), max_in, out_consumed);
++  SSL_set0_wbio(ssl, wbio);
++  return ret;
++}
++
++// ReadAvailable appends what `ssl` reads, until it would block, to `out`.
++static bool ReadAvailable(SSL *ssl, std::vector<uint8_t> *out) {
++  uint8_t buf[4096];
++  for (;;) {
++    int ret = SSL_read(ssl, buf, sizeof(buf));
++    if (ret <= 0) {
++      return SSL_get_error(ssl, ret) == SSL_ERROR_WANT_READ;
++    }
++    out->insert(out->end(), buf, buf + ret);
++  }
++}
++
++// SendToPeer writes `data`, which `ssl` sealed, to `ssl`'s transport and
++// appends what `peer` then reads to `out`.
++static bool SendToPeer(SSL *ssl, SSL *peer, Span<const uint8_t> data,
++                       std::vector<uint8_t> *out) {
++  BIO *bio = SSL_get_wbio(ssl);
++  while (!data.empty()) {
++    int ret = BIO_write(bio, data.data(),
++                        static_cast<int>(std::min(data.size(), size_t{1024})));
++    if (ret > 0) {
++      data = data.subspan(static_cast<size_t>(ret));
++      continue;
++    }
++    // The transport is full. Let the peer drain it.
++    if (!ReadAvailable(peer, out) || BIO_ctrl_get_write_guarantee(bio) == 0) {
++      return false;
++    }
++  }
++  return ReadAvailable(peer, out);
++}
++
++// SliceInput returns slices of `data` with lengths `lens`, in order. Empty
++// slices get bogus pointers, which must not be read: one inside `out`, one
++// that points nowhere, and NULL.
++static std::vector<CRYPTO_IVEC> SliceInput(Span<const uint8_t> data,
++                                           Span<const size_t> lens,
++                                           Span<const uint8_t> out) {
++  const uint8_t *bogus[] = {out.size() > 1 ? out.data() + 1 : nullptr,
++                            reinterpret_cast<const uint8_t *>(uintptr_t{1}),
++                            nullptr};
++  std::vector<CRYPTO_IVEC> ret;
++  size_t num_empty = 0;
++  for (size_t len : lens) {
++    if (len == 0) {
++      ret.push_back({bogus[num_empty++ % std::size(bogus)], 0});
++      continue;
++    }
++    ret.push_back({data.data(), len});
++    data = data.subspan(len);
++  }
++  return ret;
++}
++
++// RecordLengths sets `*out` to the lengths, with headers, of the application
++// data records that make up `in`.
++static bool RecordLengths(Span<const uint8_t> in, std::vector<size_t> *out) {
++  out->clear();
++  CBS cbs(in);
++  while (CBS_len(&cbs) != 0) {
++    uint8_t type;
++    uint16_t record_version;
++    CBS body;
++    if (!CBS_get_u8(&cbs, &type) || type != SSL3_RT_APPLICATION_DATA ||
++        !CBS_get_u16(&cbs, &record_version) ||
++        !CBS_get_u16_length_prefixed(&cbs, &body)) {
++      return false;
++    }
++    out->push_back(SSL3_RT_HEADER_LENGTH + CBS_len(&body));
++  }
++  return true;
++}
++
++// CheckSealedRecords checks that `records`, sealed by `ssl` from `consumed`
++// bytes, is the fewest records of at most `frag` bytes, and that every record
++// but the last carries `frag` bytes. The record sizes are exact only for AEAD
++// ciphers, whose overhead is fixed.
++static void CheckSealedRecords(const SSL *ssl, Span<const uint8_t> records,
++                               size_t consumed, size_t frag, size_t overhead) {
++  std::vector<size_t> lens;
++  ASSERT_TRUE(RecordLengths(records, &lens));
++  ASSERT_EQ(lens.size(), (consumed + frag - 1) / frag);
++  if (!SSL_CIPHER_is_aead(SSL_get_current_cipher(ssl)) || lens.empty()) {
++    return;
++  }
++  for (size_t i = 0; i + 1 < lens.size(); i++) {
++    EXPECT_EQ(lens[i], frag + overhead) << "record " << i;
++  }
++  EXPECT_EQ(lens.back(), consumed - (lens.size() - 1) * frag + overhead);
++}
++
++// SealToPeer seals `data` on `ssl` in one call, with `out` sized exactly by
++// `SSL_seal_app_data_limits`, and checks that `peer` reads back `data`. It
++// sets `*out_pending` to the pending length the limits reported and
++// `*out_records` to the number of records written, including pending ones.
++static void SealToPeer(SSL *ssl, SSL *peer, Span<const uint8_t> data,
++                       size_t *out_pending = nullptr,
++                       size_t *out_records = nullptr) {
++  size_t frag, overhead, pending;
++  ASSERT_TRUE(SSL_seal_app_data_limits(ssl, &frag, &overhead, &pending));
++  const size_t max_out =
++      pending + data.size() + (data.size() + frag - 1) / frag * overhead;
++  auto out = std::make_unique<uint8_t[]>(max_out);
++  const CRYPTO_IVEC in = {data.data(), data.size()};
++  // Queued handshake messages are sealed as one record now. A pending flight
++  // was sealed earlier, possibly under the previous key.
++  const BUF_MEM *hs_data = FromOpaque(ssl)->s3->pending_hs_data.get();
++  const uint64_t new_records =
++      (hs_data != nullptr && hs_data->length != 0 ? 1 : 0) +
++      (data.size() + frag - 1) / frag;
++  const uint64_t seq = SSL_get_write_sequence(ssl);
++  size_t out_len, consumed;
++  ASSERT_EQ(SealNoIO(ssl, Span(out.get(), max_out), &out_len, Span(&in, 1),
++                     data.size(), &consumed),
++            ssl_seal_app_data_success);
++  EXPECT_EQ(consumed, data.size());
++  EXPECT_LE(out_len, max_out);
++  std::vector<size_t> lens;
++  ASSERT_TRUE(RecordLengths(Span(out.get(), out_len), &lens));
++  EXPECT_EQ(SSL_get_write_sequence(ssl) - seq, new_records);
++
++  std::vector<uint8_t> received;
++  ASSERT_TRUE(SendToPeer(ssl, peer, Span(out.get(), out_len), &received));
++  EXPECT_TRUE(Bytes(received) == Bytes(data));
++  if (out_pending != nullptr) {
++    *out_pending = pending;
++  }
++  if (out_records != nullptr) {
++    *out_records = lens.size();
++  }
++}
++
++TEST_P(SSLVersionTest, SealAppDataRoundTrip) {
++  if (is_dtls()) {
++    return;
++  }
++
++  struct Shape {
++    std::vector<size_t> lens;
++    size_t max_in = SIZE_MAX;
++  };
++  const Shape kShapes[] = {
++      {{100}},
++      {std::vector<size_t>(64, 64)},
++      {std::vector<size_t>(512, 32)},
++      {std::vector<size_t>(16, 1024)},
++      {std::vector<size_t>(4, 4096)},
++      {std::vector<size_t>(8, 2048)},
++      {{10000, 7000}},
++      {{9, 16384, 9, 16384, 9, 16384, 9, 16384}},
++      {{16384 * 4}},
++      {{1, 16383, 16385}},
++      {{0, 3, 16384, 0, 40965, 1, 0, 32771}},
++      {std::vector<size_t>(20000, 1)},
++      // `max_in` ends inside a slice.
++      {{10000, 7000}, 12345},
++  };
++
++  for (const SealCipher &cipher : kSealCiphers) {
++    if (!SealCipherApplies(cipher, version())) {
++      continue;
++    }
++    SCOPED_TRACE(SSL_CIPHER_standard_name(SSL_get_cipher_by_value(cipher.id)));
++    ASSERT_NO_FATAL_FAILURE(ResetContexts());
++    ASSERT_TRUE(ConfigureSealCipher(client_ctx_.get(), server_ctx_.get(),
++                                    cipher, version()));
++    ASSERT_TRUE(Connect());
++    ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++    ASSERT_EQ(SSL_CIPHER_get_protocol_id(SSL_get_current_cipher(client_.get())),
++              cipher.id);
++
++    for (size_t max_frag : {size_t{16384}, size_t{512}}) {
++      SCOPED_TRACE(max_frag);
++      ASSERT_TRUE(SSL_set_max_send_fragment(client_.get(), max_frag));
++      for (const Shape &shape : kShapes) {
++        SCOPED_TRACE(shape.lens.size());
++        size_t total = 0;
++        for (size_t len : shape.lens) {
++          total += len;
++        }
++        std::vector<uint8_t> data(total);
++        RAND_bytes(data.data(), data.size());
++
++        size_t frag, overhead, pending;
++        ASSERT_TRUE(SSL_seal_app_data_limits(client_.get(), &frag, &overhead,
++                                             &pending));
++        EXPECT_EQ(frag, max_frag);
++        EXPECT_EQ(overhead, SSL_max_seal_overhead(client_.get()));
++        EXPECT_EQ(pending, 0u);
++
++        const size_t n = std::min(shape.max_in, total);
++        const size_t max_out = n + (n + frag - 1) / frag * overhead;
++        auto out = std::make_unique<uint8_t[]>(max_out);
++        std::vector<CRYPTO_IVEC> in =
++            SliceInput(data, shape.lens, Span(out.get(), max_out));
++        const uint64_t seq = SSL_get_write_sequence(client_.get());
++        size_t out_len, consumed;
++        ASSERT_EQ(SealNoIO(client_.get(), Span(out.get(), max_out), &out_len,
++                           in, shape.max_in, &consumed),
++                  ssl_seal_app_data_success);
++        EXPECT_EQ(consumed, n);
++        EXPECT_LE(out_len, max_out);
++        ASSERT_NO_FATAL_FAILURE(CheckSealedRecords(
++            client_.get(), Span(out.get(), out_len), consumed, frag, overhead));
++        EXPECT_EQ(SSL_get_write_sequence(client_.get()) - seq,
++                  (consumed + frag - 1) / frag);
++
++        std::vector<uint8_t> received;
++        ASSERT_TRUE(SendToPeer(client_.get(), server_.get(),
++                               Span(out.get(), out_len), &received));
++        EXPECT_TRUE(Bytes(received) == Bytes(Span(data).first(n)));
++
++        // `SSL_write` continues where sealing stopped.
++        ASSERT_EQ(SSL_write(client_.get(), "x", 1), 1);
++        uint8_t byte;
++        ASSERT_EQ(SSL_read(server_.get(), &byte, 1), 1);
++        EXPECT_EQ(byte, 'x');
++      }
++    }
++  }
++}
++
++TEST_P(SSLVersionTest, SealAppDataSendsFlightFirst) {
++  if (is_dtls() || !is_tls13()) {
++    return;
++  }
++
++  SSL_CTX_set_session_cache_mode(client_ctx_.get(), SSL_SESS_CACHE_BOTH);
++  SSL_CTX_sess_set_new_cb(client_ctx_.get(), SaveLastSession);
++  g_last_session = nullptr;
++  ASSERT_TRUE(Connect());
++  static const uint8_t kData[] = "hello";
++
++  // The server defers its tickets to its first write. They go out first, and
++  // the client reads them before the data.
++  SSLImpl *server = FromOpaque(server_.get());
++  ASSERT_TRUE(server->s3->pending_hs_data);
++  ASSERT_NE(server->s3->pending_hs_data->length, 0u);
++  size_t pending, records;
++  ASSERT_NO_FATAL_FAILURE(SealToPeer(server_.get(), client_.get(), kData,
++                                     &pending, &records));
++  EXPECT_GT(pending, 0u);
++  EXPECT_EQ(records, 2u);
++  EXPECT_TRUE(g_last_session);
++  EXPECT_FALSE(server->s3->pending_hs_data);
++  EXPECT_FALSE(server->s3->pending_flight);
++
++  // A local KeyUpdate is sealed under the old key and sent first.
++  SSLImpl *client = FromOpaque(client_.get());
++  ASSERT_TRUE(SSL_key_update(client_.get(), SSL_KEY_UPDATE_REQUESTED));
++  EXPECT_TRUE(client->s3->key_update_pending);
++  ASSERT_NO_FATAL_FAILURE(
++      SealToPeer(client_.get(), server_.get(), kData, &pending, &records));
++  EXPECT_GT(pending, 0u);
++  EXPECT_EQ(records, 2u);
++  EXPECT_FALSE(client->s3->key_update_pending);
++
++  // Reading the request queued the server's acknowledgement under its old
++  // key. It precedes the data, which uses the new key.
++  ASSERT_TRUE(server->s3->pending_flight);
++  ASSERT_NO_FATAL_FAILURE(
++      SealToPeer(server_.get(), client_.get(), kData, &pending, &records));
++  EXPECT_GT(pending, 0u);
++  EXPECT_EQ(records, 2u);
++  EXPECT_FALSE(server->s3->pending_flight);
++
++  // Both directions still work with `SSL_write`.
++  uint8_t buf[sizeof(kData)];
++  ASSERT_EQ(SSL_write(client_.get(), kData, sizeof(kData)), int{sizeof(kData)});
++  ASSERT_EQ(SSL_read(server_.get(), buf, sizeof(buf)), int{sizeof(buf)});
++  ASSERT_EQ(SSL_write(server_.get(), kData, sizeof(kData)), int{sizeof(kData)});
++  ASSERT_EQ(SSL_read(client_.get(), buf, sizeof(buf)), int{sizeof(buf)});
++}
++
++TEST_P(SSLVersionTest, SealAppDataDeclines) {
++  static const uint8_t kData[100] = {1};
++  const CRYPTO_IVEC in = {kData, sizeof(kData)};
++  uint8_t out[1024];
++  size_t frag, overhead, pending, out_len, consumed;
++  auto expect_declined = [&](SSL *ssl) {
++    EXPECT_FALSE(SSL_seal_app_data_limits(ssl, &frag, &overhead, &pending));
++    const uint64_t seq = SSL_get_write_sequence(ssl);
++    EXPECT_EQ(SealNoIO(ssl, out, &out_len, Span(&in, 1), SIZE_MAX, &consumed),
++              ssl_seal_app_data_declined);
++    EXPECT_EQ(out_len, 0u);
++    EXPECT_EQ(consumed, 0u);
++    EXPECT_EQ(SSL_get_write_sequence(ssl), seq);
++    EXPECT_EQ(ERR_peek_error(), 0u);
++  };
++
++  // DTLS is never sealed into caller memory.
++  if (is_dtls()) {
++    ASSERT_TRUE(Connect());
++    expect_declined(client_.get());
++    expect_declined(server_.get());
++    return;
++  }
++
++  // Neither a client nor a server yet.
++  UniquePtr<SSL> ssl(SSL_new(client_ctx_.get()));
++  ASSERT_TRUE(ssl);
++  expect_declined(ssl.get());
++  EXPECT_EQ(SSL_write(ssl.get(), kData, sizeof(kData)), -1);
++  EXPECT_TRUE(ExpectSingleError(ERR_LIB_SSL, SSL_R_UNINITIALIZED));
++
++  // Before and during the handshake.
++  ASSERT_TRUE(CreateClientAndServer(&client_, &server_, client_ctx_.get(),
++                                    server_ctx_.get()));
++  expect_declined(client_.get());
++  EXPECT_EQ(SSL_write(client_.get(), kData, sizeof(kData)), -1);
++  EXPECT_EQ(SSL_get_error(client_.get(), -1), SSL_ERROR_WANT_READ);
++  expect_declined(client_.get());
++  ASSERT_TRUE(CompleteHandshakes(client_.get(), server_.get()));
++  EXPECT_TRUE(SSL_seal_app_data_limits(client_.get(), &frag, &overhead,
++                                       &pending));
++
++  // With an unfinished write.
++  ASSERT_TRUE(Connect());
++  ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++  unsigned count = 0;
++  for (;;) {
++    int ret = SSL_write(client_.get(), kData, sizeof(kData));
++    if (ret <= 0) {
++      ASSERT_EQ(SSL_get_error(client_.get(), ret), SSL_ERROR_WANT_WRITE);
++      break;
++    }
++    count++;
++  }
++  expect_declined(client_.get());
++  uint8_t buf[sizeof(kData)];
++  for (unsigned i = 0; i < count; i++) {
++    ASSERT_EQ(SSL_read(server_.get(), buf, sizeof(buf)), int{sizeof(buf)});
++  }
++  ASSERT_EQ(SSL_write(client_.get(), kData, sizeof(kData)), int{sizeof(kData)});
++  ASSERT_EQ(SSL_read(server_.get(), buf, sizeof(buf)), int{sizeof(buf)});
++  ASSERT_NO_FATAL_FAILURE(SealToPeer(client_.get(), server_.get(), kData));
++
++  // TLS 1.0 CBC record splitting stays in `SSL_write`.
++  if (version() == TLS1_VERSION) {
++    ASSERT_TRUE(Connect());
++    SSL_set_mode(client_.get(), SSL_MODE_CBC_RECORD_SPLITTING);
++    ASSERT_TRUE(SSL_CIPHER_is_block_cipher(SSL_get_current_cipher(client_.get())));
++    expect_declined(client_.get());
++    ASSERT_EQ(SSL_write(client_.get(), kData, sizeof(kData)), int{sizeof(kData)});
++    ASSERT_EQ(SSL_read(server_.get(), buf, sizeof(buf)), 1);
++    ASSERT_EQ(SSL_read(server_.get(), buf, sizeof(buf)), int{sizeof(buf) - 1});
++  }
++
++  // `out` one byte too short for the pending records and the first record.
++  // The server's tickets stay queued until a call has room for them.
++  ASSERT_TRUE(Connect());
++  SSLImpl *server = FromOpaque(server_.get());
++  ASSERT_TRUE(SSL_seal_app_data_limits(server_.get(), &frag, &overhead,
++                                       &pending));
++  EXPECT_EQ(pending != 0, is_tls13());
++  const size_t hs_len =
++      server->s3->pending_hs_data ? server->s3->pending_hs_data->length : 0;
++  const uint64_t seq = SSL_get_write_sequence(server_.get());
++  auto exact = std::make_unique<uint8_t[]>(pending + sizeof(kData) + overhead);
++  EXPECT_EQ(SealNoIO(server_.get(),
++                     Span(exact.get(), pending + sizeof(kData) + overhead - 1),
++                     &out_len, Span(&in, 1), SIZE_MAX, &consumed),
++            ssl_seal_app_data_declined);
++  EXPECT_EQ(server->s3->pending_hs_data ? server->s3->pending_hs_data->length
++                                        : 0,
++            hs_len);
++  EXPECT_FALSE(server->s3->pending_flight);
++  EXPECT_EQ(SSL_get_write_sequence(server_.get()), seq);
++  // An exact `out` with `max_in` well past the input works.
++  ASSERT_EQ(SealNoIO(server_.get(),
++                     Span(exact.get(), pending + sizeof(kData) + overhead),
++                     &out_len, Span(&in, 1), SIZE_MAX, &consumed),
++            ssl_seal_app_data_success);
++  EXPECT_EQ(consumed, sizeof(kData));
++  std::vector<uint8_t> received;
++  ASSERT_TRUE(SendToPeer(server_.get(), client_.get(),
++                         Span(exact.get(), out_len), &received));
++  EXPECT_EQ(Bytes(received), Bytes(kData));
++
++  // After the connection is shut down or failed.
++  ASSERT_TRUE(Connect());
++  EXPECT_EQ(SSL_shutdown(client_.get()), 0);
++  expect_declined(client_.get());
++  EXPECT_EQ(SSL_write(client_.get(), kData, sizeof(kData)), -1);
++  EXPECT_TRUE(ExpectSingleError(ERR_LIB_SSL, SSL_R_PROTOCOL_IS_SHUTDOWN));
++
++  ASSERT_TRUE(Connect());
++  SSL_set_quiet_shutdown(client_.get(), 1);
++  EXPECT_EQ(SSL_shutdown(client_.get()), 1);
++  expect_declined(client_.get());
++
++  ASSERT_TRUE(Connect());
++  EXPECT_EQ(SSL_send_fatal_alert(client_.get(), SSL_AD_INTERNAL_ERROR), 1);
++  expect_declined(client_.get());
++  EXPECT_EQ(SSL_write(client_.get(), kData, sizeof(kData)), -1);
++  EXPECT_TRUE(ExpectSingleError(ERR_LIB_SSL, SSL_R_PROTOCOL_IS_SHUTDOWN));
++}
++
++TEST_P(SSLVersionTest, SealAppDataErrors) {
++  if (is_dtls()) {
++    return;
++  }
++
++  // Seal on the server, which has tickets pending in TLS 1.3.
++  ASSERT_TRUE(Connect());
++  SSLImpl *server = FromOpaque(server_.get());
++  size_t frag, overhead, pending;
++  ASSERT_TRUE(SSL_seal_app_data_limits(server_.get(), &frag, &overhead,
++                                       &pending));
++  const size_t max_out = pending + 3 * (frag + overhead);
++  auto out = std::make_unique<uint8_t[]>(max_out);
++  std::vector<uint8_t> data(3 * frag);
++  RAND_bytes(data.data(), data.size());
++  size_t out_len, consumed;
++  auto expect_error = [&](Span<const CRYPTO_IVEC> in, int lib, int reason) {
++    EXPECT_EQ(SealNoIO(server_.get(), Span(out.get(), max_out), &out_len, in,
++                       SIZE_MAX, &consumed),
++              ssl_seal_app_data_error);
++    EXPECT_EQ(out_len, 0u);
++    EXPECT_EQ(consumed, 0u);
++    EXPECT_EQ(SSL_get_error(server_.get(), -1), SSL_ERROR_SSL);
++    EXPECT_TRUE(ExpectSingleError(lib, reason));
++  };
++
++  // A slice array inside `out` is rejected before anything changes.
++  auto *in_out = reinterpret_cast<CRYPTO_IVEC *>(out.get());
++  in_out[0] = {data.data(), data.size()};
++  expect_error(Span(in_out, 1), ERR_LIB_SSL, SSL_R_OUTPUT_ALIASES_INPUT);
++  EXPECT_EQ(!!server->s3->pending_hs_data, is_tls13());
++  EXPECT_FALSE(server->s3->pending_flight);
++
++  // A slice that overlaps `out`, after a valid one.
++  const CRYPTO_IVEC aliasing[] = {{data.data(), 10},
++                                  {out.get() + max_out - 1, 1}};
++  expect_error(aliasing, ERR_LIB_SSL, SSL_R_OUTPUT_ALIASES_INPUT);
++  // The tickets were sealed, but stay queued.
++  EXPECT_FALSE(server->s3->pending_hs_data);
++  EXPECT_EQ(!!server->s3->pending_flight, is_tls13());
++
++  const CRYPTO_IVEC null_slice[] = {{nullptr, 0}, {nullptr, 1}};
++  expect_error(null_slice, ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
++
++  // A valid call sends the queued tickets, then the data, and does not
++  // leave an earlier error behind.
++  OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++  const CRYPTO_IVEC in = {data.data(), data.size()};
++  ASSERT_EQ(SealNoIO(server_.get(), Span(out.get(), max_out), &out_len,
++                     Span(&in, 1), SIZE_MAX, &consumed),
++            ssl_seal_app_data_success);
++  EXPECT_EQ(ERR_peek_error(), 0u);
++  EXPECT_EQ(consumed, data.size());
++  EXPECT_FALSE(server->s3->pending_flight);
++  std::vector<uint8_t> received;
++  ASSERT_TRUE(SendToPeer(server_.get(), client_.get(),
++                         Span(out.get(), out_len), &received));
++  EXPECT_TRUE(Bytes(received) == Bytes(data));
++
++  // The sequence number runs out after two more records. The records already
++  // sealed must be reported; the next call reports the failure.
++  server->s3->write_sequence = UINT64_MAX - 2;
++  ASSERT_EQ(SealNoIO(server_.get(), Span(out.get(), max_out), &out_len,
++                     Span(&in, 1), SIZE_MAX, &consumed),
++            ssl_seal_app_data_success);
++  EXPECT_EQ(consumed, 2 * frag);
++  EXPECT_EQ(ERR_peek_error(), 0u);
++  EXPECT_EQ(server->s3->write_sequence, UINT64_MAX);
++  const CRYPTO_IVEC rest = {data.data() + consumed, data.size() - consumed};
++  expect_error(Span(&rest, 1), ERR_LIB_SSL, ERR_R_OVERFLOW);
++
++  // The same with a flight: the tickets take the last sequence number, so
++  // the first record fails. Nothing reaches `out`, and the flight stays
++  // queued.
++  if (is_tls13()) {
++    ASSERT_TRUE(Connect());
++    server = FromOpaque(server_.get());
++    ASSERT_TRUE(server->s3->pending_hs_data);
++    server->s3->write_sequence = UINT64_MAX - 1;
++    OPENSSL_memset(out.get(), 0xaa, max_out);
++    expect_error(Span(&in, 1), ERR_LIB_SSL, ERR_R_OVERFLOW);
++    EXPECT_TRUE(server->s3->pending_flight);
++    for (size_t i = 0; i < max_out; i++) {
++      ASSERT_EQ(out[i], 0xaa) << i;
++    }
++  }
++}
++
++TEST_P(SSLVersionTest, SealAppDataProperty) {
++  if (is_dtls()) {
++    return;
++  }
++
++  // xorshift64 with a fixed seed, so failures reproduce.
++  uint64_t state = 0x9e3779b97f4a7c15 ^ version();
++  auto rand = [&]() -> size_t {
++    state ^= state << 13;
++    state ^= state >> 7;
++    state ^= state << 17;
++    return static_cast<size_t>(state);
++  };
++
++  for (const SealCipher &cipher : kSealCiphers) {
++    if (!SealCipherApplies(cipher, version())) {
++      continue;
++    }
++    SCOPED_TRACE(SSL_CIPHER_standard_name(SSL_get_cipher_by_value(cipher.id)));
++    ASSERT_NO_FATAL_FAILURE(ResetContexts());
++    ASSERT_TRUE(ConfigureSealCipher(client_ctx_.get(), server_ctx_.get(),
++                                    cipher, version()));
++    ASSERT_TRUE(Connect());
++    ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++
++    for (int iter = 0; iter < 250; iter++) {
++      SCOPED_TRACE(iter);
++      ASSERT_TRUE(
++          SSL_set_max_send_fragment(client_.get(), 512 + rand() % 15873));
++      size_t frag, overhead, pending;
++      ASSERT_TRUE(SSL_seal_app_data_limits(client_.get(), &frag, &overhead,
++                                           &pending));
++      ASSERT_EQ(pending, 0u);
++
++      // Up to 600 slices of up to 20,000 bytes, about 200 KB at most.
++      static const size_t kMaxLens[] = {0, 16, 300, 4100, 20000};
++      const size_t max_len = kMaxLens[rand() % std::size(kMaxLens)];
++      const size_t num = rand() % 601;
++      std::vector<size_t> lens;
++      size_t total = 0;
++      while (lens.size() < num && total < 200000) {
++        lens.push_back(rand() % (max_len + 1));
++        total += lens.back();
++      }
++      std::vector<uint8_t> data(total);
++      for (uint8_t &b : data) {
++        b = static_cast<uint8_t>(rand());
++      }
++
++      size_t max_in;
++      switch (rand() % 3) {
++        case 0:
++          max_in = SIZE_MAX;
++          break;
++        case 1:
++          max_in = total;
++          break;
++        default:
++          max_in = rand() % (total + 1);
++          break;
++      }
++      const size_t n = std::min(max_in, total);
++      const size_t first = std::min(frag, n);
++      const size_t bound = n + (n + frag - 1) / frag * overhead;
++      size_t max_out;
++      switch (rand() % 4) {
++        case 0:
++          max_out = bound;
++          break;
++        case 1:
++          max_out = bound + rand() % 64;
++          break;
++        case 2:
++          max_out = rand() % (bound + 1);
++          break;
++        default:
++          max_out = first + overhead - 1 + rand() % 2;
++          break;
++      }
++
++      auto out = std::make_unique<uint8_t[]>(max_out);
++      std::vector<CRYPTO_IVEC> in =
++          SliceInput(data, lens, Span(out.get(), max_out));
++      const uint64_t seq = SSL_get_write_sequence(client_.get());
++      size_t out_len, consumed;
++      ssl_seal_app_data_result_t ret =
++          SealNoIO(client_.get(), Span(out.get(), max_out), &out_len, in,
++                   max_in, &consumed);
++      if (first != 0 && max_out < first + overhead) {
++        EXPECT_EQ(ret, ssl_seal_app_data_declined);
++        EXPECT_EQ(out_len, 0u);
++        EXPECT_EQ(consumed, 0u);
++        EXPECT_EQ(SSL_get_write_sequence(client_.get()), seq);
++        continue;
++      }
++      ASSERT_EQ(ret, ssl_seal_app_data_success);
++      EXPECT_LE(out_len, max_out);
++      EXPECT_LE(consumed, n);
++      EXPECT_EQ(consumed == 0, n == 0);
++      if (consumed < n) {
++        // Sealing stops only when the next record does not fit.
++        EXPECT_LT(max_out - out_len, std::min(frag, n - consumed) + overhead);
++      }
++      ASSERT_NO_FATAL_FAILURE(CheckSealedRecords(
++          client_.get(), Span(out.get(), out_len), consumed, frag, overhead));
++      EXPECT_EQ(SSL_get_write_sequence(client_.get()) - seq,
++                (consumed + frag - 1) / frag);
++
++      std::vector<uint8_t> received;
++      ASSERT_TRUE(SendToPeer(client_.get(), server_.get(),
++                             Span(out.get(), out_len), &received));
++      ASSERT_TRUE(Bytes(received) == Bytes(Span(data).first(consumed)));
++
++      if (iter % 16 == 0) {
++        ASSERT_EQ(SSL_write(client_.get(), "x", 1), 1);
++        uint8_t byte;
++        ASSERT_EQ(SSL_read(server_.get(), &byte, 1), 1);
++      }
++    }
++  }
++}
++
+ TEST_P(SSLVersionTest, RecordCallback) {
+   if (version() == DTLS1_3_VERSION) {
+     // The DTLS 1.3 record header is vastly different than the TLS or DTLS < 1.3
+@@ -8156,6 +8841,30 @@ TEST_F(QUICMethodTest, Basic) {
+   EXPECT_TRUE(SSL_session_reused(server_.get()));
+ }
+ 
++// Test that `SSL_seal_app_data` declines QUIC connections. Their write context
++// is a placeholder with a cipher but no `EVP_AEAD_CTX`.
++TEST_F(QUICMethodTest, SealAppDataDeclines) {
++  const SSL_QUIC_METHOD quic_method = DefaultQUICMethod();
++  ASSERT_TRUE(SSL_CTX_set_quic_method(client_ctx_.get(), &quic_method));
++  ASSERT_TRUE(SSL_CTX_set_quic_method(server_ctx_.get(), &quic_method));
++  ASSERT_TRUE(CreateClientAndServer());
++  ASSERT_TRUE(CompleteHandshakesForQUIC());
++
++  static const uint8_t kData[100] = {1};
++  const CRYPTO_IVEC in = {kData, sizeof(kData)};
++  uint8_t out[1024];
++  for (SSL *ssl : {client_.get(), server_.get()}) {
++    size_t frag, overhead, pending, out_len = 1, consumed = 1;
++    EXPECT_FALSE(SSL_seal_app_data_limits(ssl, &frag, &overhead, &pending));
++    EXPECT_EQ(SSL_seal_app_data(ssl, out, &out_len, sizeof(out), &in, 1,
++                                SIZE_MAX, &consumed),
++              ssl_seal_app_data_declined);
++    EXPECT_EQ(out_len, 0u);
++    EXPECT_EQ(consumed, 0u);
++    EXPECT_EQ(ERR_peek_error(), 0u);
++  }
++}
++
+ // Test that HelloRetryRequest in QUIC works.
+ TEST_F(QUICMethodTest, HelloRetryRequest) {
+   const SSL_QUIC_METHOD quic_method = DefaultQUICMethod();
+diff --git a/ssl/test/bssl_shim.cc b/ssl/test/bssl_shim.cc
+--- a/ssl/test/bssl_shim.cc
++++ b/ssl/test/bssl_shim.cc
+@@ -253,6 +253,84 @@ static int DoRead(SSL *ssl, uint8_t *out, size_t max_out) {
+   return ret;
+ }
+ 
++// WriteSealed writes `len` bytes from `SSL_seal_app_data` to `ssl`'s `BIO`,
++// resolving asynchronous writes.
++static bool WriteSealed(SSL *ssl, const uint8_t *data, size_t len) {
++  const TestConfig *config = GetTestConfig(ssl);
++  TestState *test_state = GetTestState(ssl);
++  BIO *bio = SSL_get_wbio(ssl);
++  while (len > 0) {
++    size_t written;
++    if (BIO_write_ex(bio, data, len, &written)) {
++      data += written;
++      len -= written;
++    } else if (config->async && BIO_should_retry(bio)) {
++      AsyncBioAllowWrite(test_state->async_bio, 1);
++    } else {
++      return false;
++    }
++  }
++  return true;
++}
++
++// SealAll is `WriteAll` through `SSL_seal_app_data`. Each call takes the input
++// as irregular slices and stops after three records and a byte, so most
++// calls are partial. What sealing declines goes through `SSL_write`.
++static int SealAll(SSL *ssl, const uint8_t *in, size_t in_len) {
++  static const size_t kSliceLens[] = {0, 1, 7, 0, 300, 4100, 2, 9000};
++  size_t next_slice = 0;
++  int ret;
++  do {
++    size_t frag, overhead, pending;
++    if (!SSL_seal_app_data_limits(ssl, &frag, &overhead, &pending)) {
++      do {
++        ret = SSL_write(ssl, in, in_len);
++      } while (RetryAsync(ssl, ret));
++      if (ret <= 0) {
++        return ret;
++      }
++      in += ret;
++      in_len -= ret;
++      continue;
++    }
++
++    // Cut a little past `max_in`, so it usually ends inside a slice.
++    const size_t max_in = std::min(in_len, 3 * frag + 1);
++    std::vector<CRYPTO_IVEC> slices;
++    for (size_t off = 0; off < std::min(in_len, max_in + 9000);) {
++      const size_t len = std::min(
++          kSliceLens[next_slice++ % std::size(kSliceLens)], in_len - off);
++      slices.push_back({in + off, len});
++      off += len;
++    }
++    const size_t max_out =
++        pending + max_in + (max_in + frag - 1) / frag * overhead;
++    auto out = std::make_unique<uint8_t[]>(max_out);
++    size_t out_len, consumed;
++    switch (SSL_seal_app_data(ssl, out.get(), &out_len, max_out, slices.data(),
++                              slices.size(), max_in, &consumed)) {
++      case ssl_seal_app_data_success:
++        break;
++      case ssl_seal_app_data_declined:
++        fprintf(stderr, "SSL_seal_app_data declined after its limits.\n");
++        return -1;
++      case ssl_seal_app_data_error:
++        return -1;
++    }
++    if (consumed == 0 && in_len != 0) {
++      fprintf(stderr, "SSL_seal_app_data consumed nothing.\n");
++      return -1;
++    }
++    if (!WriteSealed(ssl, out.get(), out_len)) {
++      return -1;
++    }
++    in += consumed;
++    in_len -= consumed;
++    ret = static_cast<int>(consumed);
++  } while (in_len > 0);
++  return ret;
++}
++
+ // WriteAll writes `in_len` bytes from `in` to `ssl`, resolving any asynchronous
+ // operations. It returns the result of the final `SSL_write` call.
+ static int WriteAll(SSL *ssl, const void *in_, size_t in_len) {
+@@ -264,6 +342,9 @@ static int WriteAll(SSL *ssl, const void *in_, size_t in_len) {
+     }
+     return in_len;
+   }
++  if (GetTestConfig(ssl)->seal_app_data) {
++    return SealAll(ssl, in, in_len);
++  }
+   int ret;
+   do {
+     ret = SSL_write(ssl, in, in_len);
+diff --git a/ssl/test/test_config.cc b/ssl/test/test_config.cc
+--- a/ssl/test/test_config.cc
++++ b/ssl/test/test_config.cc
+@@ -381,6 +381,7 @@ const Flag<TestConfig> *FindFlag(const char *name) {
+                  &TestConfig::write_different_record_sizes),
+         BoolFlag("-cbc-record-splitting", &TestConfig::cbc_record_splitting),
+         BoolFlag("-partial-write", &TestConfig::partial_write),
++        BoolFlag("-seal-app-data", &TestConfig::seal_app_data),
+         BoolFlag("-no-tls13", &TestConfig::no_tls13),
+         BoolFlag("-no-tls12", &TestConfig::no_tls12),
+         BoolFlag("-no-tls11", &TestConfig::no_tls11),
+diff --git a/ssl/test/test_config.h b/ssl/test/test_config.h
+--- a/ssl/test/test_config.h
++++ b/ssl/test/test_config.h
+@@ -101,6 +101,7 @@ struct TestConfig {
+   bool write_different_record_sizes = false;
+   bool cbc_record_splitting = false;
+   bool partial_write = false;
++  bool seal_app_data = false;
+   bool no_tls13 = false;
+   bool no_tls12 = false;
+   bool no_tls11 = false;
+diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
+--- a/ssl/tls_record.cc
++++ b/ssl/tls_record.cc
+@@ -263,9 +263,14 @@ ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
+   return ssl_open_record_success;
+ }
+ 
+-static bool do_seal_record(SSLImpl *ssl, uint8_t *out_prefix, uint8_t *out,
+-                           uint8_t *out_suffix, uint8_t type, const uint8_t *in,
+-                           const size_t in_len) {
++// do_seal_record_iov seals a record of type `type` whose body is `body`, which
++// holds `in_len` bytes in total. It writes the header and explicit nonce to
++// `out_prefix`, the body to the entries' `out` ranges and the suffix to
++// `out_suffix`, and sets `*out_suffix_len` to the suffix length.
++static bool do_seal_record_iov(SSLImpl *ssl, uint8_t *out_prefix,
++                               Span<const CRYPTO_IOVEC> body, size_t in_len,
++                               uint8_t *out_suffix, uint8_t type,
++                               size_t *out_suffix_len) {
+   SSLAEADContext *aead = ssl->s3->aead_write_ctx.get();
+   uint8_t *extra_in = nullptr;
+   size_t extra_in_len = 0;
+@@ -282,9 +287,13 @@ static bool do_seal_record(SSLImpl *ssl, uint8_t *out_prefix, uint8_t *out,
+     return false;
+   }
+ 
+-  assert(in == out || !buffers_alias(in, in_len, out, in_len));
+-  assert(!buffers_alias(in, in_len, out_prefix, ssl_record_prefix_len(ssl)));
+-  assert(!buffers_alias(in, in_len, out_suffix, suffix_len));
++#if !defined(NDEBUG)
++  for (const CRYPTO_IOVEC &v : body) {
++    assert(v.in == v.out || !buffers_alias(v.in, v.len, body[0].out, in_len));
++    assert(!buffers_alias(v.in, v.len, out_prefix, ssl_record_prefix_len(ssl)));
++    assert(!buffers_alias(v.in, v.len, out_suffix, suffix_len));
++  }
++#endif
+ 
+   if (extra_in_len) {
+     out_prefix[0] = SSL3_RT_APPLICATION_DATA;
+@@ -305,17 +314,28 @@ static bool do_seal_record(SSLImpl *ssl, uint8_t *out_prefix, uint8_t *out,
+     return false;
+   }
+ 
+-  if (!aead->SealScatter(out_prefix + SSL3_RT_HEADER_LENGTH, out, out_suffix,
+-                         out_prefix[0], record_version, ssl->s3->write_sequence,
+-                         header, in, in_len, extra_in, extra_in_len)) {
++  if (!aead->SealScatterv(out_prefix + SSL3_RT_HEADER_LENGTH, body, out_suffix,
++                          out_prefix[0], record_version,
++                          ssl->s3->write_sequence, header, extra_in,
++                          extra_in_len)) {
+     return false;
+   }
+ 
+   ssl->s3->write_sequence++;
+   ssl_do_msg_callback(ssl, 1 /* write */, SSL3_RT_HEADER, header);
++  *out_suffix_len = suffix_len;
+   return true;
+ }
+ 
++static bool do_seal_record(SSLImpl *ssl, uint8_t *out_prefix, uint8_t *out,
++                           uint8_t *out_suffix, uint8_t type, const uint8_t *in,
++                           const size_t in_len) {
++  const CRYPTO_IOVEC body = {out, in, in_len};
++  size_t suffix_len;
++  return do_seal_record_iov(ssl, out_prefix, Span(&body, 1), in_len,
++                            out_suffix, type, &suffix_len);
++}
++
+ static size_t tls_seal_scatter_prefix_len(const SSLImpl *ssl, uint8_t type,
+                                           size_t in_len) {
+   size_t ret = SSL3_RT_HEADER_LENGTH;
+@@ -499,6 +519,151 @@ enum ssl_open_record_t ssl_process_alert(SSLImpl *ssl, uint8_t *out_alert,
+   return ssl_open_record_error;
+ }
+ 
++size_t SealInput::Available(size_t limit) const {
++  limit = std::min(limit, remaining_);
++  size_t n = 0;
++  for (size_t i = index_, off = offset_; i < slices_.size() && n < limit;
++       i++, off = 0) {
++    n += std::min(slices_[i].len - off, limit - n);
++  }
++  return n;
++}
++
++size_t tls_seal_body_iovec_budget(const SSLImpl *ssl) {
++  // Only AES-GCM gathers. ChaCha20-Poly1305's one-pass assembly takes at most
++  // two entries, and TLS 1.3 spends one on the content type. CBC stays at one
++  // too: SealScatterTest shows mixed entries seal correctly, but gathering is
++  // unmeasured for CBC.
++  const SSL_CIPHER *cipher = ssl->s3->aead_write_ctx->cipher();
++  if ((cipher->algorithm_enc & (SSL_AES128GCM | SSL_AES256GCM)) == 0) {
++    return 1;
++  }
++  return size_t{CRYPTO_IOVEC_MAX} -
++         (ssl_protocol_version(ssl) >= TLS1_3_VERSION ? 1 : 0);
++}
++
++// seal_copy copies `len` bytes of a piece into the record body. Pieces of at
++// most 32 bytes, as from many small slices, are copied with fixed-size moves
++// rather than a call.
++static void seal_copy(uint8_t *dst, const uint8_t *src, size_t len) {
++  if (len > 32) {
++    OPENSSL_memcpy(dst, src, len);
++  } else if (len >= 16) {
++    OPENSSL_memcpy(dst, src, 16);
++    OPENSSL_memcpy(dst + len - 16, src + len - 16, 16);
++  } else if (len >= 8) {
++    OPENSSL_memcpy(dst, src, 8);
++    OPENSSL_memcpy(dst + len - 8, src + len - 8, 8);
++  } else if (len >= 4) {
++    OPENSSL_memcpy(dst, src, 4);
++    OPENSSL_memcpy(dst + len - 4, src + len - 4, 4);
++  } else if (len > 0) {
++    dst[0] = src[0];
++    dst[len / 2] = src[len / 2];
++    dst[len - 1] = src[len - 1];
++  }
++}
++
++bool tls_plan_seal_body(SealInput *input, size_t want, uint8_t *body,
++                        size_t budget, CRYPTO_IOVEC *out_iovecs,
++                        size_t *out_num, size_t *out_len) {
++  // Work on local copies, which `body` cannot alias.
++  const Span<const CRYPTO_IVEC> slices = input->slices_;
++  const Span<const uint8_t> out = input->out_;
++  size_t index = input->index_, offset = input->offset_;
++  const size_t limit = std::min(want, input->remaining_);
++  size_t n = 0, pos = 0, run = 0;  // body[run, pos) is the open copied run
++  while (pos < limit && index < slices.size()) {
++    const CRYPTO_IVEC &slice = slices[index];
++    if (offset == slice.len) {  // an empty slice; its pointer is not read
++      index++;
++      offset = 0;
++      continue;
++    }
++    if (slice.in == nullptr) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
++      OPENSSL_memset(body, 0, pos);
++      return false;
++    }
++    const size_t len = std::min(slice.len - offset, limit - pos);
++    const uint8_t *piece = slice.in + offset;
++    if (buffers_alias(piece, len, out.data(), out.size())) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_OUTPUT_ALIASES_INPUT);
++      OPENSSL_memset(body, 0, pos);
++      return false;
++    }
++    offset += len;
++    if (offset == slice.len) {
++      index++;
++      offset = 0;
++    }
++
++    const bool whole = pos == 0 && len == want;
++    const bool last = pos + len == want;
++    const size_t open = pos > run ? 1 : 0;
++    // Gathering spends a slot on the open run, one on the piece and, unless
++    // the record ends here, keeps one for whatever follows.
++    if (whole || (len >= kSealGatherMin &&
++                  n + open + 1 + (last ? 0 : 1) <= budget)) {
++      if (open) {
++        BSSL_CHECK(n < budget);
++        out_iovecs[n++] = {body + run, body + run, pos - run};
++      }
++      BSSL_CHECK(n < budget);
++      out_iovecs[n++] = {body + pos, piece, len};
++      pos += len;
++      run = pos;
++    } else {
++      seal_copy(body + pos, piece, len);
++      pos += len;
++    }
++  }
++  if (pos > run) {
++    BSSL_CHECK(n < budget);
++    out_iovecs[n++] = {body + run, body + run, pos - run};
++  }
++  input->index_ = index;
++  input->offset_ = offset;
++  input->remaining_ -= pos;
++  *out_num = n;
++  *out_len = pos;
++  return true;
++}
++
++bool tls_seal_app_data_record(SSLImpl *ssl, Span<uint8_t> out,
++                              SealInput *input, size_t want,
++                              size_t prefix_len, size_t budget,
++                              size_t *out_len, size_t *out_consumed) {
++  // Fail before copying any plaintext.
++  if (ssl->s3->write_sequence + 1 == 0) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
++    return false;
++  }
++  uint8_t *body = out.data() + prefix_len;
++  CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++  size_t num, body_len;
++  if (!tls_plan_seal_body(input, want, body, budget, iovecs, &num,
++                          &body_len)) {
++    return false;
++  }
++  if (body_len == 0) {
++    *out_len = *out_consumed = 0;
++    return true;
++  }
++  size_t suffix_len;
++  if (!do_seal_record_iov(ssl, out.data(), Span(iovecs, num), body_len,
++                          body + body_len, SSL3_RT_APPLICATION_DATA,
++                          &suffix_len)) {
++    // `EVP_AEAD_CTX_sealv` zeroes its outputs, but a failure can come before
++    // it.
++    OPENSSL_memset(body, 0, body_len);
++    return false;
++  }
++  *out_len = prefix_len + body_len + suffix_len;
++  *out_consumed = body_len;
++  return true;
++}
++
+ BSSL_NAMESPACE_END
+ 
+ using namespace bssl;
