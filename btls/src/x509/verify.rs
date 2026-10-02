@@ -173,9 +173,12 @@ impl X509VerifyParamRef {
     }
 
     /// Set the verification time, where time is of type time_t, traditionaly defined as seconds since the epoch
-    #[corresponds(X509_VERIFY_PARAM_set_time)]
+    #[corresponds(X509_VERIFY_PARAM_set_time_posix)]
+    #[allow(clippy::useless_conversion)]
     pub fn set_time(&mut self, time: time_t) {
-        unsafe { ffi::X509_VERIFY_PARAM_set_time(self.as_ptr(), time) }
+        // libc and the C headers can disagree on time_t width on 32-bit musl.
+        // The POSIX entry point takes a fixed-width timestamp on every target.
+        unsafe { ffi::X509_VERIFY_PARAM_set_time_posix(self.as_ptr(), i64::from(time)) }
     }
 
     /// Set the verification depth

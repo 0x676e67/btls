@@ -17,6 +17,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
+    clippy::manual_div_ceil,
     clippy::ptr_offset_with_cast,
     clippy::useless_transmute,
     dead_code,
@@ -79,28 +80,7 @@ pub fn cbs_init(data: &[u8]) -> CBS {
 }
 
 pub mod internal {
-    use super::EVP_MD;
-    use std::os::raw::c_int;
-
-    extern "C" {
-        /// Calculates `out_len` bytes of the TLS 1.2 PRF using `digest` and writes
-        /// them to `out`.
-        ///
-        /// This symbol is exported by BoringSSL, but it is declared in an internal
-        /// header (`crypto/fipsmodule/tls/internal.h`) and is therefore not present
-        /// in generated bindgen output.
-        pub fn CRYPTO_tls1_prf(
-            digest: *const EVP_MD,
-            out: *mut u8,
-            out_len: usize,
-            secret: *const u8,
-            secret_len: usize,
-            label: *const u8,
-            label_len: usize,
-            seed1: *const u8,
-            seed1_len: usize,
-            seed2: *const u8,
-            seed2_len: usize,
-        ) -> c_int;
-    }
+    // BoringSSL now exposes this in the public `openssl/tls_prf.h`, so bindgen
+    // generates it; kept as a re-export so the old path still works.
+    pub use super::CRYPTO_tls1_prf;
 }
