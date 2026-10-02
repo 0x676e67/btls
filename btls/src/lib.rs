@@ -130,6 +130,7 @@ pub mod error;
 pub mod ex_data;
 pub mod fips;
 pub mod hash;
+pub mod hkdf;
 pub mod hmac;
 pub mod hpke;
 pub mod memcmp;

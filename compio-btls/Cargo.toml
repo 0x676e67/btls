@@ -21,8 +21,9 @@ default = ["btls/default"]
 # Use a FIPS-validated version of boringssl.
 fips = ["btls/fips"]
 
-# Add a prefix to all symbols in libcrypto and libssl to prevent conflicts
-# with OpenSSL versions that might be linked in the same process.
+# Build BoringSSL with its native symbol-prefixing support, so its symbols don't
+# collide with an OpenSSL linked into the same process. Needs Go and clang at
+# build time, and cannot be combined with `fips` or `BORING_BSSL_SOURCE_PATH`.
 prefix-symbols = ["btls/prefix-symbols"]
 
 [dependencies]

@@ -623,6 +623,7 @@ impl ExtensionType {
     pub const CHANNEL_ID: Self = Self(ffi::TLSEXT_TYPE_channel_id as u16);
     #[cfg(not(feature = "fips"))]
     pub const RECORD_SIZE_LIMIT: Self = Self(ffi::TLSEXT_TYPE_record_size_limit as u16);
+    pub const SERVER_PADDING: Self = Self(ffi::TLSEXT_TYPE_server_padding as u16);
 }
 
 impl From<u16> for ExtensionType {
@@ -3623,6 +3624,27 @@ impl SslRef {
         }
     }
 
+    /// Returns the peer's ALPS (application-layer protocol settings) value, or `None` if ALPS
+    /// was not negotiated.
+    ///
+    /// The value may be empty. It is available once the handshake has negotiated ALPS.
+    #[corresponds(SSL_get0_peer_application_settings)]
+    pub fn peer_application_settings(&self) -> Option<&[u8]> {
+        unsafe {
+            if ffi::SSL_has_application_settings(self.as_ptr()) == 0 {
+                return None;
+            }
+            let mut data = ptr::null();
+            let mut len = 0;
+            ffi::SSL_get0_peer_application_settings(self.as_ptr(), &mut data, &mut len);
+            if data.is_null() {
+                Some(&[])
+            } else {
+                Some(slice::from_raw_parts(data, len))
+            }
+        }
+    }
+
     /// Enables the DTLS extension "use_srtp" as defined in RFC5764.
     #[corresponds(SSL_set_tlsext_use_srtp)]
     pub fn set_tlsext_use_srtp(&mut self, protocols: &str) -> Result<(), ErrorStack> {
@@ -4254,16 +4276,24 @@ impl SslRef {
         }
     }
 
-    /// Sets application settings flag for ALPS (Application-Layer Protocol Negotiation).
+    /// Enables ALPS (application-layer protocol settings) for the ALPN protocol `proto`, sending
+    /// `settings` to the peer, or an empty value if `None`.
+    ///
+    /// The peer's value is available with [`Self::peer_application_settings`].
     #[corresponds(SSL_add_application_settings)]
-    pub fn add_application_settings(&mut self, alps: &[u8]) -> Result<(), ErrorStack> {
+    pub fn add_application_settings(
+        &mut self,
+        proto: &[u8],
+        settings: Option<&[u8]>,
+    ) -> Result<(), ErrorStack> {
+        let settings = settings.unwrap_or_default();
         unsafe {
             cvt(ffi::SSL_add_application_settings(
                 self.as_ptr(),
-                alps.as_ptr(),
-                alps.len(),
-                std::ptr::null(),
-                0,
+                proto.as_ptr(),
+                proto.len(),
+                settings.as_ptr(),
+                settings.len(),
             ))
             .map(|_| ())
         }
@@ -4282,6 +4312,29 @@ impl SslRef {
     pub fn set_aes_hw_override(&mut self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
         unsafe { ffi::SSL_set_aes_hw_override(self.as_ptr(), enable) }
+    }
+
+    /// Requests `num_bytes` of padding from the server in its EncryptedExtensions.
+    ///
+    /// Servers answer only over TLS 1.3, and not for more than 16 KiB. The extension is
+    /// experimental in BoringSSL.
+    #[corresponds(SSL_set_server_padding_request)]
+    pub fn set_server_padding_request(&mut self, num_bytes: u16) {
+        unsafe { ffi::SSL_set_server_padding_request(self.as_ptr(), num_bytes) }
+    }
+
+    /// Sets whether a server answers the client's server padding request.
+    #[corresponds(SSL_set_server_padding_enabled)]
+    pub fn set_server_padding_enabled(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_set_server_padding_enabled(self.as_ptr(), enabled as _) }
+    }
+
+    /// Returns whether the server sent the padding requested with
+    /// [`set_server_padding_request`](Self::set_server_padding_request).
+    #[corresponds(SSL_server_sent_requested_padding)]
+    #[must_use]
+    pub fn server_sent_requested_padding(&self) -> bool {
+        unsafe { ffi::SSL_server_sent_requested_padding(self.as_ptr()) == 1 }
     }
 }
 

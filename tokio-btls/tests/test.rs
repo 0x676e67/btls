@@ -93,3 +93,60 @@ async fn server() {
 
     future::join(server, client).await;
 }
+
+#[tokio::test]
+async fn buffered_reads_preserve_record_boundaries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Exercise varied write sizes, including writes larger than one TLS record.
+    let records: Vec<Vec<u8>> = [1, 5, 300, 16 * 1024, 40 * 1024, 7]
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| vec![i as u8; len])
+        .collect();
+    let expected = records.concat();
+
+    let server = async {
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor
+            .set_private_key_file("tests/key.pem", SslFiletype::PEM)
+            .unwrap();
+        acceptor
+            .set_certificate_chain_file("tests/cert.pem")
+            .unwrap();
+        let acceptor = acceptor.build();
+
+        let ssl = Ssl::new(acceptor.context()).unwrap();
+        let stream = listener.accept().await.unwrap().0;
+        let mut stream = SslStream::new(ssl, stream).unwrap();
+        Pin::new(&mut stream).accept().await.unwrap();
+
+        for record in &records {
+            stream.write_all(record).await.unwrap();
+        }
+        future::poll_fn(|ctx| Pin::new(&mut stream).poll_shutdown(ctx))
+            .await
+            .unwrap()
+    };
+
+    let client = async {
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        connector.set_ca_file("tests/cert.pem").unwrap();
+        let ssl = connector
+            .build()
+            .configure()
+            .unwrap()
+            .into_ssl("localhost")
+            .unwrap();
+
+        let stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = SslStream::new(ssl, stream).unwrap();
+        Pin::new(&mut stream).connect().await.unwrap();
+
+        let mut buf = vec![];
+        stream.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, expected);
+    };
+
+    future::join(server, client).await;
+}
