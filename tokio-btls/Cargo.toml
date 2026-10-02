@@ -16,6 +16,8 @@ include = [
     "/*.toml",
     "/LICENSE-*",
     "/src",
+    # Read by the unit tests in src/lib.rs.
+    "/tests/*.pem",
 ]
 
 [package.metadata.docs.rs]
@@ -44,4 +46,3 @@ btls-sys = { workspace = true }
 foreign-types = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = [ "full" ] }
-anyhow = { workspace = true }

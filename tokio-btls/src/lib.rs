@@ -36,7 +36,7 @@ const READ_BUF_CAPACITY: usize = 17 * 1024;
 
 /// Buffered ciphertext threshold at which writes stop sealing, except for a final
 /// plaintext tail of at most `MAX_RECORD` bytes.
-const OUT_BUF_CAPACITY: usize = 64 * 1024;
+const WRITE_BUF_CAPACITY: usize = 64 * 1024;
 
 /// Largest plaintext in one TLS record.
 const MAX_RECORD: usize = 16 * 1024;
@@ -58,9 +58,9 @@ pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
 struct StreamWrapper<S> {
     transport: Transport<S>,
     read_buf: ReadBuffer,
-    out_buf: OutBuffer,
+    write_buf: WriteBuffer,
     // Set while sealing the last record of a write, which goes straight to the transport unless
-    // `out_buf` is blocked.
+    // `write_buf` is blocked.
     write_through: bool,
     // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
     shutdown_sent: bool,
@@ -89,7 +89,7 @@ struct ReadBuffer {
 /// Partial writes advance `pos` instead of shifting the rest; appends drop the written prefix
 /// through [`make_room`](Self::make_room).
 #[derive(Default)]
-struct OutBuffer {
+struct WriteBuffer {
     bytes: Vec<u8>,
     // `bytes[..pos]` is written. `pos < bytes.len()` unless both are 0.
     pos: usize,
@@ -113,7 +113,7 @@ struct Packer<'a> {
     scratch: Vec<u8>,
 }
 
-/// Plaintext to seal in one call: stop once about `OUT_BUF_CAPACITY` of ciphertext is buffered,
+/// Plaintext to seal in one call: stop once about `WRITE_BUF_CAPACITY` of ciphertext is buffered,
 /// but take a final tail of at most `MAX_RECORD` bytes too, like [`SslStream::ssl_write_records`].
 ///
 /// `pending` handshake bytes go out ahead of the records, after the `buffered` ones.
@@ -124,7 +124,7 @@ fn seal_budget(
     buffered: usize,
     total: usize,
 ) -> usize {
-    let room = OUT_BUF_CAPACITY
+    let room = WRITE_BUF_CAPACITY
         .saturating_sub(buffered)
         .saturating_sub(pending);
     // The `SSL_write` loop seals at least one record per call.
@@ -273,7 +273,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
         bufs: &[io::IoSlice<'_>],
     ) -> io::Result<usize> {
         let wrapper = s.get_mut();
-        wrapper.out_buf.retry(&mut wrapper.transport)?;
+        wrapper.write_buf.retry(&mut wrapper.transport)?;
         // Slices may alias, so the sum can exceed `usize::MAX` on 32-bit targets.
         let total = bufs.iter().fold(0usize, |n, b| n.saturating_add(b.len()));
         if total == 0 {
@@ -281,7 +281,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
             // seal consumes at least one byte, so no path reports `Ok(0)`.
             return Ok(0);
         }
-        if total <= MAX_RECORD && wrapper.out_buf.is_empty() {
+        if total <= MAX_RECORD && wrapper.write_buf.is_empty() {
             match Self::seal_on_stack(s, bufs, total)? {
                 Some(n) if n < total => {
                     // The stack records are buffered; the rest follows them in the same transport
@@ -289,7 +289,8 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
                     let mut slices = bufs.to_vec();
                     let mut rest = &mut slices[..];
                     io::IoSlice::advance_slices(&mut rest, n);
-                    // Sealed plaintext must be reported; an error after it recurs on the next call.
+                    // Sealed plaintext must be reported; an error after it is dropped and reported
+                    // by the next call only if it recurs.
                     return Ok(n + Self::write_buffered(s, rest, total - n).unwrap_or(0));
                 }
                 Some(n) => return Ok(n),
@@ -308,13 +309,18 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     ) -> io::Result<usize> {
         if let Some(limits) = s.ssl().seal_app_data_limits() {
             // The buffer lives behind the BIO; move it out while the `SslRef` is borrowed mutably.
-            let mut out_buf = mem::take(&mut s.get_mut().out_buf);
-            let sealed = out_buf.seal(s.ssl_mut(), limits, bufs, total);
+            let mut write_buf = mem::take(&mut s.get_mut().write_buf);
+            let sealed = write_buf.seal(s.ssl_mut(), limits, bufs, total);
             let wrapper = s.get_mut();
-            debug_assert!(wrapper.out_buf.is_empty(), "sealing wrote to the BIO");
-            wrapper.out_buf = out_buf;
+            debug_assert!(wrapper.write_buf.is_empty(), "sealing wrote to the BIO");
+            wrapper.write_buf = write_buf;
             if let Some(n) = sealed? {
-                wrapper.out_buf.drain_unless_blocked(&mut wrapper.transport);
+                let StreamWrapper {
+                    transport,
+                    write_buf,
+                    ..
+                } = wrapper;
+                write_buf.drain_unless_blocked(transport);
                 return Ok(n);
             }
         }
@@ -342,13 +348,18 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
         // SAFETY: `seal_app_data` initialized the first `written` bytes of `out`, and `written` is
         // at most `out.len()`.
         let records = unsafe { slice::from_raw_parts(out.as_ptr().cast::<u8>(), sealed.written) };
-        let wrapper = s.get_mut();
-        debug_assert!(wrapper.out_buf.is_empty(), "sealing wrote to the BIO");
+        let StreamWrapper {
+            transport,
+            write_buf,
+            ..
+        } = s.get_mut();
+        debug_assert!(write_buf.is_empty(), "sealing wrote to the BIO");
         if sealed.consumed < total {
-            wrapper.out_buf.push(records);
+            write_buf.push(records);
         } else {
-            // What the transport does not take stays buffered; an error surfaces on the next call.
-            wrapper.out_buf.write_last(&mut wrapper.transport, records);
+            // What the transport does not take stays buffered; an error is dropped, and the next
+            // retry reports it only if it recurs.
+            write_buf.write_last(transport, records);
         }
         Ok(Some(sealed.consumed))
     }
@@ -357,7 +368,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     /// possible.
     ///
     /// Small adjacent slices share records as in a flattened buffer. Sealing stops once buffered
-    /// ciphertext reaches `OUT_BUF_CAPACITY`, except when at most `MAX_RECORD` plaintext bytes
+    /// ciphertext reaches `WRITE_BUF_CAPACITY`, except when at most `MAX_RECORD` plaintext bytes
     /// remain. The last record goes out with the buffer when possible; backpressure can leave it
     /// buffered too, and records are only buffered once the transport refuses one. The BIO accepts
     /// every record, so BoringSSL never holds a pending write that a retry with less data would
@@ -367,7 +378,7 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
         bufs: &[io::IoSlice<'_>],
         total: usize,
     ) -> io::Result<usize> {
-        s.get_mut().out_buf.reserve(total);
+        s.get_mut().write_buf.reserve(total);
 
         let mut written = 0usize;
         let mut err = None;
@@ -393,14 +404,19 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
             packer.advance(n);
 
             // Finish a tail of at most one default record, even if backpressure leaves it buffered.
-            if s.get_ref().out_buf.is_full() && total.saturating_sub(written) > MAX_RECORD {
+            if s.get_ref().write_buf.is_full() && total.saturating_sub(written) > MAX_RECORD {
                 break;
             }
         }
 
-        let wrapper = s.get_mut();
-        wrapper.write_through = false;
-        wrapper.out_buf.drain_unless_blocked(&mut wrapper.transport);
+        let StreamWrapper {
+            transport,
+            write_buf,
+            write_through,
+            ..
+        } = s.get_mut();
+        *write_through = false;
+        write_buf.drain_unless_blocked(transport);
         match err {
             Some(e) if written == 0 => Err(e),
             // Sealed plaintext must be reported, or a retry would send it twice.
@@ -502,7 +518,7 @@ impl<S> StreamWrapper<S> {
         StreamWrapper {
             transport: Transport { stream, context: 0 },
             read_buf: ReadBuffer::default(),
-            out_buf: OutBuffer::default(),
+            write_buf: WriteBuffer::default(),
             write_through: false,
             shutdown_sent: false,
         }
@@ -533,17 +549,17 @@ where
     S: AsyncWrite,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Once `out_buf` is blocked, no record goes straight to the transport.
-        if self.write_through && !self.out_buf.blocked {
-            self.out_buf.write_last(&mut self.transport, buf);
+        // Once `write_buf` is blocked, no record goes straight to the transport.
+        if self.write_through && !self.write_buf.blocked {
+            self.write_buf.write_last(&mut self.transport, buf);
         } else {
-            self.out_buf.push(buf);
+            self.write_buf.push(buf);
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.out_buf.drain(&mut self.transport)?;
+        self.write_buf.drain(&mut self.transport)?;
         let (stream, cx) = self.transport.parts();
         match stream.poll_flush(cx) {
             Poll::Ready(r) => r,
@@ -630,9 +646,9 @@ impl ReadBuffer {
     }
 }
 
-// ===== impl OutBuffer =====
+// ===== impl WriteBuffer =====
 
-impl OutBuffer {
+impl WriteBuffer {
     #[inline]
     fn push(&mut self, record: &[u8]) {
         self.make_room(record.len());
@@ -703,10 +719,10 @@ impl OutBuffer {
         Ok(Some(sealed.consumed))
     }
 
-    /// Whether buffered ciphertext has reached `OUT_BUF_CAPACITY`.
+    /// Whether buffered ciphertext has reached `WRITE_BUF_CAPACITY`.
     #[inline]
     fn is_full(&self) -> bool {
-        self.len() >= OUT_BUF_CAPACITY
+        self.len() >= WRITE_BUF_CAPACITY
     }
 
     /// Reserves room for the records sealed from `total` plaintext bytes, up to the cap, when
@@ -714,7 +730,7 @@ impl OutBuffer {
     #[inline]
     fn reserve(&mut self, total: usize) {
         if total > MAX_RECORD {
-            let sealed = total.min(OUT_BUF_CAPACITY);
+            let sealed = total.min(WRITE_BUF_CAPACITY);
             self.make_room(sealed + sealed.div_ceil(MAX_RECORD) * RECORD_OVERHEAD);
         }
     }
@@ -741,7 +757,8 @@ impl OutBuffer {
 
     /// Ends a write by draining the records unless `blocked`.
     ///
-    /// An error leaves them buffered for the next `retry` to report.
+    /// An error is dropped and leaves them buffered; the next `retry` reports it only if it
+    /// recurs.
     #[inline]
     fn drain_unless_blocked<S>(&mut self, transport: &mut Transport<S>)
     where
@@ -779,7 +796,7 @@ impl OutBuffer {
     /// Writes buffered records and `record` in one transport write and buffers the rest.
     ///
     /// Sets `blocked` if the transport returns `Pending` or an error, which leaves the unwritten
-    /// bytes buffered for the next drain to retry.
+    /// bytes buffered. The error is dropped; the next drain reports it only if it recurs.
     fn write_last<S>(&mut self, transport: &mut Transport<S>, record: &[u8])
     where
         S: AsyncWrite,
@@ -1074,26 +1091,6 @@ mod tests {
     }
 
     #[test]
-    fn write_buf_released_when_drained() {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        let mut wrapper = StreamWrapper::new(Sink {
-            budget: 0,
-            data: Vec::new(),
-        });
-        wrapper.transport.context = &mut cx as *mut _ as usize;
-
-        wrapper.write_all(&[1; 100]).unwrap();
-        let err = wrapper.flush().unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(wrapper.out_buf.len(), 100);
-
-        wrapper.transport.stream.budget = usize::MAX;
-        wrapper.flush().unwrap();
-        assert_eq!(wrapper.transport.stream.data, [1; 100]);
-        assert_eq!(wrapper.out_buf.bytes.capacity(), 0);
-    }
-
-    #[test]
     fn last_record_follows_buffered_records() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let mut wrapper = StreamWrapper::new(Sink {
@@ -1103,25 +1100,27 @@ mod tests {
         wrapper.transport.context = &mut cx as *mut _ as usize;
 
         wrapper.write_all(b"0123456789").unwrap();
+        let err = wrapper.flush().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         wrapper.write_through = true;
         // The transport stops inside the buffered records.
         wrapper.transport.stream.budget = 4;
         wrapper.write_all(b"abcde").unwrap();
         assert_eq!(wrapper.transport.stream.data, b"0123");
-        assert_eq!(wrapper.out_buf.buffered(), b"456789abcde");
+        assert_eq!(wrapper.write_buf.buffered(), b"456789abcde");
 
         // One vectored write takes the buffered records and the head of the last one.
         wrapper.transport.stream.budget = 15;
         wrapper.write_all(b"fghij").unwrap();
         assert_eq!(wrapper.transport.stream.data, b"0123456789abcdefghi");
-        assert_eq!(wrapper.out_buf.buffered(), b"j");
+        assert_eq!(wrapper.write_buf.buffered(), b"j");
 
         // With nothing buffered, the record goes straight out.
         wrapper.transport.stream.budget = usize::MAX;
         wrapper.flush().unwrap();
         wrapper.write_all(b"klm").unwrap();
         assert_eq!(wrapper.transport.stream.data, b"0123456789abcdefghijklm");
-        assert_eq!(wrapper.out_buf.bytes.capacity(), 0);
+        assert_eq!(wrapper.write_buf.bytes.capacity(), 0);
     }
 
     #[test]
@@ -1139,11 +1138,11 @@ mod tests {
             wrapper.write_all(&[1; CHUNK]).unwrap();
             // The transport takes one record's worth per drain and never catches up.
             wrapper.transport.stream.budget = CHUNK;
-            let err = wrapper.out_buf.drain(&mut wrapper.transport).unwrap_err();
+            let err = wrapper.write_buf.drain(&mut wrapper.transport).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         }
-        assert_eq!(wrapper.out_buf.len(), 3 * CHUNK);
-        assert!(wrapper.out_buf.bytes.capacity() <= 2 * OUT_BUF_CAPACITY);
+        assert_eq!(wrapper.write_buf.len(), 3 * CHUNK);
+        assert!(wrapper.write_buf.bytes.capacity() <= 2 * WRITE_BUF_CAPACITY);
     }
 
     #[test]
@@ -1157,7 +1156,7 @@ mod tests {
 
         // A backlog that never empties, so the written prefix is only ever dropped by compaction.
         let mut expected = vec![0xff; 1024];
-        wrapper.out_buf.push(&expected);
+        wrapper.write_buf.push(&expected);
         let mut capacity = 0;
         for i in 0..1000usize {
             // Records average slightly more than the 37 bytes the transport takes per round.
@@ -1165,20 +1164,22 @@ mod tests {
             expected.extend_from_slice(&record);
             wrapper.transport.stream.budget = 37;
             if i % 3 == 1 {
-                wrapper.out_buf.write_last(&mut wrapper.transport, &record);
+                wrapper
+                    .write_buf
+                    .write_last(&mut wrapper.transport, &record);
             } else {
-                wrapper.out_buf.push(&record);
+                wrapper.write_buf.push(&record);
             }
-            let _ = wrapper.out_buf.drain(&mut wrapper.transport);
-            assert!(!wrapper.out_buf.is_empty());
-            capacity = capacity.max(wrapper.out_buf.bytes.capacity());
+            let _ = wrapper.write_buf.drain(&mut wrapper.transport);
+            assert!(!wrapper.write_buf.is_empty());
+            capacity = capacity.max(wrapper.write_buf.bytes.capacity());
         }
         assert!(capacity <= 4096, "{capacity}");
 
         wrapper.transport.stream.budget = usize::MAX;
         wrapper.flush().unwrap();
         assert_eq!(wrapper.transport.stream.data, expected);
-        assert_eq!(wrapper.out_buf.bytes.capacity(), 0);
+        assert_eq!(wrapper.write_buf.bytes.capacity(), 0);
     }
 
     /// Duplex transport whose writes can stall, fail once, or keep returning `BrokenPipe`.
@@ -1355,21 +1356,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sealed_write_survives_transport_error() {
-        let (mut client, mut server) = tls_pair().await;
-
-        // The record is sealed before the transport fails; reporting the error would make the
-        // caller send the plaintext again.
-        client.get_mut().interrupt = true;
-        assert_eq!(client.write(b"headerpayload").await.unwrap(), 13);
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        server.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"headerpayload");
-    }
-
-    #[tokio::test]
     async fn sealed_records_survive_a_failed_drain() {
         for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
             let (mut client, mut server) = tls_pair_with(version, None).await;
@@ -1377,6 +1363,11 @@ mod tests {
             let data: Vec<_> = (0..3 * MAX_RECORD)
                 .map(|offset| (offset ^ (offset >> 8)) as u8)
                 .collect();
+
+            // A one-time error after sealing is dropped: the record is reported and goes out
+            // before the next write.
+            client.get_mut().interrupt = true;
+            assert_eq!(client.write(b"headerpayload").await.unwrap(), 13);
 
             // The transport takes part of the records, then fails. The sealed plaintext must be
             // reported, or the caller would send it again.
@@ -1388,21 +1379,21 @@ mod tests {
             };
             assert_eq!(n, data.len());
             assert_eq!(client.get_ref().tap.len(), 20_000);
-            let buffered = client.0.get_ref().out_buf.len();
+            let buffered = client.0.get_ref().write_buf.len();
             assert!(buffered > n - 20_000);
 
-            // The buffered rest stays put, and the error surfaces on the next call.
+            // The buffered rest stays put; the error persists, so the next call reports it.
             match Pin::new(&mut client).poll_flush(&mut cx) {
                 Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
                 result => panic!("expected the deferred error: {result:?}"),
             }
-            assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+            assert_eq!(client.0.get_ref().write_buf.len(), buffered);
 
             client.get_mut().budget = usize::MAX;
             client.shutdown().await.unwrap();
             let mut received = Vec::new();
             server.read_to_end(&mut received).await.unwrap();
-            assert_eq!(received, data);
+            assert_eq!(received, [&b"headerpayload"[..], &data].concat());
         }
     }
 
@@ -1485,59 +1476,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_tail_stays_bounded_under_backpressure() {
-        for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
-            let (mut client, mut server) = tls_pair_with(version, None).await;
-            client.get_mut().open = false;
-            let mut cx = Context::from_waker(std::task::Waker::noop());
-            let data: Vec<_> = (0..5 * MAX_RECORD)
-                .map(|offset| (offset ^ (offset >> 8)) as u8)
-                .collect();
-            let consumed = match Pin::new(&mut client).poll_write(&mut cx, &data) {
-                Poll::Ready(Ok(n)) => n,
-                result => panic!("initial buffering failed: {result:?}"),
-            };
-            let buffered = client.0.get_ref().out_buf.len();
-            assert_eq!(consumed, data.len());
-            assert!(buffered > OUT_BUF_CAPACITY);
-            assert!(buffered <= data.len() + 5 * RECORD_OVERHEAD);
-            for _ in 0..4 {
-                assert!(Pin::new(&mut client)
-                    .poll_write(&mut cx, b"extra")
-                    .is_pending());
-                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
-            }
-
-            client.get_mut().open = true;
-            client.shutdown().await.unwrap();
-            let mut received = Vec::new();
-            server.read_to_end(&mut received).await.unwrap();
-            assert_eq!(received, data);
-        }
-    }
-
-    #[tokio::test]
     async fn buffer_cap_and_persistent_errors_preserve_consumed_prefix() {
         for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
             let (mut client, mut server) = tls_pair_with(version, None).await;
             let mut cx = Context::from_waker(std::task::Waker::noop());
-            let mut expected: Vec<_> = (0..6 * MAX_RECORD)
+            let data: Vec<_> = (0..6 * MAX_RECORD)
                 .map(|offset| (offset ^ (offset >> 8)) as u8)
                 .collect();
+            let mut expected = Vec::new();
 
-            // The cap stops accepting plaintext while the transport is blocked.
+            // While the transport is blocked, a write past the cap still takes a last tail of at
+            // most one record, and later writes accept nothing.
             client.get_mut().open = false;
-            let consumed = match Pin::new(&mut client).poll_write(&mut cx, &expected) {
-                Poll::Ready(Ok(n)) => n,
-                result => panic!("initial buffering failed: {result:?}"),
-            };
-            assert!(consumed > 0 && consumed < expected.len());
-            let buffered = client.0.get_ref().out_buf.len();
-            assert!(buffered >= OUT_BUF_CAPACITY);
+            let tail = &data[..5 * MAX_RECORD];
+            assert!(matches!(
+                Pin::new(&mut client).poll_write(&mut cx, tail),
+                Poll::Ready(Ok(n)) if n == tail.len()
+            ));
+            expected.extend_from_slice(tail);
+            let buffered = client.0.get_ref().write_buf.len();
+            assert!(buffered > WRITE_BUF_CAPACITY);
+            assert!(buffered <= tail.len() + 5 * RECORD_OVERHEAD);
             assert!(Pin::new(&mut client)
-                .poll_write(&mut cx, &expected[consumed..])
+                .poll_write(&mut cx, b"extra")
                 .is_pending());
-            assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+            assert_eq!(client.0.get_ref().write_buf.len(), buffered);
 
             // A persistent error prevents every later write from accepting more input.
             client.get_mut().broken = true;
@@ -1546,18 +1509,30 @@ mod tests {
                     Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
                     result => panic!("expected persistent flush failure: {result:?}"),
                 }
-                match Pin::new(&mut client).poll_write(&mut cx, &expected[consumed..]) {
+                match Pin::new(&mut client).poll_write(&mut cx, b"extra") {
                     Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
                     result => panic!("expected persistent write failure: {result:?}"),
                 }
-                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+                assert_eq!(client.0.get_ref().write_buf.len(), buffered);
             }
-
             client.get_mut().broken = false;
             client.get_mut().open = true;
-            client.write_all(&expected[consumed..]).await.unwrap();
             client.flush().await.unwrap();
-            assert!(client.0.get_ref().out_buf.is_empty());
+            assert!(client.0.get_ref().write_buf.is_empty());
+
+            // A write longer than the cap plus one record stops at the cap.
+            client.get_mut().open = false;
+            let consumed = match Pin::new(&mut client).poll_write(&mut cx, &data) {
+                Poll::Ready(Ok(n)) => n,
+                result => panic!("initial buffering failed: {result:?}"),
+            };
+            assert!(consumed > 0 && consumed < data.len());
+            assert!(client.0.get_ref().write_buf.len() >= WRITE_BUF_CAPACITY);
+            client.get_mut().open = true;
+            client.write_all(&data[consumed..]).await.unwrap();
+            client.flush().await.unwrap();
+            assert!(client.0.get_ref().write_buf.is_empty());
+            expected.extend_from_slice(&data);
 
             // If the error first occurs after sealing, report the consumed plaintext once.
             let tail = b"tail-queued-before-reporting-error";
@@ -1566,7 +1541,7 @@ mod tests {
                 Pin::new(&mut client).poll_write(&mut cx, tail),
                 Poll::Ready(Ok(n)) if n == tail.len()
             ));
-            let buffered = client.0.get_ref().out_buf.len();
+            let buffered = client.0.get_ref().write_buf.len();
             assert!(buffered > 0);
             for _ in 0..2 {
                 match Pin::new(&mut client).poll_flush(&mut cx) {
@@ -1577,7 +1552,7 @@ mod tests {
                     Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
                     result => panic!("expected deferred write failure: {result:?}"),
                 }
-                assert_eq!(client.0.get_ref().out_buf.len(), buffered);
+                assert_eq!(client.0.get_ref().write_buf.len(), buffered);
             }
 
             client.get_mut().broken = false;
@@ -1637,14 +1612,14 @@ mod tests {
         let res = Pin::new(&mut client).poll_write(&mut cx, &[1; 100]);
         assert!(matches!(res, Poll::Ready(Ok(100))));
         assert_eq!(client.get_ref().polls, 1);
-        assert_eq!(client.0.get_ref().out_buf.bytes.capacity(), 0);
+        assert_eq!(client.0.get_ref().write_buf.bytes.capacity(), 0);
 
         // The record stays buffered while the transport takes nothing.
         client.get_mut().open = false;
         let res = Pin::new(&mut client).poll_write(&mut cx, &[2; 100]);
         assert!(matches!(res, Poll::Ready(Ok(100))));
         assert_eq!(client.get_ref().polls, 2);
-        assert!(!client.0.get_ref().out_buf.is_empty());
+        assert!(!client.0.get_ref().write_buf.is_empty());
 
         // Once the retry returns `Pending`, the transport is not polled again.
         let res = Pin::new(&mut client).poll_write(&mut cx, &[3; 100]);
@@ -1659,12 +1634,12 @@ mod tests {
         let bufs = [io::IoSlice::new(&[4; 100])];
         let res = Pin::new(&mut client).with_context(&mut cx, |s| {
             // `retry` resets this as each write starts; this call bypasses it.
-            s.get_mut().out_buf.blocked = false;
+            s.get_mut().write_buf.blocked = false;
             SslStream::ssl_write_records(s, &bufs, 100)
         });
         assert_eq!(res.unwrap(), 100);
         assert_eq!(client.get_ref().polls, polls + 1);
-        assert!(!client.0.get_ref().out_buf.is_empty());
+        assert!(!client.0.get_ref().write_buf.is_empty());
 
         client.get_mut().open = true;
         client.shutdown().await.unwrap();
@@ -1694,7 +1669,7 @@ mod tests {
             assert!(limits.sealed_len(MAX_RECORD).unwrap() > SEAL_STACK_LEN);
             assert_eq!(client.get_ref().polls, 1);
             assert_eq!(records(&client.get_ref().tap).len(), MAX_RECORD / 512);
-            assert!(client.0.get_ref().out_buf.is_empty());
+            assert!(client.0.get_ref().write_buf.is_empty());
         }
 
         client.shutdown().await.unwrap();
@@ -1797,7 +1772,7 @@ mod tests {
         // close_notify stays buffered while the transport takes nothing.
         client.get_mut().open = false;
         assert!(Pin::new(&mut client).poll_shutdown(&mut cx).is_pending());
-        let buffered = client.0.get_ref().out_buf.buffered().to_vec();
+        let buffered = client.0.get_ref().write_buf.buffered().to_vec();
         assert!(!buffered.is_empty());
 
         let polls = client.get_ref().polls;
@@ -1812,7 +1787,7 @@ mod tests {
         }
         // Only the retry polled the transport, and nothing was added to the buffer.
         assert_eq!(client.get_ref().polls, polls + 1);
-        assert_eq!(client.0.get_ref().out_buf.buffered(), buffered);
+        assert_eq!(client.0.get_ref().write_buf.buffered(), buffered);
 
         client.get_mut().open = true;
         client.shutdown().await.unwrap();
@@ -1836,7 +1811,7 @@ mod tests {
                 let len = fragment.min(total - written);
                 out += len + overhead;
                 written += len;
-                if out >= OUT_BUF_CAPACITY && total - written > MAX_RECORD {
+                if out >= WRITE_BUF_CAPACITY && total - written > MAX_RECORD {
                     break;
                 }
             }
@@ -1870,7 +1845,7 @@ mod tests {
         for fragment in [512, 1000, 16384] {
             for overhead in [22, 29, 85] {
                 for pending in [0, 520, 16500] {
-                    for buffered in [0, 1, 30000, OUT_BUF_CAPACITY - 1] {
+                    for buffered in [0, 1, 30000, WRITE_BUF_CAPACITY - 1] {
                         for total in [1, 100, 16384, 16385, 65572, 81920, 98304, 185124] {
                             let args = (fragment, overhead, pending, buffered, total);
                             assert_eq!(
