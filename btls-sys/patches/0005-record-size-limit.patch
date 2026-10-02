@@ -30,7 +30,7 @@ limitations under the License.
  ssl/handoff.cc                   |    6 +-
  ssl/handshake_client.cc          |    1 +
  ssl/internal.h                   |   68 ++
- ssl/record_size_limit.cc         |  354 +++++++++++
+ ssl/record_size_limit.cc         |  355 +++++++++++
  ssl/record_size_limit_test.cc    | 1015 ++++++++++++++++++++++++++++++
  ssl/s3_both.cc                   |    7 +-
  ssl/s3_pkt.cc                    |    2 +-
@@ -38,7 +38,7 @@ limitations under the License.
  ssl/tls13_server.cc              |   11 +-
  ssl/tls_method.cc                |    2 +
  ssl/tls_record.cc                |   17 +-
- 21 files changed, 1530 insertions(+), 11 deletions(-)
+ 21 files changed, 1531 insertions(+), 11 deletions(-)
  create mode 100644 ssl/record_size_limit.cc
  create mode 100644 ssl/record_size_limit_test.cc
 
@@ -443,10 +443,10 @@ index 506775b90..21311e821 100644
    bssl::Array<uint16_t> extension_order;
 diff --git a/ssl/record_size_limit.cc b/ssl/record_size_limit.cc
 new file mode 100644
-index 000000000..8e066ad02
+index 000000000..b8906badc
 --- /dev/null
 +++ b/ssl/record_size_limit.cc
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,355 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -661,8 +661,9 @@ index 000000000..8e066ad02
 +
 +bool ssl_record_size_limit_allows_early_data(const SSL_HANDSHAKE *hs) {
 +  // The client sends 0-RTT before EncryptedExtensions carries this server's
-+  // limit, so early data may use the protocol maximum (RFC 8449, section 4).
-+  // A server that advertised a smaller limit cannot accept those records.
++  // limit, so early data may use the protocol maximum. A server with a smaller
++  // limit declines 0-RTT. NSS servers instead apply their limit to early data
++  // and fail the connection with record_overflow on larger records.
 +  const uint16_t limit = hs->ssl->s3->pending_read_record_size_limit;
 +  return limit == 0 || limit >= record_size_limit_max_for_version(
 +                                    ssl_protocol_version(hs->ssl));
@@ -670,8 +671,8 @@ index 000000000..8e066ad02
 +
 +void ssl_record_size_limit_set_read_state(SSLImpl *ssl,
 +                                          ssl_encryption_level_t level) {
-+  // 0-RTT keys come from a session, not this handshake, so its records are
-+  // bounded only by the protocol maximum. NSS behaves the same way.
++  // 0-RTT records are bounded only by the protocol maximum, as NSS clients
++  // send them. Servers accept 0-RTT only when their own limit is that maximum.
 +  const uint16_t limit = level == ssl_encryption_early_data
 +                             ? 0
 +                             : ssl->s3->pending_read_record_size_limit;
@@ -803,7 +804,7 @@ index 000000000..8e066ad02
 +}
 diff --git a/ssl/record_size_limit_test.cc b/ssl/record_size_limit_test.cc
 new file mode 100644
-index 000000000..355b16c61
+index 000000000..cb32a4e94
 --- /dev/null
 +++ b/ssl/record_size_limit_test.cc
 @@ -0,0 +1,1015 @@
@@ -1609,7 +1610,7 @@ index 000000000..355b16c61
 +TEST(RecordSizeLimitTest, EarlyDataUsesProtocolMaximum) {
 +  // RFC 8449, section 4: records follow the limits of the handshake that made
 +  // their keys. 0-RTT keys predate this handshake's EncryptedExtensions, so
-+  // early data is bounded only by the protocol maximum, as in NSS.
++  // early data is bounded only by the protocol maximum, as NSS clients send it.
 +  UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_3_VERSION);
 +  UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_3_VERSION);
 +  ASSERT_TRUE(client_ctx);
