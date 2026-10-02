@@ -24,28 +24,26 @@ limitations under the License.
  gen/sources.json                 |    4 +-
  gen/sources.mk                   |    2 +
  include/openssl/prefix_symbols.h |    4 +
- include/openssl/ssl.h            |   15 +
+ include/openssl/ssl.h            |   19 +
  include/openssl/tls1.h           |    3 +
  ssl/extensions.cc                |   17 +
  ssl/handoff.cc                   |    6 +-
  ssl/handshake_client.cc          |    1 +
- ssl/internal.h                   |   72 +++
- ssl/record_size_limit.cc         |  384 ++++++++++++
- ssl/record_size_limit_test.cc    | 1005 ++++++++++++++++++++++++++++++
+ ssl/internal.h                   |   68 ++
+ ssl/record_size_limit.cc         |  354 +++++++++++
+ ssl/record_size_limit_test.cc    | 1015 ++++++++++++++++++++++++++++++
  ssl/s3_both.cc                   |    7 +-
  ssl/s3_pkt.cc                    |    2 +-
- ssl/ssl_asn1.cc                  |   28 +
  ssl/ssl_lib.cc                   |    1 +
- ssl/ssl_session.cc               |    2 +
- ssl/tls13_server.cc              |    8 +
+ ssl/tls13_server.cc              |   11 +-
  ssl/tls_method.cc                |    2 +
  ssl/tls_record.cc                |   17 +-
- 23 files changed, 1578 insertions(+), 10 deletions(-)
+ 21 files changed, 1530 insertions(+), 11 deletions(-)
  create mode 100644 ssl/record_size_limit.cc
  create mode 100644 ssl/record_size_limit_test.cc
 
 diff --git a/build.json b/build.json
-index f9e3a7e..4691fe4 100644
+index f9e3a7e09..4691fe469 100644
 --- a/build.json
 +++ b/build.json
 @@ -709,6 +709,7 @@
@@ -65,7 +63,7 @@ index f9e3a7e..4691fe4 100644
              "ssl/ssl_c_test.c",
              "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.bzl b/gen/sources.bzl
-index e85d7a7..9328c40 100644
+index e85d7a747..9328c40d9 100644
 --- a/gen/sources.bzl
 +++ b/gen/sources.bzl
 @@ -2939,6 +2939,7 @@ ssl_sources = [
@@ -85,7 +83,7 @@ index e85d7a7..9328c40 100644
      "ssl/ssl_c_test.c",
      "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.cmake b/gen/sources.cmake
-index 117ba3f..10808e0 100644
+index 117ba3ffb..10808e0e4 100644
 --- a/gen/sources.cmake
 +++ b/gen/sources.cmake
 @@ -3007,6 +3007,7 @@ set(
@@ -105,7 +103,7 @@ index 117ba3f..10808e0 100644
    ssl/ssl_c_test.c
    ssl/ssl_internal_test.cc
 diff --git a/gen/sources.gni b/gen/sources.gni
-index 5777c09..9994be8 100644
+index 5777c09a0..9994be8d1 100644
 --- a/gen/sources.gni
 +++ b/gen/sources.gni
 @@ -2939,6 +2939,7 @@ ssl_sources = [
@@ -125,7 +123,7 @@ index 5777c09..9994be8 100644
    "ssl/ssl_c_test.c",
    "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.json b/gen/sources.json
-index 97b70e5..e639ca7 100644
+index 97b70e554..e639ca7cd 100644
 --- a/gen/sources.json
 +++ b/gen/sources.json
 @@ -2924,6 +2924,7 @@
@@ -152,7 +150,7 @@ index 97b70e5..e639ca7 100644
 \ No newline at end of file
 +}
 diff --git a/gen/sources.mk b/gen/sources.mk
-index b7cb8ad..fc45de6 100644
+index b7cb8ad00..fc45de625 100644
 --- a/gen/sources.mk
 +++ b/gen/sources.mk
 @@ -2906,6 +2906,7 @@ boringssl_ssl_sources := \
@@ -172,7 +170,7 @@ index b7cb8ad..fc45de6 100644
    ssl/ssl_c_test.c \
    ssl/ssl_internal_test.cc \
 diff --git a/include/openssl/prefix_symbols.h b/include/openssl/prefix_symbols.h
-index 79df391..7377e32 100644
+index 79df39104..7377e32a8 100644
 --- a/include/openssl/prefix_symbols.h
 +++ b/include/openssl/prefix_symbols.h
 @@ -2057,6 +2057,7 @@
@@ -208,10 +206,10 @@ index 79df391..7377e32 100644
  #define SSL_set_resumption_across_names_enabled BORINGSSL_ADD_PREFIX(SSL_set_resumption_across_names_enabled)
  #define SSL_set_retain_only_sha256_of_client_certs BORINGSSL_ADD_PREFIX(SSL_set_retain_only_sha256_of_client_certs)
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 56761fa..c1840fd 100644
+index 56761fa33..16e3220dd 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5655,6 +5655,21 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+@@ -5655,6 +5655,25 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  OPENSSL_EXPORT int SSL_CTX_set_extension_order(SSL_CTX *ctx,
                                                 const uint16_t *ids, int num);
  
@@ -224,6 +222,10 @@ index 56761fa..c1840fd 100644
 +// |SSL_CTX_set_select_certificate_cb|; later calls apply to a future handshake.
 +// This is currently supported for stream TLS only, not DTLS, QUIC, or split
 +// handshakes.
++//
++// TLS 1.3 early data is sent before the server's limit is known, so 0-RTT
++// records are bounded only by the protocol maximum. A server whose limit is
++// below that maximum neither issues early-data tickets nor accepts early data.
 +OPENSSL_EXPORT void SSL_set_record_size_limit(SSL *ssl, uint16_t limit);
 +
 +// SSL_CTX_set_record_size_limit applies SSL_set_record_size_limit to new
@@ -234,7 +236,7 @@ index 56761fa..c1840fd 100644
  // record with `ssl`.
  OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
 diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
-index 0a01b24..611b202 100644
+index 0a01b2456..611b202e1 100644
 --- a/include/openssl/tls1.h
 +++ b/include/openssl/tls1.h
 @@ -48,6 +48,9 @@ extern "C" {
@@ -248,7 +250,7 @@ index 0a01b24..611b202 100644
  #define TLSEXT_TYPE_server_name 0
  #define TLSEXT_TYPE_status_request 5
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 9ad7527..503a128 100644
+index 9ad7527ec..503a128ad 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -4323,6 +4323,13 @@ static const struct tls_extension kExtensions[] = {
@@ -290,7 +292,7 @@ index 9ad7527..503a128 100644
      if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
        OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
 diff --git a/ssl/handoff.cc b/ssl/handoff.cc
-index c8d9897..840258e 100644
+index c8d989796..840258ef9 100644
 --- a/ssl/handoff.cc
 +++ b/ssl/handoff.cc
 @@ -84,7 +84,8 @@ bool SSL_serialize_handoff(const SSL *ssl, CBB *out,
@@ -314,7 +316,7 @@ index c8d9897..840258e 100644
  
  bool SSL_apply_handoff(SSL *ssl, Span<const uint8_t> handoff) {
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index 298f04f..885444b 100644
+index 298f04f9c..885444bb1 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
 @@ -370,6 +370,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
@@ -326,7 +328,7 @@ index 298f04f..885444b 100644
    uint8_t ech_enc[EVP_HPKE_MAX_ENC_LENGTH];
    size_t ech_enc_len;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 506775b..10e0f3a 100644
+index 506775b90..21311e821 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -757,6 +757,31 @@ enum ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
@@ -410,7 +412,7 @@ index 506775b..10e0f3a 100644
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
-@@ -3833,6 +3886,17 @@ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
+@@ -3833,6 +3886,18 @@ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
                                    const SSL_CLIENT_HELLO *client_hello);
  bool ssl_parse_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *extensions);
  
@@ -422,13 +424,14 @@ index 506775b..10e0f3a 100644
 +bool record_size_limit_parse_clienthello(SSL_HANDSHAKE *hs,
 +                                         uint8_t *out_alert, CBS *contents);
 +bool record_size_limit_add_serverhello(SSL_HANDSHAKE *hs, CBB *out);
-+void ssl_record_size_limit_store_session(SSL_HANDSHAKE *hs);
-+bool ssl_record_size_limit_session_values_valid(const SSL_SESSION *session);
++// ssl_record_size_limit_allows_early_data returns whether this server's
++// negotiated limit admits 0-RTT records, which may use the protocol maximum.
++bool ssl_record_size_limit_allows_early_data(const SSL_HANDSHAKE *hs);
 +
  #define tlsext_tick_md EVP_sha256
  
  // ssl_process_ticket processes a session ticket from the client. It returns
-@@ -4244,6 +4308,9 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4244,6 +4309,9 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // signal its sessions may be resumed across names in the server certificate.
    bool resumption_across_names_enabled : 1;
  
@@ -438,24 +441,12 @@ index 506775b..10e0f3a 100644
    // extension_order stores wire extension IDs in the order requested by
    // SSL_CTX_set_extension_order. An empty array leaves the order unset.
    bssl::Array<uint16_t> extension_order;
-@@ -4449,6 +4516,11 @@ struct ssl_session_st : public bssl::RefCounted<ssl_session_st> {
-   // early data. If zero, 0-RTT is disallowed.
-   uint32_t ticket_max_early_data = 0;
- 
-+  // These are the directional limits negotiated by the handshake that created
-+  // this session. TLS 1.3 0-RTT records use the prior connection's limits.
-+  uint16_t local_record_size_limit = 0;
-+  uint16_t peer_record_size_limit = 0;
-+
-   // early_alpn is the ALPN protocol from the initial handshake. This is only
-   // stored for TLS 1.3 and above in order to enforce ALPN matching for 0-RTT
-   // resumptions. For the current connection's ALPN protocol, see
 diff --git a/ssl/record_size_limit.cc b/ssl/record_size_limit.cc
 new file mode 100644
-index 0000000..ba1a56b
+index 000000000..8e066ad02
 --- /dev/null
 +++ b/ssl/record_size_limit.cc
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,354 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -473,7 +464,6 @@ index 0000000..ba1a56b
 +#include <openssl/ssl.h>
 +
 +#include <algorithm>
-+#include <variant>
 +
 +#include <openssl/bytestring.h>
 +#include <openssl/err.h>
@@ -518,17 +508,6 @@ index 0000000..ba1a56b
 +  hs->ssl->s3->pending_write_record_size_limit = 0;
 +}
 +
-+void ssl_record_size_limit_store_session(SSL_HANDSHAKE *hs) {
-+  if (hs->new_session == nullptr ||
-+      ssl_protocol_version(hs->ssl) < TLS1_3_VERSION) {
-+    return;
-+  }
-+  hs->new_session->local_record_size_limit =
-+      hs->ssl->s3->pending_read_record_size_limit;
-+  hs->new_session->peer_record_size_limit =
-+      hs->ssl->s3->pending_write_record_size_limit;
-+}
-+
 +static void record_size_limit_negotiate(SSL_HANDSHAKE *hs,
 +                                        uint16_t peer_limit) {
 +  const uint16_t version = ssl_protocol_version(hs->ssl);
@@ -536,7 +515,6 @@ index 0000000..ba1a56b
 +      std::min(peer_limit, record_size_limit_max_for_version(version));
 +  hs->ssl->s3->pending_read_record_size_limit =
 +      record_size_limit_for_version(hs->record_size_limit, version);
-+  ssl_record_size_limit_store_session(hs);
 +}
 +
 +static void record_size_limit_clear_unconfirmed(SSLImpl *ssl) {
@@ -586,7 +564,6 @@ index 0000000..ba1a56b
 +      hs->ssl->s3->unconfirmed_read_record_size_limit_exceeded;
 +  record_size_limit_clear_unconfirmed(hs->ssl);
 +  if (contents == nullptr) {
-+    ssl_record_size_limit_store_session(hs);
 +    return true;
 +  }
 +
@@ -610,7 +587,8 @@ index 0000000..ba1a56b
 +  if (ssl_protocol_version(hs->ssl) >= TLS1_3_VERSION) {
 +    // EncryptedExtensions confirms the limit after the client installed its
 +    // handshake keys. Apply it to that epoch now. If 0-RTT is active, its write
-+    // epoch retains the prior session's limit until close_early_data.
++    // epoch keeps the protocol maximum until close_early_data installs the
++    // handshake write keys.
 +    hs->ssl->s3->read_record_size_limit =
 +        hs->ssl->s3->pending_read_record_size_limit;
 +    if (!hs->in_early_data) {
@@ -681,24 +659,22 @@ index 0000000..ba1a56b
 +         CBB_flush(out);
 +}
 +
-+static const SSL_SESSION *record_size_limit_psk_session(
-+    const SSLPreSharedKey *psk) {
-+  if (psk == nullptr) {
-+    return nullptr;
-+  }
-+  const auto *session = std::get_if<UniquePtr<SSL_SESSION>>(psk);
-+  return session != nullptr && *session != nullptr ? session->get() : nullptr;
++bool ssl_record_size_limit_allows_early_data(const SSL_HANDSHAKE *hs) {
++  // The client sends 0-RTT before EncryptedExtensions carries this server's
++  // limit, so early data may use the protocol maximum (RFC 8449, section 4).
++  // A server that advertised a smaller limit cannot accept those records.
++  const uint16_t limit = hs->ssl->s3->pending_read_record_size_limit;
++  return limit == 0 || limit >= record_size_limit_max_for_version(
++                                    ssl_protocol_version(hs->ssl));
 +}
 +
 +void ssl_record_size_limit_set_read_state(SSLImpl *ssl,
 +                                          ssl_encryption_level_t level) {
-+  uint16_t limit = ssl->s3->pending_read_record_size_limit;
-+  if (level == ssl_encryption_early_data && ssl->server) {
-+    const SSL_SESSION *session = record_size_limit_psk_session(
-+        ssl->s3->hs == nullptr ? nullptr : ssl->s3->hs->pre_shared_key.get());
-+    limit = session == nullptr ? 0 : session->local_record_size_limit;
-+  }
-+
++  // 0-RTT keys come from a session, not this handshake, so its records are
++  // bounded only by the protocol maximum. NSS behaves the same way.
++  const uint16_t limit = level == ssl_encryption_early_data
++                             ? 0
++                             : ssl->s3->pending_read_record_size_limit;
 +  ssl->s3->read_record_size_limit = limit;
 +  record_size_limit_clear_unconfirmed(ssl);
 +  if (level == ssl_encryption_handshake && !ssl->server &&
@@ -711,12 +687,11 @@ index 0000000..ba1a56b
 +
 +void ssl_record_size_limit_set_write_state(SSLImpl *ssl,
 +                                           ssl_encryption_level_t level) {
-+  uint16_t limit = ssl->s3->pending_write_record_size_limit;
-+  if (level == ssl_encryption_early_data && !ssl->server &&
-+      ssl->s3->hs != nullptr && ssl->s3->hs->early_session != nullptr) {
-+    limit = ssl->s3->hs->early_session->peer_record_size_limit;
-+  }
-+  ssl->s3->write_record_size_limit = limit;
++  // See ssl_record_size_limit_set_read_state for 0-RTT.
++  ssl->s3->write_record_size_limit =
++      level == ssl_encryption_early_data
++          ? 0
++          : ssl->s3->pending_write_record_size_limit;
 +}
 +
 +size_t ssl_record_size_limit_max_send_fragment(const SSLImpl *ssl,
@@ -754,10 +729,10 @@ index 0000000..ba1a56b
 +    return true;
 +  }
 +
-+  // Rejected 0-RTT uses the previous session's keys and limits. Let trial
-+  // decryption discard it before applying the new handshake's limit (RFC
-+  // 8446 section 4.2.10). Successfully decrypted records still pass through
-+  // ssl_record_size_limit_check_plaintext before they can be processed.
++  // Rejected 0-RTT was sent under the protocol maximum before the client
++  // learned this limit. Let trial decryption discard it before applying the
++  // limit (RFC 8446, section 4.2.10). Successfully decrypted records still
++  // pass through ssl_record_size_limit_check_plaintext.
 +  if (ssl->s3->skip_early_data) {
 +    return true;
 +  }
@@ -812,20 +787,6 @@ index 0000000..ba1a56b
 +  return true;
 +}
 +
-+bool ssl_record_size_limit_session_values_valid(const SSL_SESSION *session) {
-+  const uint16_t local = session->local_record_size_limit;
-+  const uint16_t peer = session->peer_record_size_limit;
-+  if (local == 0 || peer == 0) {
-+    return local == 0 && peer == 0;
-+  }
-+  if (ssl_session_protocol_version(session) < TLS1_3_VERSION) {
-+    return false;
-+  }
-+  const uint16_t max = record_size_limit_max_for_version(TLS1_3_VERSION);
-+  return local >= kMinRecordSizeLimit && local <= max &&
-+         peer >= kMinRecordSizeLimit && peer <= max;
-+}
-+
 +BSSL_NAMESPACE_END
 +
 +using namespace bssl;
@@ -842,10 +803,10 @@ index 0000000..ba1a56b
 +}
 diff --git a/ssl/record_size_limit_test.cc b/ssl/record_size_limit_test.cc
 new file mode 100644
-index 0000000..f33f89a
+index 000000000..355b16c61
 --- /dev/null
 +++ b/ssl/record_size_limit_test.cc
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,1015 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1645,7 +1606,10 @@ index 0000000..f33f89a
 +  EXPECT_TRUE(ErrorQueueContains(SSL_R_TLSV1_ALERT_RECORD_OVERFLOW));
 +}
 +
-+TEST(RecordSizeLimitTest, EarlyDataUsesTheSessionEpochLimits) {
++TEST(RecordSizeLimitTest, EarlyDataUsesProtocolMaximum) {
++  // RFC 8449, section 4: records follow the limits of the handshake that made
++  // their keys. 0-RTT keys predate this handshake's EncryptedExtensions, so
++  // early data is bounded only by the protocol maximum, as in NSS.
 +  UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_3_VERSION);
 +  UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_3_VERSION);
 +  ASSERT_TRUE(client_ctx);
@@ -1655,49 +1619,45 @@ index 0000000..f33f89a
 +  SSL_CTX_set_early_data_enabled(client_ctx.get(), 1);
 +  SSL_CTX_set_early_data_enabled(server_ctx.get(), 1);
 +  SSL_CTX_set_record_size_limit(client_ctx.get(), 96);
-+  SSL_CTX_set_record_size_limit(server_ctx.get(), 128);
++  SSL_CTX_set_record_size_limit(server_ctx.get(), SSL3_RT_MAX_PLAIN_LENGTH + 1);
 +
 +  UniquePtr<SSL_SESSION> session =
 +      CreateClientSession(client_ctx.get(), server_ctx.get());
 +  ASSERT_TRUE(session);
 +  ASSERT_TRUE(SSL_SESSION_early_data_capable(session.get()));
-+  EXPECT_EQ(session->local_record_size_limit, 96);
-+  EXPECT_EQ(session->peer_record_size_limit, 128);
-+
-+  uint8_t *encoded = nullptr;
-+  size_t encoded_len = 0;
-+  ASSERT_TRUE(SSL_SESSION_to_bytes(session.get(), &encoded, &encoded_len));
-+  UniquePtr<uint8_t> encoded_storage(encoded);
-+  UniquePtr<SSL_SESSION> decoded(
-+      SSL_SESSION_from_bytes(encoded, encoded_len, client_ctx.get()));
-+  ASSERT_TRUE(decoded);
-+  EXPECT_EQ(decoded->local_record_size_limit, 96);
-+  EXPECT_EQ(decoded->peer_record_size_limit, 128);
 +
 +  SSL_CTX_set_record_size_limit(client_ctx.get(), 80);
-+  SSL_CTX_set_record_size_limit(server_ctx.get(), 64);
++  std::vector<uint16_t> lengths;
++  SSL_CTX_set_msg_callback(client_ctx.get(), CaptureProtectedRecordLengths);
++  SSL_CTX_set_msg_callback_arg(client_ctx.get(), &lengths);
 +  UniquePtr<SSL> client, server;
 +  ASSERT_TRUE(CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
-+  ASSERT_TRUE(SSL_set_session(client.get(), decoded.get()));
++  ASSERT_TRUE(SSL_set_session(client.get(), session.get()));
 +
 +  ASSERT_EQ(SSL_do_handshake(client.get()), 1);
 +  ASSERT_TRUE(SSL_in_early_data(client.get()));
-+  EXPECT_EQ(FromOpaque(client.get())->s3->write_record_size_limit, 128);
++  EXPECT_EQ(FromOpaque(client.get())->s3->write_record_size_limit, 0);
 +
-+  ASSERT_EQ(SSL_do_handshake(server.get()), 1);
-+  ASSERT_TRUE(SSL_in_early_data(server.get()));
-+  EXPECT_EQ(FromOpaque(server.get())->s3->read_record_size_limit, 128);
-+
-+  std::array<uint8_t, 100> sent = {};
-+  std::array<uint8_t, 100> received = {};
++  std::array<uint8_t, 1000> sent = {};
 +  for (size_t i = 0; i < sent.size(); i++) {
 +    sent[i] = static_cast<uint8_t>(i);
 +  }
++  lengths.clear();
 +  ASSERT_EQ(SSL_write(client.get(), sent.data(), sent.size()),
 +            static_cast<int>(sent.size()));
++  // One record: data, inner content type and a 16-byte tag.
++  ASSERT_EQ(lengths.size(), 1u);
++  EXPECT_EQ(lengths.front(), sent.size() + 1 + 16);
++
++  ASSERT_EQ(SSL_do_handshake(server.get()), 1);
++  ASSERT_TRUE(SSL_in_early_data(server.get()));
++  EXPECT_EQ(FromOpaque(server.get())->s3->read_record_size_limit, 0);
++  std::array<uint8_t, 1000> received = {};
 +  ASSERT_TRUE(ReadExact(server.get(), received));
 +  EXPECT_EQ(received, sent);
 +
++  // While in early data, SSL_do_handshake returns immediately on the server.
++  // Let the client send its Finished, then read EndOfEarlyData on the server.
 +  const int client_finish = SSL_do_handshake(client.get());
 +  ASSERT_TRUE(
 +      IsRetryableHandshakeError(SSL_get_error(client.get(), client_finish)));
@@ -1706,39 +1666,49 @@ index 0000000..f33f89a
 +  ASSERT_EQ(server_finish, -1);
 +  ASSERT_EQ(SSL_get_error(server.get(), server_finish), SSL_ERROR_WANT_READ);
 +  ASSERT_TRUE(CompleteHandshakes(client.get(), server.get()));
-+  EXPECT_TRUE(SSL_session_reused(client.get()));
-+  EXPECT_TRUE(SSL_session_reused(server.get()));
++  EXPECT_TRUE(SSL_early_data_accepted(client.get()));
 +  EXPECT_EQ(FromOpaque(client.get())->s3->read_record_size_limit, 80);
-+  EXPECT_EQ(FromOpaque(client.get())->s3->write_record_size_limit, 64);
-+  EXPECT_EQ(FromOpaque(server.get())->s3->read_record_size_limit, 64);
++  EXPECT_EQ(FromOpaque(client.get())->s3->write_record_size_limit,
++            SSL3_RT_MAX_PLAIN_LENGTH + 1);
++  EXPECT_EQ(FromOpaque(server.get())->s3->read_record_size_limit,
++            SSL3_RT_MAX_PLAIN_LENGTH + 1);
 +  EXPECT_EQ(FromOpaque(server.get())->s3->write_record_size_limit, 80);
 +}
 +
-+TEST(RecordSizeLimitTest, RejectedEarlyDataDoesNotUseNewEpochLimit) {
-+  // RFC 8446 section 4.2.10 requires rejected early data to be discarded.
-+  // The patch must not apply the new RFC 8449 limit to those old-epoch records.
-+  // https://www.rfc-editor.org/rfc/rfc8446.html#section-4.2.10
-+  for (uint16_t old_limit : {0, 512}) {
++TEST(RecordSizeLimitTest, ServerBelowMaximumDeclinesEarlyData) {
++  // A server below the protocol maximum cannot accept 0-RTT records without
++  // exceeding the limit it advertised, so it neither offers nor accepts 0-RTT.
++  auto client_ctx = CreateContext(false, TLS1_3_VERSION);
++  auto server_ctx = CreateContext(true, TLS1_3_VERSION);
++  ASSERT_TRUE(client_ctx);
++  ASSERT_TRUE(server_ctx);
++  SSL_CTX_set_session_cache_mode(client_ctx.get(), SSL_SESS_CACHE_BOTH);
++  SSL_CTX_set_session_cache_mode(server_ctx.get(), SSL_SESS_CACHE_BOTH);
++  SSL_CTX_set_early_data_enabled(client_ctx.get(), 1);
++  SSL_CTX_set_early_data_enabled(server_ctx.get(), 1);
++  SSL_CTX_set_record_size_limit(client_ctx.get(), 96);
++
++  SSL_CTX_set_record_size_limit(server_ctx.get(), SSL3_RT_MAX_PLAIN_LENGTH);
++  auto session = CreateClientSession(client_ctx.get(), server_ctx.get());
++  ASSERT_TRUE(session);
++  EXPECT_FALSE(SSL_SESSION_early_data_capable(session.get()));
++
++  // A ticket issued under an unlimited configuration still meets the lower
++  // limit on resumption. The early data is sent at the protocol maximum, then
++  // discarded rather than rejected with record_overflow (RFC 8446, section
++  // 4.2.10).
++  for (uint16_t old_limit : {0, SSL3_RT_MAX_PLAIN_LENGTH + 1}) {
 +    SCOPED_TRACE(old_limit);
-+    auto client_ctx = CreateContext(false, TLS1_3_VERSION);
-+    auto server_ctx = CreateContext(true, TLS1_3_VERSION);
-+    ASSERT_TRUE(client_ctx);
-+    ASSERT_TRUE(server_ctx);
-+    SSL_CTX_set_session_cache_mode(client_ctx.get(), SSL_SESS_CACHE_BOTH);
-+    SSL_CTX_set_session_cache_mode(server_ctx.get(), SSL_SESS_CACHE_BOTH);
-+    SSL_CTX_set_early_data_enabled(client_ctx.get(), 1);
-+    SSL_CTX_set_early_data_enabled(server_ctx.get(), 1);
-+    SSL_CTX_set_record_size_limit(client_ctx.get(), 96);
 +    SSL_CTX_set_record_size_limit(server_ctx.get(), old_limit);
-+    auto session = CreateClientSession(client_ctx.get(), server_ctx.get());
++    session = CreateClientSession(client_ctx.get(), server_ctx.get());
 +    ASSERT_TRUE(session);
 +    ASSERT_TRUE(SSL_SESSION_early_data_capable(session.get()));
 +
 +    SSL_CTX_set_record_size_limit(server_ctx.get(), 64);
 +    UniquePtr<SSL> client, server;
-+    ASSERT_TRUE(CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
++    ASSERT_TRUE(
++        CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
 +    ASSERT_TRUE(SSL_set_session(client.get(), session.get()));
-+    SSL_set_early_data_enabled(server.get(), 0);
 +    ASSERT_EQ(SSL_do_handshake(client.get()), 1);
 +    ASSERT_TRUE(SSL_in_early_data(client.get()));
 +    std::array<uint8_t, 200> sent = {0x5a};
@@ -1747,6 +1717,7 @@ index 0000000..f33f89a
 +
 +    int ret = SSL_do_handshake(server.get());
 +    ASSERT_EQ(SSL_get_error(server.get(), ret), SSL_ERROR_WANT_READ);
++    EXPECT_EQ(SSL_get_early_data_reason(server.get()), ssl_early_data_disabled);
 +    ASSERT_TRUE(FromOpaque(server.get())->s3->skip_early_data);
 +    ret = SSL_do_handshake(client.get());
 +    ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_EARLY_DATA_REJECTED);
@@ -1758,8 +1729,8 @@ index 0000000..f33f89a
 +    EXPECT_EQ(FromOpaque(server.get())->s3->read_record_size_limit, 64);
 +    EXPECT_EQ(FromOpaque(client.get())->s3->write_record_size_limit, 64);
 +
-+    // Only the new application data may reach the server, not the discarded
-+    // early data. It must now be fragmented using the new, smaller limit.
++    // Only new application data reaches the server, fragmented to the new
++    // limit.
 +    sent.fill(0xa5);
 +    ASSERT_EQ(SSL_write(client.get(), sent.data(), sent.size()),
 +              static_cast<int>(sent.size()));
@@ -1852,7 +1823,7 @@ index 0000000..f33f89a
 +
 +BSSL_NAMESPACE_END
 diff --git a/ssl/s3_both.cc b/ssl/s3_both.cc
-index d885da9..e00c043 100644
+index d885da981..e00c04309 100644
 --- a/ssl/s3_both.cc
 +++ b/ssl/s3_both.cc
 @@ -99,10 +99,11 @@ bool tls_add_message(SSLImpl *ssl, Array<uint8_t> msg) {
@@ -1887,7 +1858,7 @@ index d885da9..e00c043 100644
        rest = rest.subspan(chunk.size());
  
 diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
-index 2724e32..c928930 100644
+index 2724e327e..c92893070 100644
 --- a/ssl/s3_pkt.cc
 +++ b/ssl/s3_pkt.cc
 @@ -64,7 +64,7 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
@@ -1899,68 +1870,8 @@ index 2724e32..c928930 100644
      if (is_early_data_write) {
        SSL_HANDSHAKE *hs = ssl->s3->hs.get();
        if (hs->early_data_written >= hs->early_session->ticket_max_early_data) {
-diff --git a/ssl/ssl_asn1.cc b/ssl/ssl_asn1.cc
-index cdf763a..c061df7 100644
---- a/ssl/ssl_asn1.cc
-+++ b/ssl/ssl_asn1.cc
-@@ -77,6 +77,8 @@ BSSL_NAMESPACE_BEGIN
- //     resumableAcrossNames    [31] BOOLEAN OPTIONAL,
- //     peerCertType            [32] INTEGER DEFAULT 0,  -- defaults to X509(0)
- //     peerRawPublicKey        [33] SubjectPublicKeyInfo OPTIONAL,
-+//     localRecordSizeLimit    [100] INTEGER OPTIONAL,
-+//     peerRecordSizeLimit     [101] INTEGER OPTIONAL,
- // }
- //
- // Note: historically this serialization has included other optional
-@@ -150,6 +152,12 @@ static const CBS_ASN1_TAG kPeerCertTypeTag =
-     CBS_ASN1_CONSTRUCTED | CBS_ASN1_CONTEXT_SPECIFIC | 32;
- static const CBS_ASN1_TAG kPeerRawPublicKeyTag =
-     CBS_ASN1_CONSTRUCTED | CBS_ASN1_CONTEXT_SPECIFIC | 33;
-+// btls-specific fields use tag numbers from 100 so that upstream additions
-+// do not collide with them.
-+static const CBS_ASN1_TAG kLocalRecordSizeLimitTag =
-+    CBS_ASN1_CONSTRUCTED | CBS_ASN1_CONTEXT_SPECIFIC | 100;
-+static const CBS_ASN1_TAG kPeerRecordSizeLimitTag =
-+    CBS_ASN1_CONSTRUCTED | CBS_ASN1_CONTEXT_SPECIFIC | 101;
- 
- 
- static int SSL_SESSION_to_bytes_full(const SSL_SESSION *in, CBB *cbb,
-@@ -381,6 +389,17 @@ static int SSL_SESSION_to_bytes_full(const SSL_SESSION *in, CBB *cbb,
-     }
-   }
- 
-+  if (in->local_record_size_limit != 0 &&
-+      (!CBB_add_asn1(&session, &child, kLocalRecordSizeLimitTag) ||
-+       !CBB_add_asn1_uint64(&child, in->local_record_size_limit))) {
-+    return 0;
-+  }
-+  if (in->peer_record_size_limit != 0 &&
-+      (!CBB_add_asn1(&session, &child, kPeerRecordSizeLimitTag) ||
-+       !CBB_add_asn1_uint64(&child, in->peer_record_size_limit))) {
-+    return 0;
-+  }
-+
-   return CBB_flush(cbb);
- }
- 
-@@ -766,6 +785,15 @@ UniquePtr<SSL_SESSION> SSL_SESSION_parse(CBS *cbs,
-     }
-   }
- 
-+  if (!SSL_SESSION_parse_u16(&session, &ret->local_record_size_limit,
-+                             kLocalRecordSizeLimitTag, 0) ||
-+      !SSL_SESSION_parse_u16(&session, &ret->peer_record_size_limit,
-+                             kPeerRecordSizeLimitTag, 0) ||
-+      !ssl_record_size_limit_session_values_valid(ret.get())) {
-+    OPENSSL_PUT_ERROR(SSL, SSL_R_INVALID_SSL_SESSION);
-+    return nullptr;
-+  }
-+
-   // End of fields. There should be no trailing data.
-   if (CBS_len(&session) != 0) {
-     OPENSSL_PUT_ERROR(SSL, SSL_R_INVALID_SSL_SESSION);
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index c559b61..fdc49ef 100644
+index c559b61b9..fdc49eff6 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -573,6 +573,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
@@ -1971,32 +1882,29 @@ index c559b61..fdc49ef 100644
  
    if (!ssl->method->ssl_new(ssl.get()) ||
        !ssl->ctx->x509_method->ssl_new(ssl->s3->hs.get())) {
-diff --git a/ssl/ssl_session.cc b/ssl/ssl_session.cc
-index 4be8b58..30badad 100644
---- a/ssl/ssl_session.cc
-+++ b/ssl/ssl_session.cc
-@@ -131,6 +131,8 @@ UniquePtr<SSL_SESSION> SSL_SESSION_dup(const SSL_SESSION *session,
-     new_session->ticket_lifetime_hint = session->ticket_lifetime_hint;
-     new_session->ticket_age_add = session->ticket_age_add;
-     new_session->ticket_max_early_data = session->ticket_max_early_data;
-+    new_session->local_record_size_limit = session->local_record_size_limit;
-+    new_session->peer_record_size_limit = session->peer_record_size_limit;
-     new_session->extended_master_secret = session->extended_master_secret;
-     new_session->has_application_settings = session->has_application_settings;
- 
 diff --git a/ssl/tls13_server.cc b/ssl/tls13_server.cc
-index 94de72d..881eb7e 100644
+index 94de72d98..db156408f 100644
 --- a/ssl/tls13_server.cc
 +++ b/ssl/tls13_server.cc
-@@ -645,6 +645,7 @@ static enum ssl_hs_wait_t do_select_session(SSL_HANDSHAKE *hs) {
-       return ssl_hs_pending_ticket;
-   }
- 
-+  ssl_record_size_limit_store_session(hs);
-   hs->can_release_private_key = !using_certificate(hs);
- 
-   // Negotiate ALPS now, after ALPN is negotiated and `hs->new_session` is
-@@ -956,6 +957,13 @@ static enum ssl_hs_wait_t do_read_second_client_hello(SSL_HANDSHAKE *hs) {
+@@ -188,7 +188,7 @@ static bool add_new_session_tickets(SSL_HANDSHAKE *hs, bool *out_sent_tickets) {
+     bool enable_early_data =
+         ssl->enable_early_data &&
+         (!SSL_is_quic(ssl) || !ssl->config->quic_early_data_context.empty()) &&
+-        !SSL_is_dtls(ssl);
++        !SSL_is_dtls(ssl) && ssl_record_size_limit_allows_early_data(hs);
+     if (enable_early_data) {
+       // QUIC does not use the max_early_data_size parameter and always sets it
+       // to a fixed value. See RFC 9001, section 4.6.1.
+@@ -720,6 +720,8 @@ static enum ssl_hs_wait_t do_select_session(SSL_HANDSHAKE *hs) {
+     ssl->s3->early_data_reason = ssl_early_data_quic_parameter_mismatch;
+   } else if (need_hrr) {
+     ssl->s3->early_data_reason = ssl_early_data_hello_retry_request;
++  } else if (!ssl_record_size_limit_allows_early_data(hs)) {
++    ssl->s3->early_data_reason = ssl_early_data_disabled;
+   } else {
+     // `ssl_session_is_resumable` forbids cross-cipher resumptions even if the
+     // PRF hashes match.
+@@ -956,6 +958,13 @@ static enum ssl_hs_wait_t do_read_second_client_hello(SSL_HANDSHAKE *hs) {
      }
    }
  
@@ -2011,7 +1919,7 @@ index 94de72d..881eb7e 100644
    // consistency with what `select_certificate_cb` observed), which is in the
    // transcript, so we can ignore most of this second one.
 diff --git a/ssl/tls_method.cc b/ssl/tls_method.cc
-index a2e4dcf..a5ff384 100644
+index a2e4dcf58..a5ff38451 100644
 --- a/ssl/tls_method.cc
 +++ b/ssl/tls_method.cc
 @@ -69,6 +69,7 @@ static bool tls_set_read_state(SSLImpl *ssl, ssl_encryption_level_t level,
@@ -2031,7 +1939,7 @@ index a2e4dcf..a5ff384 100644
  }
  
 diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
-index f77d84b..2c0da11 100644
+index f77d84bfa..2c0da1147 100644
 --- a/ssl/tls_record.cc
 +++ b/ssl/tls_record.cc
 @@ -88,6 +88,11 @@ static uint16_t tls_record_version(const SSLImpl *ssl) {
