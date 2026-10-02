@@ -2119,33 +2119,23 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
-    /// Configures client connections to request and verify delegated
-    /// credentials presented by servers, using the specified signature
-    /// algorithm list, as defined by [RFC 9345].
+    /// Requests and verifies server delegated credentials ([RFC 9345]),
+    /// advertising the given colon-separated signature algorithms in order.
     ///
-    /// Algorithm names are separated by colons, for example
-    /// `ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384`, and encoded in the order
-    /// provided. Advertised algorithms remain subject to TLS version and key
-    /// compatibility checks. This list is separate from
-    /// the normal signature algorithm list, which controls the certificate
-    /// key's signature over the credential. Server-side use requires a
-    /// separately configured delegated credential; this setting does not make
-    /// a server select or send one. Client support is disabled by default and
-    /// only applies to TLS 1.3 and DTLS 1.3 handshakes.
+    /// The list only covers the delegated key; the signature over the
+    /// credential follows the normal signature algorithm list. Support is off
+    /// by default and applies to (D)TLS 1.3 clients. RSA delegated keys are
+    /// rejected because BoringSSL lacks the `rsa_pss_pss_*` schemes. Servers
+    /// may still answer with a plain certificate; see
+    /// [`SslRef::used_delegated_credential`].
     ///
-    /// Servers may still authenticate with an ordinary certificate. After a
-    /// successful handshake, use [`SslRef::used_delegated_credential`] to check
-    /// whether a delegated credential was used.
-    ///
-    /// RSA delegated keys are not supported because BoringSSL does not implement
-    /// the `rsa_pss_pss_*` signature schemes. RSA certificates can still sign
-    /// delegated credentials using `rsa_pss_rsae_*` with a supported non-RSA
-    /// delegated key.
+    /// Received credentials are validated per RFC 9345 §4.1.3, including that
+    /// they expire before the certificate; Firefox skips that last check. This
+    /// only affects certificate validation, not the ClientHello.
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty list, an unrecognized algorithm name, or
-    /// an embedded NUL byte. An empty string does not disable this setting.
+    /// Returns an error for an empty list, an unknown name, or an embedded NUL.
     ///
     /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
