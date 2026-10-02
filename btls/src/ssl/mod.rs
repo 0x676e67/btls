@@ -2107,10 +2107,9 @@ impl SslContextBuilder {
     ///
     /// The default is zero, which disables the extension. Nonzero values below
     /// 64 or above the protocol maximum are clamped when advertised. The peer's
-    /// advertised value limits records sent by this endpoint. Configure this
-    /// before creating connections; the value is fixed for each handshake.
-    /// This currently applies to stream TLS, not DTLS, QUIC, or split
-    /// handshakes.
+    /// advertised value limits records sent by this endpoint. The value is
+    /// fixed once the ClientHello is built or parsed. This currently applies
+    /// to stream TLS, not DTLS, QUIC, or split handshakes.
     ///
     /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]
@@ -3347,6 +3346,18 @@ impl SslRef {
     #[corresponds(SSL_set_permute_extensions)]
     pub fn set_permute_extensions(&mut self, enabled: bool) {
         unsafe { ffi::SSL_set_permute_extensions(self.as_ptr(), enabled as _) }
+    }
+
+    /// Sets the [RFC 8449] record size limit for this connection only.
+    ///
+    /// See [`SslContextBuilder::set_record_size_limit`]. A server may still
+    /// call this from a ClientHello callback before the value is negotiated.
+    ///
+    /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_set_record_size_limit)]
+    pub fn set_record_size_limit(&mut self, limit: u16) {
+        unsafe { ffi::SSL_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
     /// Like [`SslContextBuilder::set_alpn_protos`].
