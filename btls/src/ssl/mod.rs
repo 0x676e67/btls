@@ -2109,12 +2109,14 @@ impl SslContextBuilder {
     /// The default is zero, which disables the extension. Nonzero values below
     /// 64 or above the protocol maximum are clamped when advertised. The peer's
     /// advertised value limits records sent by this endpoint. The value is
-    /// fixed once the ClientHello is built or parsed. This currently applies
-    /// to stream TLS, not DTLS, QUIC, or split handshakes.
+    /// fixed once the ClientHello is built or parsed. This applies to stream
+    /// TLS and QUIC, not DTLS or split handshakes. QUIC negotiates the
+    /// extension but has no TLS records for the limit to bound.
     ///
     /// TLS 1.3 early data is sent before the server's limit is known, so 0-RTT
-    /// records may use the protocol maximum. A server whose limit is below
+    /// records may use the protocol maximum. A TLS server whose limit is below
     /// that maximum neither issues early-data tickets nor accepts early data.
+    /// QUIC carries 0-RTT in its own packets, so the limit does not affect it.
     ///
     /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]

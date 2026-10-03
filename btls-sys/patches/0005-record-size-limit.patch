@@ -24,21 +24,21 @@ limitations under the License.
  gen/sources.json                 |    4 +-
  gen/sources.mk                   |    2 +
  include/openssl/prefix_symbols.h |    4 +
- include/openssl/ssl.h            |   19 +
+ include/openssl/ssl.h            |   20 +
  include/openssl/tls1.h           |    3 +
  ssl/extensions.cc                |   17 +
  ssl/handoff.cc                   |    6 +-
  ssl/handshake_client.cc          |    1 +
- ssl/internal.h                   |   68 ++
- ssl/record_size_limit.cc         |  355 +++++++++++
- ssl/record_size_limit_test.cc    | 1015 ++++++++++++++++++++++++++++++
+ ssl/internal.h                   |   70 ++
+ ssl/record_size_limit.cc         |  365 +++++++++
+ ssl/record_size_limit_test.cc    | 1229 ++++++++++++++++++++++++++++++
  ssl/s3_both.cc                   |    7 +-
  ssl/s3_pkt.cc                    |    2 +-
  ssl/ssl_lib.cc                   |    1 +
  ssl/tls13_server.cc              |   11 +-
  ssl/tls_method.cc                |    2 +
  ssl/tls_record.cc                |   17 +-
- 21 files changed, 1531 insertions(+), 11 deletions(-)
+ 21 files changed, 1758 insertions(+), 11 deletions(-)
  create mode 100644 ssl/record_size_limit.cc
  create mode 100644 ssl/record_size_limit_test.cc
 
@@ -206,10 +206,10 @@ index 79df39104..7377e32a8 100644
  #define SSL_set_resumption_across_names_enabled BORINGSSL_ADD_PREFIX(SSL_set_resumption_across_names_enabled)
  #define SSL_set_retain_only_sha256_of_client_certs BORINGSSL_ADD_PREFIX(SSL_set_retain_only_sha256_of_client_certs)
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 56761fa33..16e3220dd 100644
+index 56761fa33..c313b9f85 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5655,6 +5655,25 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+@@ -5655,6 +5655,26 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  OPENSSL_EXPORT int SSL_CTX_set_extension_order(SSL_CTX *ctx,
                                                 const uint16_t *ids, int num);
  
@@ -220,12 +220,13 @@ index 56761fa33..16e3220dd 100644
 +// behavior. The value is fixed once the client builds its first ClientHello or
 +// the server parses one, so a server may still set it from
 +// |SSL_CTX_set_select_certificate_cb|; later calls apply to a future handshake.
-+// This is currently supported for stream TLS only, not DTLS, QUIC, or split
-+// handshakes.
++// This is supported for stream TLS and QUIC, not DTLS or split handshakes. QUIC
++// negotiates the extension but has no TLS records for the limit to bound.
 +//
 +// TLS 1.3 early data is sent before the server's limit is known, so 0-RTT
-+// records are bounded only by the protocol maximum. A server whose limit is
++// records are bounded only by the protocol maximum. A TLS server whose limit is
 +// below that maximum neither issues early-data tickets nor accepts early data.
++// QUIC carries 0-RTT in its own packets, so the limit does not affect it.
 +OPENSSL_EXPORT void SSL_set_record_size_limit(SSL *ssl, uint16_t limit);
 +
 +// SSL_CTX_set_record_size_limit applies SSL_set_record_size_limit to new
@@ -328,7 +329,7 @@ index 298f04f9c..885444bb1 100644
    uint8_t ech_enc[EVP_HPKE_MAX_ENC_LENGTH];
    size_t ech_enc_len;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 506775b90..21311e821 100644
+index 506775b90..506590eb9 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -757,6 +757,31 @@ enum ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
@@ -363,30 +364,32 @@ index 506775b90..21311e821 100644
  // dtls_open_record implements `tls_open_record` for DTLS. It only returns
  // `ssl_open_record_partial` if `in` was empty and sets `*out_consumed` to
  // zero. The caller should read one packet and try again. On success,
-@@ -1815,6 +1840,14 @@ struct SSL_HANDSHAKE {
+@@ -1815,6 +1840,15 @@ struct SSL_HANDSHAKE {
    // `SSL_OP_NO_*` and `SSL_CTX_set_max_proto_version` APIs.
    uint16_t max_version = 0;
  
 +  // record_size_limit is the receive limit offered in this handshake, or zero
 +  // when disabled. RFC 8449 fixes it once the client builds its first
 +  // ClientHello or the server parses one. peer_record_size_limit is the value
-+  // the client sent, so a second ClientHello after HelloRetryRequest can be
-+  // checked against it.
++  // the client sent, recorded only when this server enables the extension. The
++  // server echoes its limit when it is set, and a second ClientHello after
++  // HelloRetryRequest is checked against it.
 +  uint16_t record_size_limit = 0;
 +  uint16_t peer_record_size_limit = 0;
 +
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> secret;
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> early_traffic_secret;
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> client_handshake_secret;
-@@ -2837,6 +2870,23 @@ struct SSL3_STATE {
+@@ -2837,6 +2871,24 @@ struct SSL3_STATE {
    uint64_t read_sequence = 0;
    uint64_t write_sequence = 0;
  
 +  // The active record_size_limit values apply to records protected by the
 +  // current read and write keys. The pending values are installed with the
 +  // next keys so renegotiation cannot change the limits on an existing epoch.
-+  // A zero value means the extension was not negotiated. In TLS 1.3 these
-+  // limits include the inner content type and any padding.
++  // A zero value means no limit applies: the extension was not negotiated, or
++  // the connection is QUIC, which has no TLS records. In TLS 1.3 these limits
++  // include the inner content type and any padding.
 +  uint16_t read_record_size_limit = 0;
 +  uint16_t write_record_size_limit = 0;
 +  uint16_t pending_read_record_size_limit = 0;
@@ -402,7 +405,7 @@ index 506775b90..21311e821 100644
    uint8_t server_random[SSL3_RANDOM_SIZE] = {0};
    uint8_t client_random[SSL3_RANDOM_SIZE] = {0};
  
-@@ -3572,6 +3622,9 @@ struct SSL_CONFIG {
+@@ -3572,6 +3624,9 @@ struct SSL_CONFIG {
    // to negotiate and convey application settings.
    bool alps_use_new_codepoint : 1;
  
@@ -412,7 +415,7 @@ index 506775b90..21311e821 100644
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
-@@ -3833,6 +3886,18 @@ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
+@@ -3833,6 +3888,18 @@ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
                                    const SSL_CLIENT_HELLO *client_hello);
  bool ssl_parse_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *extensions);
  
@@ -431,7 +434,7 @@ index 506775b90..21311e821 100644
  #define tlsext_tick_md EVP_sha256
  
  // ssl_process_ticket processes a session ticket from the client. It returns
-@@ -4244,6 +4309,9 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4244,6 +4311,9 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // signal its sessions may be resumed across names in the server certificate.
    bool resumption_across_names_enabled : 1;
  
@@ -443,10 +446,10 @@ index 506775b90..21311e821 100644
    bssl::Array<uint16_t> extension_order;
 diff --git a/ssl/record_size_limit.cc b/ssl/record_size_limit.cc
 new file mode 100644
-index 000000000..b8906badc
+index 000000000..d0b0d30c2
 --- /dev/null
 +++ b/ssl/record_size_limit.cc
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,365 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -510,6 +513,12 @@ index 000000000..b8906badc
 +
 +static void record_size_limit_negotiate(SSL_HANDSHAKE *hs,
 +                                        uint16_t peer_limit) {
++  // QUIC carries handshake messages in its own frames, not in TLS records (RFC
++  // 9001, section 3). It negotiates the extension, as Firefox does over HTTP/3,
++  // but has no record layer to limit, so nothing is left pending.
++  if (SSL_is_quic(hs->ssl)) {
++    return;
++  }
 +  const uint16_t version = ssl_protocol_version(hs->ssl);
 +  hs->ssl->s3->pending_write_record_size_limit =
 +      std::min(peer_limit, record_size_limit_max_for_version(version));
@@ -524,10 +533,9 @@ index 000000000..b8906badc
 +
 +void ssl_record_size_limit_snapshot_config(SSL_HANDSHAKE *hs) {
 +  // The value stays fixed for the rest of the handshake, including a second
-+  // ClientHello after HelloRetryRequest. DTLS and QUIC do not use it.
-+  hs->record_size_limit = SSL_is_dtls(hs->ssl) || SSL_is_quic(hs->ssl)
-+                              ? 0
-+                              : hs->config->record_size_limit;
++  // ClientHello after HelloRetryRequest. DTLS does not use it.
++  hs->record_size_limit =
++      SSL_is_dtls(hs->ssl) ? 0 : hs->config->record_size_limit;
 +}
 +
 +bool ssl_record_size_limit_disallows_handoff(const SSLImpl *ssl) {
@@ -648,14 +656,18 @@ index 000000000..b8906badc
 +}
 +
 +bool record_size_limit_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
-+  if (hs->ssl->s3->pending_read_record_size_limit == 0) {
++  // Echo from the negotiation state rather than the pending record limits,
++  // which QUIC leaves unset. A client offer is only recorded when this server
++  // enables the extension.
++  if (hs->peer_record_size_limit == 0) {
 +    return true;
 +  }
 +
 +  CBB data;
++  const uint16_t limit = record_size_limit_for_version(
++      hs->record_size_limit, ssl_protocol_version(hs->ssl));
 +  return CBB_add_u16(out, TLSEXT_TYPE_record_size_limit) &&
-+         CBB_add_u16_length_prefixed(out, &data) &&
-+         CBB_add_u16(&data, hs->ssl->s3->pending_read_record_size_limit) &&
++         CBB_add_u16_length_prefixed(out, &data) && CBB_add_u16(&data, limit) &&
 +         CBB_flush(out);
 +}
 +
@@ -663,7 +675,8 @@ index 000000000..b8906badc
 +  // The client sends 0-RTT before EncryptedExtensions carries this server's
 +  // limit, so early data may use the protocol maximum. A server with a smaller
 +  // limit declines 0-RTT. NSS servers instead apply their limit to early data
-+  // and fail the connection with record_overflow on larger records.
++  // and fail the connection with record_overflow on larger records. QUIC sends
++  // 0-RTT in its own packets and leaves no pending limit, so it is unaffected.
 +  const uint16_t limit = hs->ssl->s3->pending_read_record_size_limit;
 +  return limit == 0 || limit >= record_size_limit_max_for_version(
 +                                    ssl_protocol_version(hs->ssl));
@@ -678,7 +691,7 @@ index 000000000..b8906badc
 +                             : ssl->s3->pending_read_record_size_limit;
 +  ssl->s3->read_record_size_limit = limit;
 +  record_size_limit_clear_unconfirmed(ssl);
-+  if (level == ssl_encryption_handshake && !ssl->server &&
++  if (level == ssl_encryption_handshake && !ssl->server && !SSL_is_quic(ssl) &&
 +      ssl_protocol_version(ssl) >= TLS1_3_VERSION && limit == 0 &&
 +      ssl->s3->hs != nullptr && ssl->s3->hs->record_size_limit != 0) {
 +    ssl->s3->unconfirmed_read_record_size_limit = record_size_limit_for_version(
@@ -804,10 +817,10 @@ index 000000000..b8906badc
 +}
 diff --git a/ssl/record_size_limit_test.cc b/ssl/record_size_limit_test.cc
 new file mode 100644
-index 000000000..cb32a4e94
+index 000000000..075ccdb2e
 --- /dev/null
 +++ b/ssl/record_size_limit_test.cc
-@@ -0,0 +1,1015 @@
+@@ -0,0 +1,1229 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -826,6 +839,7 @@ index 000000000..cb32a4e94
 +#include <stdio.h>
 +#include <string.h>
 +
++#include <algorithm>
 +#include <array>
 +#include <utility>
 +#include <vector>
@@ -1818,6 +1832,219 @@ index 000000000..cb32a4e94
 +  SSL_CLIENT_HELLO client_hello;
 +  ASSERT_TRUE(CBB_init(cbb.get(), 256));
 +  EXPECT_FALSE(SSL_serialize_handoff(server.get(), cbb.get(), &client_hello));
++}
++
++// QUICEndpoint is a minimal in-memory QUIC transport. Each endpoint queues the
++// handshake bytes its peer writes at every encryption level, and records what
++// it wrote itself and its largest single write.
++struct QUICEndpoint {
++  SSL *peer = nullptr;
++  std::array<std::vector<uint8_t>, 4> inbox;
++  std::array<std::vector<uint8_t>, 4> written;
++  std::array<size_t, 4> max_write = {};
++};
++
++static QUICEndpoint *GetQUICEndpoint(const SSL *ssl) {
++  return static_cast<QUICEndpoint *>(SSL_get_app_data(ssl));
++}
++
++static int QUICSetSecret(SSL *, ssl_encryption_level_t, const SSL_CIPHER *,
++                         const uint8_t *, size_t) {
++  return 1;
++}
++
++static int QUICAddHandshakeData(SSL *ssl, ssl_encryption_level_t level,
++                                const uint8_t *data, size_t len) {
++  QUICEndpoint *endpoint = GetQUICEndpoint(ssl);
++  std::vector<uint8_t> &written = endpoint->written[level];
++  written.insert(written.end(), data, data + len);
++  endpoint->max_write[level] = std::max(endpoint->max_write[level], len);
++  std::vector<uint8_t> &inbox = GetQUICEndpoint(endpoint->peer)->inbox[level];
++  inbox.insert(inbox.end(), data, data + len);
++  return 1;
++}
++
++static int QUICFlushFlight(SSL *) { return 1; }
++
++static int QUICSendAlert(SSL *, ssl_encryption_level_t, uint8_t) { return 1; }
++
++static const SSL_QUIC_METHOD kQUICMethod = {
++    QUICSetSecret,   QUICSetSecret, QUICAddHandshakeData,
++    QUICFlushFlight, QUICSendAlert,
++};
++
++static const uint8_t kQUICALPN[] = {0x02, 'h', '3'};
++
++static int SelectQUICALPN(SSL *, const uint8_t **out, uint8_t *out_len,
++                          const uint8_t *in, unsigned in_len, void *) {
++  return SSL_select_next_proto(const_cast<uint8_t **>(out), out_len, in, in_len,
++                               kQUICALPN,
++                               sizeof(kQUICALPN)) == OPENSSL_NPN_NEGOTIATED
++             ? SSL_TLSEXT_ERR_OK
++             : SSL_TLSEXT_ERR_NOACK;
++}
++
++struct QUICPair {
++  QUICEndpoint client_endpoint, server_endpoint;
++  UniquePtr<SSL> client, server;
++};
++
++static bool CreateQUICPair(QUICPair *pair, SSL_CTX *client_ctx,
++                           SSL_CTX *server_ctx) {
++  static const uint8_t kTransportParams[] = {0};
++  pair->client.reset(SSL_new(client_ctx));
++  pair->server.reset(SSL_new(server_ctx));
++  if (!pair->client || !pair->server) {
++    return false;
++  }
++  SSL_set_connect_state(pair->client.get());
++  SSL_set_accept_state(pair->server.get());
++  pair->client_endpoint.peer = pair->server.get();
++  pair->server_endpoint.peer = pair->client.get();
++  return SSL_set_app_data(pair->client.get(), &pair->client_endpoint) &&
++         SSL_set_app_data(pair->server.get(), &pair->server_endpoint) &&
++         SSL_set_quic_transport_params(pair->client.get(), kTransportParams,
++                                       sizeof(kTransportParams)) &&
++         SSL_set_quic_transport_params(pair->server.get(), kTransportParams,
++                                       sizeof(kTransportParams)) &&
++         SSL_set_quic_early_data_context(pair->server.get(), kTransportParams,
++                                         sizeof(kTransportParams));
++}
++
++static bool ProvideQUICData(SSL *ssl) {
++  const ssl_encryption_level_t level = SSL_quic_read_level(ssl);
++  std::vector<uint8_t> data;
++  data.swap(GetQUICEndpoint(ssl)->inbox[level]);
++  return data.empty() ||
++         SSL_provide_quic_data(ssl, level, data.data(), data.size());
++}
++
++static bool CompleteQUICHandshakes(QUICPair *pair) {
++  for (size_t i = 0; i < 100; i++) {
++    for (SSL *ssl : {pair->client.get(), pair->server.get()}) {
++      if (!ProvideQUICData(ssl)) {
++        return false;
++      }
++      if (SSL_in_init(ssl) && !IsRetryableHandshakeError(
++                                  SSL_get_error(ssl, SSL_do_handshake(ssl)))) {
++        return false;
++      }
++    }
++    if (!SSL_in_init(pair->client.get()) && !SSL_in_init(pair->server.get())) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// EncryptedExtensionsRecordSizeLimit finds record_size_limit in the
++// EncryptedExtensions message at the start of a server's handshake flight.
++static bool EncryptedExtensionsRecordSizeLimit(Span<const uint8_t> flight,
++                                               uint16_t *out) {
++  CBS cbs(flight), body, extensions;
++  uint8_t type;
++  if (!CBS_get_u8(&cbs, &type) || type != SSL3_MT_ENCRYPTED_EXTENSIONS ||
++      !CBS_get_u24_length_prefixed(&cbs, &body) ||
++      !CBS_get_u16_length_prefixed(&body, &extensions) || CBS_len(&body) != 0) {
++    return false;
++  }
++  while (CBS_len(&extensions) != 0) {
++    uint16_t extension_type;
++    CBS extension;
++    if (!CBS_get_u16(&extensions, &extension_type) ||
++        !CBS_get_u16_length_prefixed(&extensions, &extension)) {
++      return false;
++    }
++    if (extension_type == TLSEXT_TYPE_record_size_limit) {
++      return CBS_get_u16(&extension, out) && CBS_len(&extension) == 0;
++    }
++  }
++  return false;
++}
++
++TEST(RecordSizeLimitTest, QuicNegotiatesWithoutLimitingHandshakeOrEarlyData) {
++  // Firefox's HTTP/3 ClientHello carries record_size_limit 16385. QUIC sends
++  // handshake messages and 0-RTT in its own frames, so the negotiated limit
++  // must not split the handshake flight or gate early data.
++  static const uint8_t kFirefoxExtension[] = {0x00, 0x1c, 0x00,
++                                              0x02, 0x40, 0x01};
++  auto contains_firefox_extension = [](const std::vector<uint8_t> &bytes) {
++    return std::search(bytes.begin(), bytes.end(),
++                       std::begin(kFirefoxExtension),
++                       std::end(kFirefoxExtension)) != bytes.end();
++  };
++
++  UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_3_VERSION);
++  UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_3_VERSION);
++  ASSERT_TRUE(client_ctx);
++  ASSERT_TRUE(server_ctx);
++  ASSERT_TRUE(SSL_CTX_set_quic_method(client_ctx.get(), &kQUICMethod));
++  ASSERT_TRUE(SSL_CTX_set_quic_method(server_ctx.get(), &kQUICMethod));
++  ASSERT_EQ(
++      SSL_CTX_set_alpn_protos(client_ctx.get(), kQUICALPN, sizeof(kQUICALPN)),
++      0);
++  SSL_CTX_set_alpn_select_cb(server_ctx.get(), SelectQUICALPN, nullptr);
++  SSL_CTX_set_session_cache_mode(client_ctx.get(), SSL_SESS_CACHE_BOTH);
++  SSL_CTX_set_early_data_enabled(client_ctx.get(), 1);
++  SSL_CTX_set_early_data_enabled(server_ctx.get(), 1);
++
++  ClientHelloObservation observation;
++  ScopedClientHelloObservation scoped_observation(&observation);
++  SSL_CTX_set_select_certificate_cb(server_ctx.get(), ObserveClientHello);
++
++  // Without a configured limit, QUIC still omits the extension.
++  QUICPair disabled;
++  ASSERT_TRUE(CreateQUICPair(&disabled, client_ctx.get(), server_ctx.get()));
++  ASSERT_TRUE(CompleteQUICHandshakes(&disabled));
++  EXPECT_TRUE(observation.called);
++  EXPECT_FALSE(observation.present);
++  EXPECT_FALSE(contains_firefox_extension(
++      disabled.client_endpoint.written[ssl_encryption_initial]));
++
++  SSL_CTX_set_record_size_limit(client_ctx.get(), 16385);
++  SSL_CTX_set_record_size_limit(server_ctx.get(), 64);
++  g_last_session = nullptr;
++  SSL_CTX_sess_set_new_cb(client_ctx.get(), SaveLastSession);
++  QUICPair pair;
++  ASSERT_TRUE(CreateQUICPair(&pair, client_ctx.get(), server_ctx.get()));
++  ASSERT_TRUE(CompleteQUICHandshakes(&pair));
++  EXPECT_TRUE(contains_firefox_extension(
++      pair.client_endpoint.written[ssl_encryption_initial]));
++  uint16_t echoed = 0;
++  ASSERT_TRUE(EncryptedExtensionsRecordSizeLimit(
++      pair.server_endpoint.written[ssl_encryption_handshake], &echoed));
++  EXPECT_EQ(echoed, 64);
++  for (SSL *ssl : {pair.client.get(), pair.server.get()}) {
++    const SSL3_STATE *state = FromOpaque(ssl)->s3;
++    EXPECT_EQ(state->read_record_size_limit, 0);
++    EXPECT_EQ(state->write_record_size_limit, 0);
++    EXPECT_EQ(state->pending_read_record_size_limit, 0);
++    EXPECT_EQ(state->pending_write_record_size_limit, 0);
++  }
++
++  // The server's 64-byte limit still issues 0-RTT tickets and accepts 0-RTT.
++  ASSERT_TRUE(ProvideQUICData(pair.client.get()));
++  ASSERT_TRUE(SSL_process_quic_post_handshake(pair.client.get()));
++  SSL_CTX_sess_set_new_cb(client_ctx.get(), nullptr);
++  UniquePtr<SSL_SESSION> session = std::move(g_last_session);
++  ASSERT_TRUE(session);
++  EXPECT_TRUE(SSL_SESSION_early_data_capable(session.get()));
++
++  QUICPair resumed;
++  ASSERT_TRUE(CreateQUICPair(&resumed, client_ctx.get(), server_ctx.get()));
++  SSL_set_session(resumed.client.get(), session.get());
++  ASSERT_TRUE(CompleteQUICHandshakes(&resumed));
++  EXPECT_TRUE(SSL_early_data_accepted(resumed.client.get()));
++  EXPECT_TRUE(SSL_early_data_accepted(resumed.server.get()));
++
++  // The client's limit bounds what the server sends. Applied to QUIC, a 64-byte
++  // limit would cut the server's certificate flight into 63-byte writes.
++  SSL_CTX_set_record_size_limit(client_ctx.get(), 64);
++  QUICPair small;
++  ASSERT_TRUE(CreateQUICPair(&small, client_ctx.get(), server_ctx.get()));
++  ASSERT_TRUE(CompleteQUICHandshakes(&small));
++  EXPECT_EQ(observation.value, 64);
++  EXPECT_GT(small.server_endpoint.max_write[ssl_encryption_handshake], 64u);
 +}
 +
 +}  // namespace
