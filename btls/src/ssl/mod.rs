@@ -2103,7 +2103,22 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_sigalgs_enabled(self.as_ptr(), enabled as _) }
     }
 
-    /// Sets whether the context should enable record size limit.
+    /// Sets the maximum protected-record plaintext this endpoint is willing to
+    /// receive, as defined by [RFC 8449].
+    ///
+    /// The default is zero, which disables the extension. Nonzero values below
+    /// 64 or above the protocol maximum are clamped when advertised. The peer's
+    /// advertised value limits records sent by this endpoint. The value is
+    /// fixed once the ClientHello is built or parsed. This applies to stream
+    /// TLS and QUIC, not DTLS or split handshakes. QUIC negotiates the
+    /// extension but has no TLS records for the limit to bound.
+    ///
+    /// TLS 1.3 early data is sent before the server's limit is known, so 0-RTT
+    /// records may use the protocol maximum. A TLS server whose limit is below
+    /// that maximum neither issues early-data tickets nor accepts early data.
+    /// QUIC carries 0-RTT in its own packets, so the limit does not affect it.
+    ///
+    /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_record_size_limit)]
     pub fn set_record_size_limit(&mut self, limit: u16) {
@@ -3338,6 +3353,18 @@ impl SslRef {
     #[corresponds(SSL_set_permute_extensions)]
     pub fn set_permute_extensions(&mut self, enabled: bool) {
         unsafe { ffi::SSL_set_permute_extensions(self.as_ptr(), enabled as _) }
+    }
+
+    /// Sets the [RFC 8449] record size limit for this connection only.
+    ///
+    /// See [`SslContextBuilder::set_record_size_limit`]. A server may still
+    /// call this from a ClientHello callback before the value is negotiated.
+    ///
+    /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_set_record_size_limit)]
+    pub fn set_record_size_limit(&mut self, limit: u16) {
+        unsafe { ffi::SSL_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
     /// Like [`SslContextBuilder::set_alpn_protos`].
