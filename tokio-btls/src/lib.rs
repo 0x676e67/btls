@@ -444,9 +444,9 @@ where
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
-            // SSL_read returns at most one record, so keep reading while plaintext is ready and
-            // fill the caller's buffer, like Chrome's `DoPayloadRead`. An end or error met after
-            // taking plaintext is reported by the next read.
+            // SSL_read returns at most one record, so keep reading while plaintext is ready to fill
+            // the caller's buffer. An end or error met after taking plaintext is reported by the
+            // next read.
             let start = buf.filled().len();
             let end = loop {
                 // SAFETY: read_uninit does not de-initialize the buffer.
