@@ -64,6 +64,8 @@ struct StreamWrapper<S> {
     write_through: bool,
     // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
     shutdown_sent: bool,
+    // The end or error a read met after taking plaintext, reported by the next read.
+    read_end: Option<io::Result<()>>,
 }
 
 /// The underlying stream and the task context of the poll driving it.
@@ -436,16 +438,38 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.with_context(ctx, |s| {
-            // SAFETY: read_uninit does not de-initialize the buffer.
-            match cvt(s.read_uninit(unsafe { buf.unfilled_mut() }))? {
-                Poll::Ready(nread) => {
-                    // SAFETY: read_uninit guarantees that nread bytes have been initialized.
-                    unsafe { buf.assume_init(nread) };
-                    buf.advance(nread);
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Pending => Poll::Pending,
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
             }
+            if let Some(end) = s.get_mut().read_end.take() {
+                return Poll::Ready(end);
+            }
+            // SSL_read returns at most one record, so keep reading while buffered ciphertext can
+            // fill the caller's buffer. An end or error met after taking plaintext is reported by
+            // the next read.
+            let start = buf.filled().len();
+            let end = loop {
+                // SAFETY: read_uninit does not de-initialize the buffer.
+                match cvt(s.read_uninit(unsafe { buf.unfilled_mut() })) {
+                    Poll::Ready(Ok(0)) => break Some(Ok(())),
+                    Poll::Ready(Ok(nread)) => {
+                        // SAFETY: read_uninit guarantees that nread bytes have been initialized.
+                        unsafe { buf.assume_init(nread) };
+                        buf.advance(nread);
+                        // Without buffered ciphertext, another record needs a transport poll.
+                        if buf.remaining() == 0 || s.get_ref().read_buf.is_empty() {
+                            break None;
+                        }
+                    }
+                    Poll::Ready(Err(err)) => break Some(Err(err)),
+                    Poll::Pending => break None,
+                }
+            };
+            if buf.filled().len() == start {
+                return end.map_or(Poll::Pending, Poll::Ready);
+            }
+            s.get_mut().read_end = end;
+            Poll::Ready(Ok(()))
         })
     }
 }
@@ -521,6 +545,7 @@ impl<S> StreamWrapper<S> {
             write_buf: WriteBuffer::default(),
             write_through: false,
             shutdown_sent: false,
+            read_end: None,
         }
     }
 }
@@ -596,6 +621,12 @@ impl<S> Transport<S> {
 // ===== impl ReadBuffer =====
 
 impl ReadBuffer {
+    /// Whether no ciphertext is waiting; a drained buffer is released at once.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     /// Copies buffered ciphertext into `buf`, first refilling an empty buffer from `transport`.
     #[inline]
     fn read<S>(&mut self, transport: &mut Transport<S>, buf: &mut [u8]) -> io::Result<usize>
@@ -1196,6 +1227,8 @@ mod tests {
         broken: bool,
         polls: usize,
         tap: Vec<u8>,
+        // Returned once instead of `Pending` when no data is left: EOF or an error.
+        drained: Option<io::Result<()>>,
     }
 
     impl AsyncRead for Gate {
@@ -1204,7 +1237,10 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.io).poll_read(cx, buf)
+            match Pin::new(&mut self.io).poll_read(cx, buf) {
+                Poll::Pending => self.drained.take().map_or(Poll::Pending, Poll::Ready),
+                read => read,
+            }
         }
     }
 
@@ -1309,6 +1345,7 @@ mod tests {
             broken: false,
             polls: 0,
             tap: Vec::new(),
+            drained: None,
         };
         let mut client = SslStream::new(ssl, gate).unwrap();
 
@@ -1335,6 +1372,53 @@ mod tests {
             rest = &rest[len..];
         }
         records
+    }
+
+    #[tokio::test]
+    async fn read_takes_every_ready_record() {
+        let (mut client, mut server) = tls_pair().await;
+        let payload = vec![7; 3 * MAX_RECORD];
+        server.write_all(&payload).await.unwrap();
+        server.flush().await.unwrap();
+
+        client.get_mut().drained = Some(Ok(()));
+
+        let mut buf = vec![0; 4 * MAX_RECORD];
+        assert_eq!(client.read(&mut buf).await.unwrap(), payload.len());
+        // The read stops once the buffered ciphertext is used, before the transport's end.
+        assert!(client.get_ref().drained.is_some());
+        assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_reports_an_end_after_the_data_before_it() {
+        for corrupt in [false, true] {
+            let (mut client, mut server) = tls_pair().await;
+            server.write_all(b"payload").await.unwrap();
+            server.flush().await.unwrap();
+            if corrupt {
+                // A record that fails to open follows the data.
+                let mut record = vec![23, 3, 3, 0, 32];
+                record.resize(5 + 32, 0);
+                server.get_mut().write_all(&record).await.unwrap();
+            } else {
+                server.shutdown().await.unwrap();
+            }
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let mut buf = [0; 64];
+
+            // Both records arrive in one transport read; the end waits for the next read.
+            let mut read = ReadBuf::new(&mut buf);
+            let first = Pin::new(&mut client).poll_read(&mut cx, &mut read);
+            assert!(matches!(first, Poll::Ready(Ok(()))), "{first:?}");
+            assert_eq!(read.filled(), b"payload");
+            let mut read = ReadBuf::new(&mut buf);
+            match Pin::new(&mut client).poll_read(&mut cx, &mut read) {
+                Poll::Ready(Ok(())) if !corrupt => assert!(read.filled().is_empty()),
+                Poll::Ready(Err(_)) if corrupt => {}
+                other => panic!("the end was lost: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
