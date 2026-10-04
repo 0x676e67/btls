@@ -438,15 +438,15 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.with_context(ctx, |s| {
-            if let Some(end) = s.get_mut().read_end.take() {
-                return Poll::Ready(end);
-            }
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
-            // SSL_read returns at most one record, so keep reading while plaintext is ready to fill
-            // the caller's buffer. An end or error met after taking plaintext is reported by the
-            // next read.
+            if let Some(end) = s.get_mut().read_end.take() {
+                return Poll::Ready(end);
+            }
+            // SSL_read returns at most one record, so keep reading while buffered ciphertext can
+            // fill the caller's buffer. An end or error met after taking plaintext is reported by
+            // the next read.
             let start = buf.filled().len();
             let end = loop {
                 // SAFETY: read_uninit does not de-initialize the buffer.
@@ -456,7 +456,8 @@ where
                         // SAFETY: read_uninit guarantees that nread bytes have been initialized.
                         unsafe { buf.assume_init(nread) };
                         buf.advance(nread);
-                        if buf.remaining() == 0 {
+                        // Without buffered ciphertext, another record needs a transport poll.
+                        if buf.remaining() == 0 || s.get_ref().read_buf.is_empty() {
                             break None;
                         }
                     }
@@ -464,14 +465,11 @@ where
                     Poll::Pending => break None,
                 }
             };
-            match end {
-                None if buf.filled().len() == start => Poll::Pending,
-                Some(end) if buf.filled().len() == start => Poll::Ready(end),
-                end => {
-                    s.get_mut().read_end = end;
-                    Poll::Ready(Ok(()))
-                }
+            if buf.filled().len() == start {
+                return end.map_or(Poll::Pending, Poll::Ready);
             }
+            s.get_mut().read_end = end;
+            Poll::Ready(Ok(()))
         })
     }
 }
@@ -623,6 +621,12 @@ impl<S> Transport<S> {
 // ===== impl ReadBuffer =====
 
 impl ReadBuffer {
+    /// Whether no ciphertext is waiting; a drained buffer is released at once.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     /// Copies buffered ciphertext into `buf`, first refilling an empty buffer from `transport`.
     #[inline]
     fn read<S>(&mut self, transport: &mut Transport<S>, buf: &mut [u8]) -> io::Result<usize>
@@ -1377,31 +1381,41 @@ mod tests {
         server.write_all(&payload).await.unwrap();
         server.flush().await.unwrap();
 
+        client.get_mut().drained = Some(Ok(()));
+
         let mut buf = vec![0; 4 * MAX_RECORD];
         assert_eq!(client.read(&mut buf).await.unwrap(), payload.len());
+        // The read stops once the buffered ciphertext is used, before the transport's end.
+        assert!(client.get_ref().drained.is_some());
+        assert_eq!(client.read(&mut buf).await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn read_reports_an_end_after_the_data_before_it() {
-        for end in [Ok(()), Err(io::ErrorKind::ConnectionAborted.into())] {
+        for corrupt in [false, true] {
             let (mut client, mut server) = tls_pair().await;
             server.write_all(b"payload").await.unwrap();
             server.flush().await.unwrap();
-            // The transport reports the end once; the read that meets it already holds data.
-            let aborted = end.is_err();
-            client.get_mut().drained = Some(end);
-
+            if corrupt {
+                // A record that fails to open follows the data.
+                let mut record = vec![23, 3, 3, 0, 32];
+                record.resize(5 + 32, 0);
+                server.get_mut().write_all(&record).await.unwrap();
+            } else {
+                server.shutdown().await.unwrap();
+            }
+            let mut cx = Context::from_waker(std::task::Waker::noop());
             let mut buf = [0; 64];
-            assert_eq!(client.read(&mut buf).await.unwrap(), 7);
-            let mut read = std::pin::pin!(client.read(&mut buf));
-            let next =
-                future::poll_fn(|cx| Poll::Ready(std::future::Future::poll(read.as_mut(), cx)))
-                    .await;
-            match next {
-                Poll::Ready(Ok(n)) if !aborted => assert_eq!(n, 0),
-                Poll::Ready(Err(err)) if aborted => {
-                    assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted)
-                }
+
+            // Both records arrive in one transport read; the end waits for the next read.
+            let mut read = ReadBuf::new(&mut buf);
+            let first = Pin::new(&mut client).poll_read(&mut cx, &mut read);
+            assert!(matches!(first, Poll::Ready(Ok(()))), "{first:?}");
+            assert_eq!(read.filled(), b"payload");
+            let mut read = ReadBuf::new(&mut buf);
+            match Pin::new(&mut client).poll_read(&mut cx, &mut read) {
+                Poll::Ready(Ok(())) if !corrupt => assert!(read.filled().is_empty()),
+                Poll::Ready(Err(_)) if corrupt => {}
                 other => panic!("the end was lost: {other:?}"),
             }
         }
