@@ -64,6 +64,8 @@ struct StreamWrapper<S> {
     write_through: bool,
     // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
     shutdown_sent: bool,
+    // The end or error a read met after taking plaintext, reported by the next read.
+    read_end: Option<io::Result<()>>,
 }
 
 /// The underlying stream and the task context of the poll driving it.
@@ -436,15 +438,39 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.with_context(ctx, |s| {
-            // SAFETY: read_uninit does not de-initialize the buffer.
-            match cvt(s.read_uninit(unsafe { buf.unfilled_mut() }))? {
-                Poll::Ready(nread) => {
-                    // SAFETY: read_uninit guarantees that nread bytes have been initialized.
-                    unsafe { buf.assume_init(nread) };
-                    buf.advance(nread);
+            if let Some(end) = s.get_mut().read_end.take() {
+                return Poll::Ready(end);
+            }
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            // SSL_read returns at most one record, so keep reading while plaintext is ready and
+            // fill the caller's buffer, like Chrome's `DoPayloadRead`. An end or error met after
+            // taking plaintext is reported by the next read.
+            let start = buf.filled().len();
+            let end = loop {
+                // SAFETY: read_uninit does not de-initialize the buffer.
+                match cvt(s.read_uninit(unsafe { buf.unfilled_mut() })) {
+                    Poll::Ready(Ok(0)) => break Some(Ok(())),
+                    Poll::Ready(Ok(nread)) => {
+                        // SAFETY: read_uninit guarantees that nread bytes have been initialized.
+                        unsafe { buf.assume_init(nread) };
+                        buf.advance(nread);
+                        if buf.remaining() == 0 {
+                            break None;
+                        }
+                    }
+                    Poll::Ready(Err(err)) => break Some(Err(err)),
+                    Poll::Pending => break None,
+                }
+            };
+            match end {
+                None if buf.filled().len() == start => Poll::Pending,
+                Some(end) if buf.filled().len() == start => Poll::Ready(end),
+                end => {
+                    s.get_mut().read_end = end;
                     Poll::Ready(Ok(()))
                 }
-                Poll::Pending => Poll::Pending,
             }
         })
     }
@@ -521,6 +547,7 @@ impl<S> StreamWrapper<S> {
             write_buf: WriteBuffer::default(),
             write_through: false,
             shutdown_sent: false,
+            read_end: None,
         }
     }
 }
@@ -1196,6 +1223,8 @@ mod tests {
         broken: bool,
         polls: usize,
         tap: Vec<u8>,
+        // Returned once instead of `Pending` when no data is left: EOF or an error.
+        drained: Option<io::Result<()>>,
     }
 
     impl AsyncRead for Gate {
@@ -1204,7 +1233,10 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.io).poll_read(cx, buf)
+            match Pin::new(&mut self.io).poll_read(cx, buf) {
+                Poll::Pending => self.drained.take().map_or(Poll::Pending, Poll::Ready),
+                read => read,
+            }
         }
     }
 
@@ -1309,6 +1341,7 @@ mod tests {
             broken: false,
             polls: 0,
             tap: Vec::new(),
+            drained: None,
         };
         let mut client = SslStream::new(ssl, gate).unwrap();
 
@@ -1335,6 +1368,43 @@ mod tests {
             rest = &rest[len..];
         }
         records
+    }
+
+    #[tokio::test]
+    async fn read_takes_every_ready_record() {
+        let (mut client, mut server) = tls_pair().await;
+        let payload = vec![7; 3 * MAX_RECORD];
+        server.write_all(&payload).await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut buf = vec![0; 4 * MAX_RECORD];
+        assert_eq!(client.read(&mut buf).await.unwrap(), payload.len());
+    }
+
+    #[tokio::test]
+    async fn read_reports_an_end_after_the_data_before_it() {
+        for end in [Ok(()), Err(io::ErrorKind::ConnectionAborted.into())] {
+            let (mut client, mut server) = tls_pair().await;
+            server.write_all(b"payload").await.unwrap();
+            server.flush().await.unwrap();
+            // The transport reports the end once; the read that meets it already holds data.
+            let aborted = end.is_err();
+            client.get_mut().drained = Some(end);
+
+            let mut buf = [0; 64];
+            assert_eq!(client.read(&mut buf).await.unwrap(), 7);
+            let mut read = std::pin::pin!(client.read(&mut buf));
+            let next =
+                future::poll_fn(|cx| Poll::Ready(std::future::Future::poll(read.as_mut(), cx)))
+                    .await;
+            match next {
+                Poll::Ready(Ok(n)) if !aborted => assert_eq!(n, 0),
+                Poll::Ready(Err(err)) if aborted => {
+                    assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted)
+                }
+                other => panic!("the end was lost: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
