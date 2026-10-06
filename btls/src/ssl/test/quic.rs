@@ -254,6 +254,16 @@ fn quic_handshake_and_early_data() {
     assert!(c.early_data_accepted() && s.early_data_accepted());
     assert_eq!(c.early_data_reason(), EarlyDataReason::ACCEPTED);
 
+    // A client can turn 0-RTT off for one connection and still resume.
+    let mut c = client(&client_ctx, Some(&latest_session()));
+    c.set_early_data_enabled(false);
+    let mut s = server(&server_ctx, b"context");
+    step(&mut c, &mut s).unwrap();
+    assert!(!c.in_early_data());
+    handshake(&mut c, &mut s);
+    assert!(c.session_reused());
+    assert_eq!(c.early_data_reason(), EarlyDataReason::DISABLED);
+
     // A server under another context rejects 0-RTT, and the handshake goes on without it.
     let mut c = client(&client_ctx, Some(&latest_session()));
     let mut s = server(&server_ctx, b"other context");

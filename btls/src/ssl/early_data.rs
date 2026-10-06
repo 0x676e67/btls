@@ -88,6 +88,12 @@ impl SslContextBuilder {
 }
 
 impl SslRef {
+    /// Overrides [`SslContextBuilder::set_early_data_enabled`] for this connection.
+    #[corresponds(SSL_set_early_data_enabled)]
+    pub fn set_early_data_enabled(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_set_early_data_enabled(self.as_ptr(), enabled.into()) }
+    }
+
     /// Returns whether the handshake is in the early data state, where a client may send early
     /// data and a server may read it.
     #[corresponds(SSL_in_early_data)]

@@ -2290,6 +2290,24 @@ impl SslContextBuilder {
         }
     }
 
+    /// Configures servers to send `ids` as the trust anchors they have certificates for, which
+    /// lets a client whose requested anchors did not match retry with others.
+    ///
+    /// `ids` is a non-empty sequence of non-empty, one-byte length-prefixed trust anchor IDs, in
+    /// decreasing preference. See [`set_requested_trust_anchors`](Self::set_requested_trust_anchors).
+    #[corresponds(SSL_CTX_set1_available_trust_anchors)]
+    pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set1_available_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Sets the context's info callback.
     #[corresponds(SSL_CTX_set_info_callback)]
     pub fn set_info_callback<F>(&mut self, callback: F)
@@ -4410,6 +4428,52 @@ impl SslRef {
                 ids.len(),
             ))
             .map(|_| ())
+        }
+    }
+
+    /// Overrides [`SslContextBuilder::set_available_trust_anchors`] for this connection.
+    #[corresponds(SSL_set1_available_trust_anchors)]
+    pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
+        unsafe {
+            cvt_0i(ffi::SSL_set1_available_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Returns whether the server reported that its certificate chain matched one of the trust
+    /// anchors this client requested, so verification may treat the chain as a built path.
+    ///
+    /// Only known during the handshake, such as in a certificate verification callback.
+    #[corresponds(SSL_peer_matched_trust_anchor)]
+    #[must_use]
+    pub fn peer_matched_trust_anchor(&self) -> bool {
+        unsafe { ffi::SSL_peer_matched_trust_anchor(self.as_ptr()) == 1 }
+    }
+
+    /// Returns the trust anchor IDs the server has certificates for, in the format of
+    /// [`SslContextBuilder::set_requested_trust_anchors`], or an empty slice if it sent none.
+    ///
+    /// Only known during the handshake, such as in a certificate verification callback, where a
+    /// client that rejects the certificate can choose anchors to request when it retries.
+    #[corresponds(SSL_get0_peer_available_trust_anchors)]
+    #[must_use]
+    pub fn peer_available_trust_anchors(&self) -> &[u8] {
+        let mut data = ptr::null();
+        let mut len = 0;
+        // SAFETY: `self` is valid. BoringSSL keeps the list until the handshake moves on, which
+        // the shared borrow of `self` prevents.
+        unsafe {
+            ffi::SSL_get0_peer_available_trust_anchors(self.as_ptr(), &mut data, &mut len);
+            if data.is_null() {
+                &[]
+            } else {
+                slice::from_raw_parts(data, len)
+            }
         }
     }
 
