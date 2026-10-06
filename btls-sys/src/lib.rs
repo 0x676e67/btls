@@ -17,6 +17,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
+    clippy::manual_div_ceil,
     clippy::ptr_offset_with_cast,
     clippy::useless_transmute,
     dead_code,
@@ -36,6 +37,8 @@ pub use generated::{FIPS_mode, SSL_CTX_set_compliance_policy}; // your include p
 pub use generated::{MLKEM768_encap, MLKEM768_private_key_from_seed}; // your include path is incorrect or has a version of boringssl without mlkem support
 #[cfg(feature = "rpk")]
 pub use generated::{SSL_CREDENTIAL_new_raw_public_key_empty, SSL_CREDENTIAL_set1_spki}; // your include path is incorrect or has a version of boringssl without rpk support
+#[cfg(not(feature = "fips"))]
+pub use generated::{SSL_seal_app_data, SSL_seal_app_data_limits}; // your include path is incorrect or has a version of boringssl without patch 0012 (seal-app-data)
 
 pub use generated::*;
 #[cfg(target_pointer_width = "64")]

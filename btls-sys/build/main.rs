@@ -543,6 +543,8 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
             "0009-boringssl-zstd-cert-compression.patch",
             "0010-boringssl-build-compat.patch",
             "0011-boringssl-prefix-struct-tags.patch",
+            "0012-boringssl-seal-app-data.patch",
+            "0013-boringssl-cheap-error-reset.patch",
         ] {
             println!("cargo:warning=applying {patch_name} to boringssl");
             apply_patch(config, patch_name)?;
@@ -878,6 +880,12 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         .merge_extern_blocks(true)
         .prepend_enum_name(true)
         .blocklist_type("max_align_t") // Not supported by bindgen on all targets, not used by BoringSSL
+        // The C allocator functions are clang builtins, and libclang reports
+        // them without the `size_t` typedef, so bindgen emits `c_ulong` instead
+        // of `usize` (https://github.com/rust-lang/rust-bindgen/issues/1770).
+        // Rust 1.99 flags such declarations of runtime symbols
+        // (`suspicious_runtime_symbol_definitions`). Use `libc` for these.
+        .blocklist_function("malloc|calloc|realloc|free")
         .clang_args(get_extra_clang_args_for_bindgen(config))
         .clang_arg("-I")
         .clang_arg(include_path.display().to_string());
@@ -963,7 +971,7 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
     let bindings = builder.generate()?;
     let mut source_code = Vec::new();
     bindings
-        .write(Box::new(&mut source_code))
+        .write(&mut source_code)
         .map_err(|e| format!("Couldn't serialize bindings: {e}"))?;
     ensure_err_lib_enum_is_named(&mut source_code);
     let bindings_path = config.out_dir.join("bindings.rs");
