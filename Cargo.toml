@@ -4,7 +4,6 @@ members = [
     "btls-sys",
     "tokio-btls",
     "tokio-btls/bench",
-    "compio-btls",
 ]
 default-members = [
     "btls",
@@ -41,8 +40,6 @@ libc = "0.2.185"
 hex = "0.4"
 futures = "0.3"
 tokio = "1.52.1"
-compio = "0.19.2"
-anyhow = "1"
 openssl-macros = "0.1.1"
 
 # Benchmarks only (tokio-btls/bench).
