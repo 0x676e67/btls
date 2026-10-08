@@ -3,6 +3,7 @@ members = [
     "btls",
     "btls-sys",
     "tokio-btls",
+    "tokio-btls/bench",
     "compio-btls",
 ]
 default-members = [
@@ -43,3 +44,14 @@ tokio = "1.52.1"
 compio = "0.19.2"
 anyhow = "1"
 openssl-macros = "0.1.1"
+
+# Benchmarks only (tokio-btls/bench).
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
+cpu-time = "1.0.0"
+criterion = "0.8.2"
+sysinfo = { version = "0.39.6", default-features = false }
+tikv-jemallocator = { version = "0.7.0", default-features = false }
+tokio-rustls = { version = "0.26.6", default-features = false }
+
+[profile.bench]
+codegen-units = 1
