@@ -24,21 +24,21 @@ limitations under the License.
  gen/sources.json                 |    4 +-
  gen/sources.mk                   |    2 +
  include/openssl/prefix_symbols.h |    4 +
- include/openssl/ssl.h            |   24 +
+ include/openssl/ssl.h            |   27 +
  include/openssl/tls1.h           |    3 +
  ssl/extensions.cc                |   17 +
  ssl/handoff.cc                   |    6 +-
  ssl/handshake_client.cc          |    1 +
  ssl/internal.h                   |   71 ++
  ssl/record_size_limit.cc         |  374 ++++++++
- ssl/record_size_limit_test.cc    | 1401 ++++++++++++++++++++++++++++++
+ ssl/record_size_limit_test.cc    | 1458 ++++++++++++++++++++++++++++++
  ssl/s3_both.cc                   |    7 +-
  ssl/s3_pkt.cc                    |   12 +-
  ssl/ssl_lib.cc                   |    1 +
  ssl/tls13_server.cc              |   13 +-
  ssl/tls_method.cc                |    2 +
  ssl/tls_record.cc                |   17 +-
- 21 files changed, 1955 insertions(+), 12 deletions(-)
+ 21 files changed, 2015 insertions(+), 12 deletions(-)
  create mode 100644 ssl/record_size_limit.cc
  create mode 100644 ssl/record_size_limit_test.cc
 
@@ -206,22 +206,25 @@ index 79df39104..7377e32a8 100644
  #define SSL_set_resumption_across_names_enabled BORINGSSL_ADD_PREFIX(SSL_set_resumption_across_names_enabled)
  #define SSL_set_retain_only_sha256_of_client_certs BORINGSSL_ADD_PREFIX(SSL_set_retain_only_sha256_of_client_certs)
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 56761fa33..cee1cb7fe 100644
+index 56761fa33..656c7393f 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5655,6 +5655,30 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+@@ -5655,6 +5655,33 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  OPENSSL_EXPORT int SSL_CTX_set_extension_order(SSL_CTX *ctx,
                                                 const uint16_t *ids, int num);
  
 +// SSL_set_record_size_limit configures the maximum protected-record plaintext
-+// that |ssl| is willing to receive and advertises it with RFC 8449. Zero
-+// disables the extension. Values below 64 and above the protocol maximum
-+// (2^14 + 1 in TLS 1.3, which counts the content type, and 2^14 in TLS 1.2) are
-+// clamped when advertised, so 2^14 + 1 advertises no restriction. The default
-+// is zero to preserve existing ClientHello behavior. The value is fixed once
-+// the client builds its first ClientHello or the server parses one, so a server
-+// may still set it from |SSL_CTX_set_select_certificate_cb|; the servername
-+// callback and |SSL_set_SSL_CTX| are too late. Later calls apply to a future
++// that |ssl| is willing to receive and advertises it with RFC 8449. The limit
++// applies only when the peer negotiates the extension. Zero disables the
++// extension. Values below 64 and above the protocol maximum (2^14 + 1 in TLS
++// 1.3, which counts the content type, and 2^14 in TLS 1.2 and earlier) are
++// clamped when advertised, so 2^14 + 1 advertises no restriction. GnuTLS peers
++// by default reject values below 512: their clients abort the handshake and
++// their servers ignore the limit. The default is zero to preserve existing
++// ClientHello behavior. The value is fixed once the client builds its first
++// ClientHello or the server parses one, so a server may still set it from
++// |SSL_CTX_set_select_certificate_cb|. The servername callback is too late, and
++// |SSL_set_SSL_CTX| does not copy the limit. Later calls apply to a future
 +// handshake. This is supported for stream TLS and QUIC, not DTLS or split
 +// handshakes. QUIC negotiates the extension but has no TLS records for the
 +// limit to bound.
@@ -831,10 +834,10 @@ index 000000000..e6190e406
 +}
 diff --git a/ssl/record_size_limit_test.cc b/ssl/record_size_limit_test.cc
 new file mode 100644
-index 000000000..5dc227b7f
+index 000000000..46120ef31
 --- /dev/null
 +++ b/ssl/record_size_limit_test.cc
-@@ -0,0 +1,1401 @@
+@@ -0,0 +1,1458 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1652,6 +1655,63 @@ index 000000000..5dc227b7f
 +  EXPECT_EQ(client_state->write_record_size_limit, 96);
 +  EXPECT_EQ(server_state->read_record_size_limit, 96);
 +  EXPECT_EQ(server_state->write_record_size_limit, 64);
++}
++
++TEST(RecordSizeLimitTest, Tls12RenegotiationKeepsLimitsUntilNewKeys) {
++  // RFC 8449, section 4: records follow the limits of the handshake that
++  // produced their keys, so a renegotiated limit waits for each direction's
++  // ChangeCipherSpec.
++  UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_2_VERSION);
++  UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_2_VERSION);
++  ASSERT_TRUE(client_ctx);
++  ASSERT_TRUE(server_ctx);
++  SSL_CTX_set_record_size_limit(client_ctx.get(), 100);
++  SSL_CTX_set_record_size_limit(server_ctx.get(), 100);
++  UniquePtr<SSL> client, server;
++  ASSERT_TRUE(CreatePair(&client, &server, client_ctx.get(), server_ctx.get()));
++  ASSERT_TRUE(CompleteHandshakes(client.get(), server.get()));
++  SSLImpl *client_impl = FromOpaque(client.get());
++  SSL3_STATE *state = client_impl->s3;
++  EXPECT_EQ(state->read_record_size_limit, 100);
++  EXPECT_EQ(state->write_record_size_limit, 100);
++
++  // A renegotiation ServerHello carries a new value.
++  SSL_set_record_size_limit(client.get(), 300);
++  {
++    SSL_HANDSHAKE hs(client_impl);
++    hs.config = client_impl->config.get();
++    ssl_record_size_limit_snapshot_config(&hs);
++    const uint8_t body[] = {0x00, 0xc8};
++    CBS contents(body);
++    uint8_t alert = 0;
++    ASSERT_TRUE(record_size_limit_parse_serverhello(&hs, &alert, &contents));
++  }
++  EXPECT_EQ(state->read_record_size_limit, 100);
++  EXPECT_EQ(state->write_record_size_limit, 100);
++  EXPECT_EQ(state->pending_read_record_size_limit, 300);
++  EXPECT_EQ(state->pending_write_record_size_limit, 200);
++  ssl_record_size_limit_set_write_state(client_impl,
++                                        ssl_encryption_application);
++  EXPECT_EQ(state->write_record_size_limit, 200);
++  EXPECT_EQ(state->read_record_size_limit, 100);
++  ssl_record_size_limit_set_read_state(client_impl, ssl_encryption_application);
++  EXPECT_EQ(state->read_record_size_limit, 300);
++
++  // A later renegotiation omits the extension, which removes both limits.
++  {
++    SSL_HANDSHAKE hs(client_impl);
++    hs.config = client_impl->config.get();
++    ssl_record_size_limit_snapshot_config(&hs);
++    uint8_t alert = 0;
++    ASSERT_TRUE(record_size_limit_parse_serverhello(&hs, &alert, nullptr));
++  }
++  EXPECT_EQ(state->read_record_size_limit, 300);
++  EXPECT_EQ(state->write_record_size_limit, 200);
++  ssl_record_size_limit_set_write_state(client_impl,
++                                        ssl_encryption_application);
++  ssl_record_size_limit_set_read_state(client_impl, ssl_encryption_application);
++  EXPECT_EQ(state->read_record_size_limit, 0);
++  EXPECT_EQ(state->write_record_size_limit, 0);
 +}
 +
 +TEST(RecordSizeLimitTest, AllowsOversizedFirstTls13RecordWithoutNegotiation) {

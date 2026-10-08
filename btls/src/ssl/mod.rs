@@ -2103,13 +2103,15 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_sigalgs_enabled(self.as_ptr(), enabled as _) }
     }
 
-    /// Sets the largest protected-record plaintext this endpoint accepts and
-    /// advertises it with the [RFC 8449] `record_size_limit` extension.
+    /// Advertises, with the [RFC 8449] `record_size_limit` extension, the largest
+    /// protected-record plaintext this endpoint accepts. The limit applies only
+    /// when the peer negotiates the extension.
     ///
     /// Zero, the default, disables the extension. Other values are clamped to
     /// 64..=16385 in TLS 1.3, where the limit counts the content type, and to
-    /// 64..=16384 in TLS 1.2, so 16385 advertises no restriction. The peer's
-    /// value bounds the records this endpoint sends. DTLS ignores the setting.
+    /// 64..=16384 in TLS 1.2 and earlier, so 16385 advertises no restriction.
+    /// GnuTLS peers reject values below 512 by default. The peer's value bounds
+    /// the records this endpoint sends. DTLS ignores the setting.
     ///
     /// 0-RTT records may use the protocol maximum, because they precede the
     /// server's limit. When the client offers the extension, a server whose
@@ -3355,8 +3357,9 @@ impl SslRef {
     /// Sets the [RFC 8449] record size limit for this connection only.
     ///
     /// See [`SslContextBuilder::set_record_size_limit`]. A server may still call
-    /// this from [`SslContextBuilder::set_select_certificate_callback`]; the
-    /// servername callback and [`SslRef::set_ssl_context`] are too late.
+    /// this from [`SslContextBuilder::set_select_certificate_callback`]. The
+    /// servername callback is too late, and [`SslRef::set_ssl_context`] does not
+    /// change the limit.
     ///
     /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]
