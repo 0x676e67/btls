@@ -215,7 +215,7 @@ diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
      if (is_early_data_write) {
        SSL_HANDSHAKE *hs = ssl->s3->hs.get();
        if (hs->early_data_written >= hs->early_session->ticket_max_early_data) {
-@@ -104,6 +104,152 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
+@@ -112,6 +112,152 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
    }
  }
  
