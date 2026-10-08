@@ -19,8 +19,8 @@ use crate::pkey::{PKey, Private};
 use crate::rsa::{Padding, Rsa};
 use crate::sign::{RsaPssSaltlen, Signer};
 use crate::ssl::{
-    Ssl, SslContext, SslContextBuilder, SslMethod, SslSessionCacheMode, SslSignatureAlgorithm,
-    SslVerifyMode, SslVersion,
+    ExtensionType, Ssl, SslContext, SslContextBuilder, SslMethod, SslSessionCacheMode,
+    SslSignatureAlgorithm, SslVerifyMode, SslVersion,
 };
 use crate::x509::extension::KeyUsage;
 use crate::x509::{X509Extension, X509NameBuilder, X509};
@@ -287,10 +287,12 @@ fn assert_delegated_credential_handshake(
 
 // This exercises negotiation added by 0006-delegated-credentials.patch, not
 // an upstream BoringSSL client capability. It also keeps the normal signature
-// list distinct from the delegated credential's CertificateVerify algorithm.
+// list distinct from the delegated credential's CertificateVerify algorithm,
+// and checks that a rejected empty list keeps the configured one.
 #[test]
 fn patch_delegated_credential_is_verified_and_used() {
-    let (client_context, server_context) = delegated_credential_contexts();
+    let (mut client_context, server_context) = delegated_credential_contexts();
+    assert!(client_context.set_delegated_credentials("").is_err());
     assert_delegated_credential_handshake(client_context, server_context);
 }
 
@@ -312,13 +314,6 @@ fn patch_delegated_credential_rejects_invalid_algorithm_lists() {
         let error = context.set_delegated_credentials(algorithms).unwrap_err();
         assert!(!error.errors().is_empty(), "input: {algorithms:?}");
     }
-}
-
-#[test]
-fn patch_delegated_credential_empty_list_does_not_disable_support() {
-    let (mut client_context, server_context) = delegated_credential_contexts();
-    assert!(client_context.set_delegated_credentials("").is_err());
-    assert_delegated_credential_handshake(client_context, server_context);
 }
 
 // The public query describes authentication in this handshake, not the
@@ -382,8 +377,23 @@ fn patch_delegated_credential_usage_is_false_on_resumption() {
 
 #[test]
 fn patch_delegated_credential_is_disabled_by_default() {
-    let server = super::server::Server::builder().build();
+    // A default client must not offer the extension at all.
+    let offered = Arc::new(Mutex::new(None));
+    let mut server = super::server::Server::builder();
+    server.ctx().set_select_certificate_callback({
+        let offered = offered.clone();
+        move |client_hello| {
+            *offered.lock().unwrap() = Some(
+                client_hello
+                    .get_extension(ExtensionType::DELEGATED_CREDENTIAL)
+                    .is_some(),
+            );
+            Ok(())
+        }
+    });
+    let server = server.build();
     let stream = server.client().connect();
+    assert_eq!(*offered.lock().unwrap(), Some(false));
     assert!(!stream.ssl().used_delegated_credential());
 }
 

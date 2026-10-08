@@ -2127,9 +2127,10 @@ impl SslContextBuilder {
     ///
     /// The list only covers the delegated key; the signature over the
     /// credential follows the normal signature algorithm list. Support is off
-    /// by default and applies to (D)TLS 1.3 clients. RSA delegated keys are
-    /// rejected because BoringSSL lacks the `rsa_pss_pss_*` schemes. Servers
-    /// may still answer with a plain certificate; see
+    /// by default and applies to (D)TLS 1.3 clients. `rsa_pss_rsae_*` and
+    /// `ecdsa_sha1` may be listed, but credentials using them are rejected, as
+    /// RFC 9345 and TLS 1.3 forbid them; `rsa_pss_pss_*` is not supported.
+    /// Servers may still answer with a plain certificate; see
     /// [`SslRef::used_delegated_credential`].
     ///
     /// # Errors
