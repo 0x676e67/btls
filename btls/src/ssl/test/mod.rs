@@ -75,6 +75,21 @@ fn zero_length_buffers() {
 }
 
 #[test]
+#[cfg(feature = "fips")]
+fn seal_app_data_is_unavailable_in_fips() {
+    let server = Server::builder().build();
+
+    let mut s = server.client().connect();
+    assert_eq!(s.ssl().seal_app_data_limits(), None);
+    let mut out = [mem::MaybeUninit::uninit(); 64];
+    assert!(matches!(
+        s.ssl_mut()
+            .seal_app_data(&[io::IoSlice::new(b"x")], 1, &mut out),
+        Ok(None)
+    ));
+}
+
+#[test]
 fn peer_certificate() {
     let server = Server::builder().build();
 
