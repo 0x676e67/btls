@@ -112,8 +112,10 @@ pub use self::connector::{
 };
 #[cfg(feature = "credential")]
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
+pub use self::early_data::EarlyDataReason;
 pub use self::ech::SslEchKeysRef;
 pub use self::error::{Error, ErrorCode, HandshakeError};
+pub use self::quic::{QuicEncryptionLevel, QuicMethod, QuicMethodError};
 
 mod async_callbacks;
 mod bio;
@@ -121,9 +123,11 @@ mod callbacks;
 mod connector;
 #[cfg(feature = "credential")]
 mod credential;
+mod early_data;
 mod ech;
 mod error;
 mod mut_only;
+mod quic;
 #[cfg(test)]
 mod test;
 
@@ -550,6 +554,23 @@ impl SslAlert {
     pub const UNKNOWN_PSK_IDENTITY: Self = Self(ffi::SSL_AD_UNKNOWN_PSK_IDENTITY);
     pub const CERTIFICATE_REQUIRED: Self = Self(ffi::SSL_AD_CERTIFICATE_REQUIRED);
     pub const NO_APPLICATION_PROTOCOL: Self = Self(ffi::SSL_AD_NO_APPLICATION_PROTOCOL);
+
+    /// Returns the alert's description code.
+    #[must_use]
+    pub fn as_raw(&self) -> c_int {
+        self.0
+    }
+
+    /// Returns a readable name of the alert, or "unknown".
+    #[corresponds(SSL_alert_desc_string_long)]
+    #[must_use]
+    pub fn description(&self) -> &'static str {
+        unsafe {
+            CStr::from_ptr(ffi::SSL_alert_desc_string_long(self.0))
+                .to_str()
+                .unwrap_or("unknown")
+        }
+    }
 }
 
 /// An error returned from an ALPN selection callback.
@@ -925,6 +946,9 @@ impl SslInfoCallbackMode {
     /// Signaled when a handshake progresses to a new state.
     pub const ACCEPT_LOOP: Self = Self(ffi::SSL_CB_ACCEPT_LOOP);
 
+    /// Signaled when a client-side handshake progresses to a new state.
+    pub const CONNECT_LOOP: Self = Self(ffi::SSL_CB_CONNECT_LOOP);
+
     /// Signaled when the current iteration of the server-side handshake state machine completes.
     pub const ACCEPT_EXIT: Self = Self(ffi::SSL_CB_ACCEPT_EXIT);
 
@@ -1131,6 +1155,16 @@ impl SslContextBuilder {
         unsafe {
             ffi::SSL_CTX_set_verify(self.as_ptr(), c_int::from(mode.bits()), None);
         }
+    }
+
+    /// Returns the verify mode set by [`Self::set_verify`] or one of the verify callbacks.
+    ///
+    /// An explicit [`SslVerifyMode::NONE`] reads the same as the default. Panics if the context
+    /// is not configured for X.509 certificates.
+    #[corresponds(SSL_CTX_get_verify_mode)]
+    #[must_use]
+    pub fn verify_mode(&self) -> SslVerifyMode {
+        self.ctx.verify_mode()
     }
 
     /// Configures the certificate verification method for new connections and
@@ -2248,6 +2282,24 @@ impl SslContextBuilder {
         // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
         unsafe {
             cvt_0i(ffi::SSL_CTX_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Configures servers to send `ids` as the trust anchors they have certificates for, which
+    /// lets a client whose requested anchors did not match retry with others.
+    ///
+    /// `ids` is a non-empty sequence of non-empty, one-byte length-prefixed trust anchor IDs, in
+    /// decreasing preference. See [`set_requested_trust_anchors`](Self::set_requested_trust_anchors).
+    #[corresponds(SSL_CTX_set1_available_trust_anchors)]
+    pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set1_available_trust_anchors(
                 self.as_ptr(),
                 ids.as_ptr(),
                 ids.len(),
@@ -4376,6 +4428,52 @@ impl SslRef {
                 ids.len(),
             ))
             .map(|_| ())
+        }
+    }
+
+    /// Overrides [`SslContextBuilder::set_available_trust_anchors`] for this connection.
+    #[corresponds(SSL_set1_available_trust_anchors)]
+    pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
+        unsafe {
+            cvt_0i(ffi::SSL_set1_available_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Returns whether the server reported that its certificate chain matched one of the trust
+    /// anchors this client requested, so verification may treat the chain as a built path.
+    ///
+    /// Only known during the handshake, such as in a certificate verification callback.
+    #[corresponds(SSL_peer_matched_trust_anchor)]
+    #[must_use]
+    pub fn peer_matched_trust_anchor(&self) -> bool {
+        unsafe { ffi::SSL_peer_matched_trust_anchor(self.as_ptr()) == 1 }
+    }
+
+    /// Returns the trust anchor IDs the server has certificates for, in the format of
+    /// [`SslContextBuilder::set_requested_trust_anchors`], or an empty slice if it sent none.
+    ///
+    /// Only known during the handshake, such as in a certificate verification callback, where a
+    /// client that rejects the certificate can choose anchors to request when it retries.
+    #[corresponds(SSL_get0_peer_available_trust_anchors)]
+    #[must_use]
+    pub fn peer_available_trust_anchors(&self) -> &[u8] {
+        let mut data = ptr::null();
+        let mut len = 0;
+        // SAFETY: `self` is valid. BoringSSL keeps the list until the handshake moves on, which
+        // the shared borrow of `self` prevents.
+        unsafe {
+            ffi::SSL_get0_peer_available_trust_anchors(self.as_ptr(), &mut data, &mut len);
+            if data.is_null() {
+                &[]
+            } else {
+                slice::from_raw_parts(data, len)
+            }
         }
     }
 

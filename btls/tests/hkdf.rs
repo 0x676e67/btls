@@ -40,6 +40,10 @@ fn assert_vectors(digest: MessageDigest, vectors: &[TestVector]) {
         assert_eq!(prk.as_ref(), expected_prk.as_slice());
         assert_eq!(prk.len(), suite.prk_size());
 
+        let mut prk_into = [0; 64];
+        let len = suite.extract_into(&salt, &ikm, &mut prk_into).unwrap();
+        assert_eq!(&prk_into[..len], expected_prk.as_slice());
+
         let mut okm = vec![0u8; expected_okm.len()];
         suite.expand(prk.as_ref(), &info, &mut okm).unwrap();
         assert_eq!(okm, expected_okm);
@@ -166,6 +170,13 @@ fn empty_inputs_and_zero_output() {
 
     let mut okm = [];
     suite.expand(prk.as_ref(), &[], &mut okm).unwrap();
+}
+
+#[test]
+fn extract_into_rejects_a_short_buffer() {
+    let suite = HkdfSuite::new(MessageDigest::sha256());
+    let mut prk = [0; 31];
+    assert!(suite.extract_into(b"salt", b"ikm", &mut prk).is_err());
 }
 
 #[test]
