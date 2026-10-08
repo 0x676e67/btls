@@ -2129,15 +2129,17 @@ impl SslContextBuilder {
     ///
     /// The list only covers the delegated key; the signature over the
     /// credential follows the normal signature algorithm list. Support is off
-    /// by default and applies to (D)TLS 1.3 clients. `rsa_pss_rsae_*` and
-    /// `ecdsa_sha1` may be listed, but credentials using them are rejected, as
-    /// RFC 9345 and TLS 1.3 forbid them; `rsa_pss_pss_*` is not supported.
+    /// by default and applies to (D)TLS 1.3 clients. Only ECDSA and Ed25519
+    /// delegated keys are usable: `rsa_pss_rsae_*` (forbidden by RFC 9345),
+    /// `rsa_pkcs1_*` and `ecdsa_sha1` (forbidden in TLS 1.3) may be listed, but
+    /// credentials using them are rejected, and `rsa_pss_pss_*` is unsupported.
     /// Servers may still answer with a plain certificate; see
     /// [`SslRef::used_delegated_credential`].
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty list, an unknown name, or an embedded NUL.
+    /// Returns an error for an empty list or element, an unknown name, or an
+    /// embedded NUL.
     ///
     /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
