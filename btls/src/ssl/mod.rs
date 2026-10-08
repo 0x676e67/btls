@@ -2124,7 +2124,24 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
-    /// Sets whether the context should enable delegated credentials.
+    /// Requests and verifies server delegated credentials ([RFC 9345]),
+    /// advertising the given colon-separated signature algorithms in order.
+    ///
+    /// The list only covers the delegated key; the signature over the
+    /// credential follows the normal signature algorithm list. Support is off
+    /// by default and applies to (D)TLS 1.3 clients. Only ECDSA and Ed25519
+    /// delegated keys are usable: `rsa_pss_rsae_*` (forbidden by RFC 9345),
+    /// `rsa_pkcs1_*` and `ecdsa_sha1` (forbidden in TLS 1.3) may be listed, but
+    /// credentials using them are rejected, and `rsa_pss_pss_*` is unsupported.
+    /// Servers may still answer with a plain certificate; see
+    /// [`SslRef::used_delegated_credential`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty list or element, an unknown name, or an
+    /// embedded NUL.
+    ///
+    /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_delegated_credentials)]
     pub fn set_delegated_credentials(&mut self, sigalgs: &str) -> Result<(), ErrorStack> {
@@ -3424,6 +3441,24 @@ impl SslRef {
         } else {
             Some(SslSignatureAlgorithm(sigalg))
         }
+    }
+
+    /// Returns whether the peer authenticated with an [RFC 9345] delegated
+    /// credential in the most recent handshake.
+    ///
+    /// Read this after a successful handshake. The value becomes `true` once
+    /// the credential and the peer's CertificateVerify signature have both
+    /// been validated; it does not by itself indicate handshake completion.
+    ///
+    /// Returns `false` for session resumption, even if the original session
+    /// was authenticated with a delegated credential.
+    ///
+    /// [RFC 9345]: https://www.rfc-editor.org/rfc/rfc9345
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_used_delegated_credential)]
+    #[must_use]
+    pub fn used_delegated_credential(&self) -> bool {
+        unsafe { ffi::SSL_used_delegated_credential(self.as_ptr()) != 0 }
     }
 
     /// Returns the signature algorithm this side used to sign the current TLS handshake,

@@ -121,7 +121,7 @@ diff --git a/ssl/internal.h b/ssl/internal.h
    bool GetIV(const uint8_t **out_iv, size_t *out_iv_len) const;
  
   private:
-@@ -3793,6 +3802,81 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
+@@ -3814,6 +3823,81 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
  int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
                         size_t *out_bytes_written, Span<const uint8_t> in);
  
