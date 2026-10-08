@@ -65,8 +65,8 @@ use std::convert::TryInto;
 use std::ffi::{c_char, c_int, c_uchar, c_uint};
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::io;
 use std::io::prelude::*;
+use std::io::{self, IoSlice};
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
@@ -4072,6 +4072,109 @@ impl SslRef {
         unsafe { cvt(ffi::SSL_set_mtu(self.as_ptr(), mtu as c_uint)) }
     }
 
+    /// Sets the maximum plaintext fragment length for TLS records sent by this connection.
+    ///
+    /// Handshake messages and application data are split into smaller records when needed.
+    /// Values are clamped to `512..=16_384` bytes; the default is `16_384`.
+    /// This is a local sending limit and does not negotiate a record-size limit with the peer.
+    /// DTLS handshake fragmentation is controlled by [`set_mtu`](Self::set_mtu) instead.
+    #[corresponds(SSL_set_max_send_fragment)]
+    pub fn set_max_send_fragment(&mut self, max_send_fragment: usize) -> Result<(), ErrorStack> {
+        // SAFETY: `self` holds a live SSL object; BoringSSL clamps the fragment length.
+        unsafe {
+            cvt(ffi::SSL_set_max_send_fragment(
+                self.as_ptr(),
+                max_send_fragment,
+            ))
+        }
+    }
+
+    /// Returns the limits for sealing application data now, or `None` if writes must go
+    /// through [`SslStream::ssl_write`].
+    ///
+    /// Always `None` in FIPS builds, which lack the BoringSSL patch.
+    #[corresponds(SSL_seal_app_data_limits)]
+    #[must_use]
+    pub fn seal_app_data_limits(&self) -> Option<SealLimits> {
+        #[cfg(not(feature = "fips"))]
+        {
+            let (mut max_fragment, mut record_overhead, mut pending_len) = (0, 0, 0);
+            // SAFETY: `self` is a live `SSL`, and the out-pointers are valid for writes.
+            let ok = unsafe {
+                ffi::SSL_seal_app_data_limits(
+                    self.as_ptr(),
+                    &mut max_fragment,
+                    &mut record_overhead,
+                    &mut pending_len,
+                )
+            };
+            (ok == 1 && max_fragment > 0).then_some(SealLimits {
+                max_fragment,
+                record_overhead,
+                pending_len,
+            })
+        }
+        #[cfg(feature = "fips")]
+        None
+    }
+
+    /// Seals up to `max_in` bytes of `bufs` as application data records at the start of `out`,
+    /// without transport I/O.
+    ///
+    /// Returns `Ok(None)`, changing nothing, when writes must go through
+    /// [`SslStream::ssl_write`] or `out` cannot hold the pending handshake records and the first
+    /// record; [`seal_app_data_limits`](Self::seal_app_data_limits) tells which. Records ignore
+    /// slice boundaries, and a success consumes at least one byte unless `max_in` is 0 or `bufs`
+    /// holds no bytes. The first `written` bytes of `out` must reach the peer before anything the
+    /// connection writes later, including a shutdown or an alert.
+    #[corresponds(SSL_seal_app_data)]
+    pub fn seal_app_data(
+        &mut self,
+        bufs: &[IoSlice<'_>],
+        max_in: usize,
+        out: &mut [MaybeUninit<u8>],
+    ) -> Result<Option<Sealed>, ErrorStack> {
+        #[cfg(not(feature = "fips"))]
+        {
+            use ffi::ssl_seal_app_data_result_t as R;
+
+            let (mut written, mut consumed) = (0, 0);
+            let res = with_ivecs(bufs, max_in, |ivecs| {
+                // SAFETY: `self` is a live `SSL`. `ivecs` describe readable memory borrowed from
+                // `bufs`, and `out` is valid for `out.len()` writes; the two cannot overlap
+                // because `bufs` is borrowed shared while `out` is exclusive.
+                unsafe {
+                    ffi::SSL_seal_app_data(
+                        self.as_ptr(),
+                        out.as_mut_ptr().cast(),
+                        &mut written,
+                        out.len(),
+                        ivecs.as_ptr(),
+                        ivecs.len(),
+                        max_in,
+                        &mut consumed,
+                    )
+                }
+            });
+            match res {
+                R::ssl_seal_app_data_success => {}
+                R::ssl_seal_app_data_declined => return Ok(None),
+                _ => return Err(ErrorStack::get()),
+            }
+            if written > out.len() || consumed > max_in {
+                return Err(ErrorStack::internal_error_str(
+                    "SSL_seal_app_data reported more than it was given",
+                ));
+            }
+            Ok(Some(Sealed { consumed, written }))
+        }
+        #[cfg(feature = "fips")]
+        {
+            let _ = (bufs, max_in, out);
+            Ok(None)
+        }
+    }
+
     /// Sets the certificate.
     #[corresponds(SSL_use_certificate)]
     pub fn set_certificate(&mut self, cert: &X509Ref) -> Result<(), ErrorStack> {
@@ -4394,6 +4497,114 @@ impl SslRef {
     #[must_use]
     pub fn server_sent_requested_padding(&self) -> bool {
         unsafe { ffi::SSL_server_sent_requested_padding(self.as_ptr()) == 1 }
+    }
+}
+
+/// Record limits for [`SslRef::seal_app_data`] in the connection's current state.
+///
+/// Valid until the connection is next used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealLimits {
+    max_fragment: usize,
+    record_overhead: usize,
+    pending_len: usize,
+}
+
+impl SealLimits {
+    /// Most plaintext bytes in one record.
+    #[must_use]
+    pub fn max_fragment(&self) -> usize {
+        self.max_fragment
+    }
+
+    /// Most bytes one record adds to its plaintext.
+    #[must_use]
+    pub fn record_overhead(&self) -> usize {
+        self.record_overhead
+    }
+
+    /// Most bytes of pending handshake records written ahead of the data.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending_len
+    }
+
+    /// Returns the output room needed to seal `len` plaintext bytes, or `None` on overflow.
+    #[must_use]
+    pub fn sealed_len(&self, len: usize) -> Option<usize> {
+        len.div_ceil(self.max_fragment)
+            .checked_mul(self.record_overhead)?
+            .checked_add(len)?
+            .checked_add(self.pending_len)
+    }
+}
+
+/// Input taken and output written by [`SslRef::seal_app_data`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Sealed {
+    /// Plaintext bytes sealed, from the start of the input slices.
+    pub consumed: usize,
+    /// Bytes written to the start of the output, pending handshake records included.
+    pub written: usize,
+}
+
+// std guarantees that `IoSlice` is ABI-compatible with `iovec` on Unix, so it can be read as a
+// `CRYPTO_IVEC` when `iovec` has the same field layout.
+#[cfg(all(unix, not(feature = "fips")))]
+const _: () = assert!(
+    mem::size_of::<IoSlice<'static>>() == mem::size_of::<ffi::CRYPTO_IVEC>()
+        && mem::align_of::<IoSlice<'static>>() == mem::align_of::<ffi::CRYPTO_IVEC>()
+        && mem::offset_of!(libc::iovec, iov_base) == mem::offset_of!(ffi::CRYPTO_IVEC, in_)
+        && mem::offset_of!(libc::iovec, iov_len) == mem::offset_of!(ffi::CRYPTO_IVEC, len)
+);
+
+/// Passes `bufs` to `f` as `CRYPTO_IVEC`s.
+#[cfg(all(unix, not(feature = "fips")))]
+fn with_ivecs<R>(
+    bufs: &[IoSlice<'_>],
+    _max_in: usize,
+    f: impl FnOnce(&[ffi::CRYPTO_IVEC]) -> R,
+) -> R {
+    // SAFETY: the assertion above makes the layouts identical, and the cast slice borrows `bufs`.
+    f(unsafe { slice::from_raw_parts(bufs.as_ptr().cast(), bufs.len()) })
+}
+
+/// Passes the slices of `bufs` that cover `max_in` bytes to `f` as `CRYPTO_IVEC`s.
+#[cfg(all(not(unix), not(feature = "fips")))]
+fn with_ivecs<R>(
+    bufs: &[IoSlice<'_>],
+    max_in: usize,
+    f: impl FnOnce(&[ffi::CRYPTO_IVEC]) -> R,
+) -> R {
+    // `IoSlice` has no `iovec` layout here (a Windows `WSABUF` puts the length first), so copy
+    // the slices: on the stack up to `STACK_LEN`, which covers most writes, else in a `Vec`.
+    const STACK_LEN: usize = 64;
+
+    let mut left = max_in;
+    let n = bufs
+        .iter()
+        .take_while(|buf| {
+            let take = left > 0;
+            left = left.saturating_sub(buf.len());
+            take
+        })
+        .count();
+    let ivecs = bufs[..n].iter().map(|buf| ffi::CRYPTO_IVEC {
+        in_: buf.as_ptr(),
+        len: buf.len(),
+    });
+    if n <= STACK_LEN {
+        let mut stack = [ffi::CRYPTO_IVEC {
+            in_: ptr::null(),
+            len: 0,
+        }; STACK_LEN];
+        for (slot, ivec) in stack.iter_mut().zip(ivecs) {
+            *slot = ivec;
+        }
+        f(&stack[..n])
+    } else {
+        f(&ivecs.collect::<Vec<_>>())
     }
 }
 

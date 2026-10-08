@@ -1,7 +1,8 @@
 #![cfg(not(feature = "fips"))]
 
 use std::ffi::{c_int, c_void, CStr};
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
+use std::mem::MaybeUninit;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::slice;
 use std::sync::{Arc, Mutex};
@@ -12,8 +13,8 @@ use foreign_types::ForeignTypeRef;
 use super::server::Server;
 use crate::ffi;
 use crate::ssl::{
-    ExtensionType, SslConnector, SslContextBuilder, SslMethod, SslOptions, SslSession,
-    SslSessionCacheMode, SslSignatureAlgorithm, SslVersion,
+    with_ivecs, ExtensionType, Sealed, SslConnector, SslContextBuilder, SslMethod, SslOptions,
+    SslRef, SslSession, SslSessionCacheMode, SslSignatureAlgorithm, SslStream, SslVersion,
 };
 
 type RecordHeaders = Arc<Mutex<Vec<[u8; 5]>>>;
@@ -785,4 +786,372 @@ fn boring_pq_can_disable_second_keyshare() {
     }
 
     assert_eq!(entries, 1);
+}
+
+fn payload(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i % 251) as u8 ^ seed.wrapping_mul(97))
+        .collect()
+}
+
+/// Splits `data` into slices of the lengths in `shape`.
+fn slices<'a>(data: &'a [u8], shape: &[usize]) -> Vec<IoSlice<'a>> {
+    let mut start = 0;
+    shape
+        .iter()
+        .map(|&len| {
+            start += len;
+            IoSlice::new(&data[start - len..start])
+        })
+        .collect()
+}
+
+fn write_sequence(ssl: &SslRef) -> u64 {
+    unsafe { ffi::SSL_get_write_sequence(ssl.as_ptr()) }
+}
+
+/// Seals into an `out_len`-byte buffer and returns the written bytes.
+fn seal(
+    ssl: &mut SslRef,
+    bufs: &[IoSlice<'_>],
+    max_in: usize,
+    out_len: usize,
+) -> Option<(Sealed, Vec<u8>)> {
+    let mut out = vec![MaybeUninit::uninit(); out_len];
+    let sealed = ssl.seal_app_data(bufs, max_in, &mut out).unwrap()?;
+    assert!(sealed.written <= out_len);
+    // SAFETY: `seal_app_data` initialized the first `written` bytes.
+    let written = out[..sealed.written]
+        .iter()
+        .map(|byte| unsafe { byte.assume_init() })
+        .collect();
+    Some((sealed, written))
+}
+
+/// Returns the body length of each TLS 1.2 or 1.3 application data record in `out`.
+fn app_data_records(mut out: &[u8]) -> Vec<usize> {
+    let mut lens = Vec::new();
+    while !out.is_empty() {
+        assert!(out.len() >= 5, "truncated record header");
+        assert_eq!(out[0], 23, "not an application data record");
+        assert_eq!(out[1..3], [3, 3], "unexpected record version");
+        let len = usize::from(u16::from_be_bytes([out[3], out[4]]));
+        assert!(out.len() >= 5 + len, "truncated record body");
+        lens.push(len);
+        out = &out[5 + len..];
+    }
+    lens
+}
+
+/// Checks `out` holds `consumed` bytes in full records, then sends it raw.
+fn check_and_send(stream: &mut SslStream<TcpStream>, consumed: usize, out: &[u8]) {
+    let limits = stream.ssl().seal_app_data_limits().unwrap();
+    let records = app_data_records(out);
+    assert_eq!(records.len(), consumed.div_ceil(limits.max_fragment()));
+    let (last, full) = records.split_last().unwrap();
+    assert!(
+        full.iter().all(|&len| len == records[0] && *last <= len),
+        "{records:?}"
+    );
+    assert!(records
+        .iter()
+        .all(|&len| len + 5 <= limits.max_fragment() + limits.record_overhead()));
+    stream.get_mut().write_all(out).unwrap();
+}
+
+#[test]
+fn seal_app_data_round_trip() {
+    // (version, cipher list, AES hardware, negotiated suite). The CBC suite is restored by
+    // 0002-boringssl-legacy-ciphers.patch.
+    let suites = [
+        (
+            SslVersion::TLS1_2,
+            "ECDHE-RSA-AES128-GCM-SHA256",
+            true,
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        ),
+        (
+            SslVersion::TLS1_2,
+            "ECDHE-RSA-CHACHA20-POLY1305",
+            true,
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        ),
+        (
+            SslVersion::TLS1_2,
+            "ECDHE-RSA-AES256-SHA384",
+            true,
+            "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
+        ),
+        (SslVersion::TLS1_3, "", true, "TLS_AES_128_GCM_SHA256"),
+        (
+            SslVersion::TLS1_3,
+            "",
+            false,
+            "TLS_CHACHA20_POLY1305_SHA256",
+        ),
+    ];
+    // 1×100, 512×32, 4×(9 + 16 KiB) and 100 uneven slices, the first one empty. More than 64
+    // slices takes the `Vec` conversion on Windows.
+    let shapes: [Vec<usize>; 4] = [
+        vec![100],
+        vec![32; 512],
+        vec![9 + 16384; 4],
+        (0..100).map(|i| i * 211 % 1000).collect(),
+    ];
+    let datas: Vec<Vec<u8>> = shapes
+        .iter()
+        .enumerate()
+        .map(|(seed, shape)| payload(shape.iter().sum(), seed as u8))
+        .collect();
+    // Each shape is sealed in one call, then the last one again `max_in` bytes at a time.
+    let mut expected: Vec<u8> = datas.concat();
+    expected.extend_from_slice(datas.last().unwrap());
+
+    for (version, cipher_list, aes_hw, suite) in suites {
+        let mut server = Server::builder();
+        server.ctx().set_min_proto_version(Some(version)).unwrap();
+        server.ctx().set_max_proto_version(Some(version)).unwrap();
+        server.ctx().set_aes_hw_override(aes_hw);
+        if !cipher_list.is_empty() {
+            server.ctx().set_cipher_list(cipher_list).unwrap();
+        }
+        server.io_cb({
+            let expected = expected.clone();
+            move |mut stream| {
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).unwrap();
+                assert!(received == expected, "{suite}: corrupted data");
+            }
+        });
+        let server = server.build();
+
+        let mut client = server.client_with_root_ca();
+        client.ctx().set_min_proto_version(Some(version)).unwrap();
+        client.ctx().set_max_proto_version(Some(version)).unwrap();
+        client.ctx().set_aes_hw_override(true);
+        if !cipher_list.is_empty() {
+            client.ctx().set_cipher_list(cipher_list).unwrap();
+        }
+        let mut stream = client.connect();
+        let cipher = stream.ssl().current_cipher().unwrap();
+        assert_eq!(cipher.standard_name(), Some(suite));
+
+        for (shape, data) in shapes.iter().zip(&datas) {
+            let bufs = slices(data, shape);
+            let limits = stream.ssl().seal_app_data_limits().unwrap();
+            assert_eq!(limits.pending_len(), 0, "{suite}");
+            let before = write_sequence(stream.ssl());
+            let out_len = limits.sealed_len(data.len()).unwrap();
+            let (sealed, out) = seal(stream.ssl_mut(), &bufs, usize::MAX, out_len).unwrap();
+            assert_eq!(sealed.consumed, data.len(), "{suite}");
+            check_and_send(&mut stream, sealed.consumed, &out);
+            let records = data.len().div_ceil(limits.max_fragment()) as u64;
+            assert_eq!(write_sequence(stream.ssl()), before + records, "{suite}");
+        }
+
+        // `max_in` stops mid-slice; the rest of the slices follow in later calls.
+        let data = datas.last().unwrap();
+        let mut bufs = slices(data, shapes.last().unwrap());
+        let mut bufs = &mut bufs[..];
+        let mut left = data.len();
+        while left > 0 {
+            let limits = stream.ssl().seal_app_data_limits().unwrap();
+            let max_in = 5000;
+            let out_len = limits.sealed_len(max_in).unwrap();
+            let (sealed, out) = seal(stream.ssl_mut(), bufs, max_in, out_len).unwrap();
+            assert_eq!(sealed.consumed, left.min(max_in), "{suite}");
+            check_and_send(&mut stream, sealed.consumed, &out);
+            IoSlice::advance_slices(&mut bufs, sealed.consumed);
+            left -= sealed.consumed;
+        }
+        stream.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn seal_app_data_honors_peer_record_size_limit() {
+    // 0012 seals records itself, so it must take the fragment that 0005 derives
+    // from the peer's record_size_limit. The TLS 1.3 limit counts the content type.
+    let data = payload(5000, 3);
+    for (version, fragment) in [(SslVersion::TLS1_2, 1000), (SslVersion::TLS1_3, 999)] {
+        let mut server = Server::builder();
+        server.ctx().set_min_proto_version(Some(version)).unwrap();
+        server.ctx().set_max_proto_version(Some(version)).unwrap();
+        server.ctx().set_record_size_limit(1000);
+        server.io_cb({
+            let data = data.clone();
+            move |mut stream| {
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).unwrap();
+                assert!(received == data, "{version:?}: corrupted data");
+            }
+        });
+        let server = server.build();
+
+        let mut client = server.client_with_root_ca();
+        client.ctx().set_min_proto_version(Some(version)).unwrap();
+        client.ctx().set_max_proto_version(Some(version)).unwrap();
+        client.ctx().set_record_size_limit(16385);
+        let mut stream = client.connect();
+        let limits = stream.ssl().seal_app_data_limits().unwrap();
+        assert_eq!(limits.max_fragment(), fragment, "{version:?}");
+        let out_len = limits.sealed_len(data.len()).unwrap();
+        let bufs = [IoSlice::new(&data)];
+        let (sealed, out) = seal(stream.ssl_mut(), &bufs, usize::MAX, out_len).unwrap();
+        assert_eq!(sealed.consumed, data.len(), "{version:?}");
+        check_and_send(&mut stream, sealed.consumed, &out);
+        stream.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn seal_app_data_sends_key_update_first() {
+    let data = payload(20000, 1);
+    let mut server = Server::builder();
+    server
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    server.io_cb({
+        let data = data.clone();
+        move |mut stream| {
+            let mut received = vec![0; data.len()];
+            stream.read_exact(&mut received).unwrap();
+            assert!(received == data, "corrupted data");
+            stream.write_all(b"reply").unwrap();
+            stream.read_to_end(&mut received).unwrap();
+        }
+    });
+    let server = server.build();
+    let mut stream = server.client_with_root_ca().connect();
+
+    assert_eq!(
+        unsafe { ffi::SSL_key_update(stream.ssl().as_ptr(), ffi::SSL_KEY_UPDATE_REQUESTED) },
+        1
+    );
+    let limits = stream.ssl().seal_app_data_limits().unwrap();
+    assert!(limits.pending_len() > 0);
+    let out_len = limits.sealed_len(data.len()).unwrap();
+    let (sealed, out) = seal(
+        stream.ssl_mut(),
+        &[IoSlice::new(&data)],
+        usize::MAX,
+        out_len,
+    )
+    .unwrap();
+    assert_eq!(sealed.consumed, data.len());
+
+    // The KeyUpdate goes first, under the old key; the data starts the new key at sequence 0.
+    let records = app_data_records(&out);
+    assert!(records[0] + 5 <= limits.pending_len());
+    assert_eq!(records.len(), 1 + 2);
+    assert_eq!(write_sequence(stream.ssl()), 2);
+    assert_eq!(
+        stream.ssl().seal_app_data_limits().unwrap().pending_len(),
+        0
+    );
+    stream.get_mut().write_all(&out).unwrap();
+
+    // The reply follows the server's own KeyUpdate.
+    let mut reply = [0; 5];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"reply");
+    stream.shutdown().unwrap();
+}
+
+#[test]
+fn seal_app_data_limits_follow_state() {
+    const FRAGMENT: usize = 16384;
+    let data = payload(3 * FRAGMENT + 2001, 2);
+    let mut server = Server::builder();
+    server.io_cb({
+        let data = data.clone();
+        move |mut stream| {
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).unwrap();
+            assert!(received == data, "corrupted data");
+        }
+    });
+    let server = server.build();
+    let mut client = server.client_with_root_ca().build().builder();
+    let mut scratch = [MaybeUninit::uninit(); 64];
+    assert_eq!(client.ssl().seal_app_data_limits(), None);
+    assert!(matches!(
+        client
+            .ssl()
+            .seal_app_data(&[IoSlice::new(b"x")], 1, &mut scratch),
+        Ok(None)
+    ));
+
+    let mut stream = client.connect();
+    assert_eq!(stream.ssl().version2(), Some(SslVersion::TLS1_3));
+    let limits = stream.ssl().seal_app_data_limits().unwrap();
+    assert_eq!(limits.max_fragment(), FRAGMENT);
+    assert_eq!(limits.pending_len(), 0);
+    assert_eq!(limits.sealed_len(0), Some(0));
+    assert_eq!(limits.sealed_len(usize::MAX), None);
+
+    // One byte short of the first record declines and changes nothing.
+    let before = write_sequence(stream.ssl());
+    let short = limits.sealed_len(100).unwrap() - 1;
+    assert!(seal(stream.ssl_mut(), &[IoSlice::new(&data[..100])], 100, short).is_none());
+    assert_eq!(write_sequence(stream.ssl()), before);
+
+    // An exact fit for three records seals three, though more input is offered.
+    let out_len = limits.sealed_len(3 * FRAGMENT).unwrap();
+    let (sealed, out) = seal(
+        stream.ssl_mut(),
+        &[IoSlice::new(&data)],
+        usize::MAX,
+        out_len,
+    )
+    .unwrap();
+    assert_eq!(sealed.consumed, 3 * FRAGMENT);
+    assert_eq!(sealed.written, out_len);
+    check_and_send(&mut stream, sealed.consumed, &out);
+
+    stream.ssl_mut().set_max_send_fragment(512).unwrap();
+    let limits = stream.ssl().seal_app_data_limits().unwrap();
+    assert_eq!(limits.max_fragment(), 512);
+    let rest = &data[3 * FRAGMENT..];
+    let out_len = limits.sealed_len(rest.len()).unwrap();
+    let (sealed, out) = seal(stream.ssl_mut(), &[IoSlice::new(rest)], usize::MAX, out_len).unwrap();
+    assert_eq!(sealed.consumed, rest.len());
+    let records = app_data_records(&out);
+    let overhead = records[0] - 512;
+    assert_eq!(records, [512, 512, 512, 465].map(|len| len + overhead));
+    check_and_send(&mut stream, sealed.consumed, &out);
+
+    stream.shutdown().unwrap();
+    assert_eq!(stream.ssl().seal_app_data_limits(), None);
+    assert!(matches!(
+        stream
+            .ssl_mut()
+            .seal_app_data(&[IoSlice::new(b"x")], 1, &mut scratch),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn io_slice_matches_crypto_ivec() {
+    let data = payload(1000, 3);
+    let bufs: Vec<_> = (0..100)
+        .map(|i| IoSlice::new(&data[i..i + i % 7]))
+        .chain([IoSlice::new(&[])])
+        .collect();
+    let total: usize = bufs.iter().map(|buf| buf.len()).sum();
+    let half: usize = bufs[..50].iter().map(|buf| buf.len()).sum();
+    // Unix passes every slice; other targets convert only the slices that cover `max_in`.
+    for max_in in [usize::MAX, half, 0] {
+        with_ivecs(&bufs, max_in, |ivecs| {
+            assert!(ivecs.len() <= bufs.len());
+            let mut covered = 0;
+            for (ivec, buf) in ivecs.iter().zip(&bufs) {
+                assert_eq!(ivec.in_, buf.as_ptr());
+                assert_eq!(ivec.len, buf.len());
+                covered += buf.len();
+            }
+            assert!(covered >= max_in.min(total));
+        });
+    }
 }

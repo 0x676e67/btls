@@ -31,14 +31,14 @@ limitations under the License.
  ssl/handshake_client.cc          |    1 +
  ssl/internal.h                   |   70 ++
  ssl/record_size_limit.cc         |  365 +++++++++
- ssl/record_size_limit_test.cc    | 1229 ++++++++++++++++++++++++++++++
+ ssl/record_size_limit_test.cc    | 1305 ++++++++++++++++++++++++++++++
  ssl/s3_both.cc                   |    7 +-
- ssl/s3_pkt.cc                    |    2 +-
+ ssl/s3_pkt.cc                    |   12 +-
  ssl/ssl_lib.cc                   |    1 +
  ssl/tls13_server.cc              |   11 +-
  ssl/tls_method.cc                |    2 +
  ssl/tls_record.cc                |   17 +-
- 21 files changed, 1758 insertions(+), 11 deletions(-)
+ 21 files changed, 1843 insertions(+), 12 deletions(-)
  create mode 100644 ssl/record_size_limit.cc
  create mode 100644 ssl/record_size_limit_test.cc
 
@@ -817,10 +817,10 @@ index 000000000..d0b0d30c2
 +}
 diff --git a/ssl/record_size_limit_test.cc b/ssl/record_size_limit_test.cc
 new file mode 100644
-index 000000000..075ccdb2e
+index 000000000..da116d67b
 --- /dev/null
 +++ b/ssl/record_size_limit_test.cc
-@@ -0,0 +1,1229 @@
+@@ -0,0 +1,1305 @@
 +// Copyright 2026 The btls Authors
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1755,6 +1755,82 @@ index 000000000..075ccdb2e
 +  }
 +}
 +
++TEST(RecordSizeLimitTest, BlockedEarlyDataWriteFinishesUnderSmallerLimit) {
++  // A 0-RTT record is sealed at the protocol maximum. If its write blocks and
++  // the server then advertises a smaller limit, the caller's retry must finish
++  // that record rather than fail with SSL_R_BAD_WRITE_RETRY.
++  UniquePtr<SSL_CTX> client_ctx = CreateContext(false, TLS1_3_VERSION);
++  UniquePtr<SSL_CTX> server_ctx = CreateContext(true, TLS1_3_VERSION);
++  ASSERT_TRUE(client_ctx);
++  ASSERT_TRUE(server_ctx);
++  for (SSL_CTX *ctx : {client_ctx.get(), server_ctx.get()}) {
++    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_BOTH);
++    SSL_CTX_set_early_data_enabled(ctx, 1);
++    SSL_CTX_set_record_size_limit(ctx, SSL3_RT_MAX_PLAIN_LENGTH + 1);
++  }
++  UniquePtr<SSL_SESSION> session =
++      CreateClientSession(client_ctx.get(), server_ctx.get());
++  ASSERT_TRUE(session);
++  ASSERT_TRUE(SSL_SESSION_early_data_capable(session.get()));
++
++  // btls servers decline 0-RTT below the maximum. Emulate a server that
++  // accepts it but advertises 64, by lowering only the echoed limit.
++  SSL_CTX_set_cert_cb(
++      server_ctx.get(),
++      [](SSL *ssl, void *) {
++        FromOpaque(ssl)->s3->hs->record_size_limit = 64;
++        return 1;
++      },
++      nullptr);
++
++  UniquePtr<SSL> client(SSL_new(client_ctx.get()));
++  UniquePtr<SSL> server(SSL_new(server_ctx.get()));
++  ASSERT_TRUE(client);
++  ASSERT_TRUE(server);
++  SSL_set_connect_state(client.get());
++  SSL_set_accept_state(server.get());
++  // A 4096-byte client buffer blocks the 8000-byte 0-RTT record.
++  BIO *client_bio = nullptr;
++  BIO *server_bio = nullptr;
++  ASSERT_TRUE(BIO_new_bio_pair(&client_bio, 4096, &server_bio, 0));
++  SSL_set_bio(client.get(), client_bio, client_bio);
++  SSL_set_bio(server.get(), server_bio, server_bio);
++  ASSERT_TRUE(SSL_set_session(client.get(), session.get()));
++  ASSERT_EQ(SSL_do_handshake(client.get()), 1);
++  ASSERT_TRUE(SSL_in_early_data(client.get()));
++
++  const std::vector<uint8_t> data(8000, 0x42);
++  int ret = SSL_write(client.get(), data.data(), data.size());
++  ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_WANT_WRITE);
++
++  // Finishing the handshake flushes the record and installs the limit of 64.
++  std::vector<uint8_t> received;
++  uint8_t buf[SSL3_RT_MAX_PLAIN_LENGTH];
++  for (size_t i = 0;
++       i < 1000 && (SSL_in_init(client.get()) || received.size() < data.size());
++       i++) {
++    if (SSL_in_init(client.get())) {
++      ret = SSL_do_handshake(client.get());
++      ASSERT_TRUE(IsRetryableHandshakeError(SSL_get_error(client.get(), ret)));
++    }
++    ret = SSL_read(server.get(), buf, sizeof(buf));
++    if (ret > 0) {
++      received.insert(received.end(), buf, buf + ret);
++    }
++  }
++  ASSERT_FALSE(SSL_in_init(client.get()));
++  EXPECT_TRUE(SSL_early_data_accepted(client.get()));
++  EXPECT_EQ(FromOpaque(client.get())->s3->write_record_size_limit, 64);
++  EXPECT_EQ(received, data);
++
++  // The retry reports the delivered record, and new data uses the new limit.
++  ASSERT_EQ(SSL_write(client.get(), data.data(), data.size()),
++            static_cast<int>(data.size()));
++  ASSERT_EQ(SSL_write(client.get(), data.data(), 200), 200);
++  ASSERT_TRUE(ReadExact(server.get(), Span(buf, 200)));
++  EXPECT_EQ(0, memcmp(buf, data.data(), 200));
++}
++
 +TEST(RecordSizeLimitTest, TrialDecryptionStillEnforcesAuthenticatedRecordLimit) {
 +  auto client_ctx = CreateContext(false, TLS1_3_VERSION);
 +  auto server_ctx = CreateContext(true, TLS1_3_VERSION);
@@ -2086,7 +2162,7 @@ index d885da981..e00c04309 100644
        rest = rest.subspan(chunk.size());
  
 diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
-index 2724e327e..c92893070 100644
+index 2724e327e..8b4043b7b 100644
 --- a/ssl/s3_pkt.cc
 +++ b/ssl/s3_pkt.cc
 @@ -64,7 +64,7 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
@@ -2098,6 +2174,23 @@ index 2724e327e..c92893070 100644
      if (is_early_data_write) {
        SSL_HANDSHAKE *hs = ssl->s3->hs.get();
        if (hs->early_data_written >= hs->early_session->ticket_max_early_data) {
+@@ -78,7 +78,15 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
+                                     hs->early_data_written});
+     }
+ 
+-    const size_t to_write = std::min(max_send_fragment, in.size());
++    size_t to_write = std::min(max_send_fragment, in.size());
++    // A record pending from an earlier epoch may exceed the current fragment,
++    // e.g. 0-RTT sealed at the protocol maximum before the server's
++    // record_size_limit applied. Offer at least that much so `do_tls_write`
++    // finishes it instead of failing the retry.
++    if (!ssl->s3->pending_write.empty()) {
++      to_write = std::max(to_write,
++                          std::min(ssl->s3->pending_write.size(), in.size()));
++    }
+     size_t bytes_written;
+     int ret = do_tls_write(ssl, &bytes_written, SSL3_RT_APPLICATION_DATA,
+                            in.subspan(0, to_write));
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 index c559b61b9..fdc49eff6 100644
 --- a/ssl/ssl_lib.cc
