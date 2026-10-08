@@ -2103,20 +2103,17 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_sigalgs_enabled(self.as_ptr(), enabled as _) }
     }
 
-    /// Sets the maximum protected-record plaintext this endpoint is willing to
-    /// receive, as defined by [RFC 8449].
+    /// Sets the largest protected-record plaintext this endpoint accepts and
+    /// advertises it with the [RFC 8449] `record_size_limit` extension.
     ///
-    /// The default is zero, which disables the extension. Nonzero values below
-    /// 64 or above the protocol maximum are clamped when advertised. The peer's
-    /// advertised value limits records sent by this endpoint. The value is
-    /// fixed once the ClientHello is built or parsed. This applies to stream
-    /// TLS and QUIC, not DTLS or split handshakes. QUIC negotiates the
-    /// extension but has no TLS records for the limit to bound.
+    /// Zero, the default, disables the extension. Other values are clamped to
+    /// 64..=16385 in TLS 1.3, where the limit counts the content type, and to
+    /// 64..=16384 in TLS 1.2, so 16385 advertises no restriction. The peer's
+    /// value bounds the records this endpoint sends. DTLS ignores the setting.
     ///
-    /// TLS 1.3 early data is sent before the server's limit is known, so 0-RTT
-    /// records may use the protocol maximum. A TLS server whose limit is below
-    /// that maximum neither issues early-data tickets nor accepts early data.
-    /// QUIC carries 0-RTT in its own packets, so the limit does not affect it.
+    /// 0-RTT records may use the protocol maximum, because they precede the
+    /// server's limit. When the client offers the extension, a server whose
+    /// limit is below the maximum declines 0-RTT.
     ///
     /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]
@@ -3371,8 +3368,9 @@ impl SslRef {
 
     /// Sets the [RFC 8449] record size limit for this connection only.
     ///
-    /// See [`SslContextBuilder::set_record_size_limit`]. A server may still
-    /// call this from a ClientHello callback before the value is negotiated.
+    /// See [`SslContextBuilder::set_record_size_limit`]. A server may still call
+    /// this from [`SslContextBuilder::set_select_certificate_callback`]; the
+    /// servername callback and [`SslRef::set_ssl_context`] are too late.
     ///
     /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]
