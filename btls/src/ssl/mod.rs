@@ -3929,8 +3929,9 @@ impl SslRef {
     /// uses the same verify store, this connection's [verify parameters](Self::verify_param_mut)
     /// including the hostname, the ECH public name, and the verify and cert verify callbacks.
     ///
-    /// BoringSSL reports a rejection through [`Self::verify_result`] as
-    /// [`X509VerifyError::APPLICATION_VERIFICATION`].
+    /// On a full handshake BoringSSL reports a rejection through [`Self::verify_result`] as
+    /// [`X509VerifyError::APPLICATION_VERIFICATION`]; a rejected resumption fails with
+    /// `CERTIFICATE_VERIFY_FAILED` and keeps the resumed session's result.
     #[corresponds(X509_verify_cert)]
     pub fn verify_peer_cert_chain(&self) -> X509VerifyResult {
         let context = self.ssl_context();
