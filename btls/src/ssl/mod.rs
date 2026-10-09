@@ -2889,6 +2889,20 @@ impl SslCipherRef {
         unsafe { ffi::SSL_CIPHER_is_aead(self.as_ptr()) != 0 }
     }
 
+    /// Returns the NID corresponding to the cipher's key exchange.
+    ///
+    /// TLS 1.3 ciphers report [`Nid::KX_ANY`].
+    #[corresponds(SSL_CIPHER_get_kx_nid)]
+    #[must_use]
+    pub fn cipher_kx_nid(&self) -> Option<Nid> {
+        let n = unsafe { ffi::SSL_CIPHER_get_kx_nid(self.as_ptr()) };
+        if n == 0 {
+            None
+        } else {
+            Some(Nid::from_raw(n))
+        }
+    }
+
     /// Returns the NID corresponding to the cipher's authentication type.
     #[corresponds(SSL_CIPHER_get_auth_nid)]
     #[must_use]
@@ -3016,6 +3030,22 @@ impl SslSessionRef {
         unsafe {
             cvt_p(ffi::SSL_SESSION_copy_without_early_data(self.as_ptr()))
                 .map(|session| SslSession::from_ptr(session))
+        }
+    }
+
+    /// Returns the cipher negotiated by the connection that established the session.
+    ///
+    /// TLS 1.3 resumptions may use a different cipher.
+    #[corresponds(SSL_SESSION_get0_cipher)]
+    #[must_use]
+    pub fn cipher(&self) -> Option<&SslCipherRef> {
+        unsafe {
+            let ptr = ffi::SSL_SESSION_get0_cipher(self.as_ptr());
+            if ptr.is_null() {
+                None
+            } else {
+                Some(SslCipherRef::from_ptr(ptr.cast_mut()))
+            }
         }
     }
 
