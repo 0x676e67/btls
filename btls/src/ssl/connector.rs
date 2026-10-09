@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use foreign_types::ForeignTypeRef;
 use openssl_macros::corresponds;
@@ -14,7 +15,9 @@ use crate::ssl::{
     HandshakeError, Ssl, SslContext, SslContextBuilder, SslContextRef, SslMethod, SslMode,
     SslOptions, SslRef, SslSession, SslSessionRef, SslStream, SslVerifyMode,
 };
+use crate::stack::StackRef;
 use crate::version;
+use crate::x509::X509;
 use std::net::IpAddr;
 
 use super::callbacks::raw_client_session;
@@ -217,13 +220,16 @@ pub struct ConnectConfiguration {
 /// [`ConnectConfiguration::set_client_session`] offers one only to a connection with the same
 /// domain and SNI use, no stricter hostname or peer verification, and the same non-empty
 /// [session ID context](SslContextBuilder::set_session_id_context) or, without one, the same
-/// context. Other per-connection changes through [`SslRef`], such as verify callbacks, verify
+/// context. A connection that verifies the peer is not offered a session whose certificate chain
+/// has expired. Other per-connection changes through [`SslRef`], such as verify callbacks, verify
 /// stores, or client certificates, are not tracked.
 #[derive(Clone)]
 pub struct ClientSession {
     session: SslSession,
     peer: SessionPeer,
     verify_peer: bool,
+    /// Earliest expiry in the peer certificate chain, as POSIX time.
+    not_after: Option<i64>,
     /// Callback token of the issuing context, compared when the session has no session ID context.
     issuer: Option<u64>,
 }
@@ -253,6 +259,7 @@ impl ClientSession {
             session,
             peer,
             verify_peer: verifies_peer(ssl),
+            not_after: chain_not_after(ssl),
             issuer: issuer(ssl.ssl_context()),
         }
     }
@@ -269,14 +276,50 @@ impl ClientSession {
     /// certificate checks on resumption unless reverify-on-resume runs a custom verifier.
     fn resumes(&self, ssl: &SslRef, domain: &str, sni: bool, verify_hostname: bool) -> bool {
         let scope = self.session.id_context();
+        let verify_peer = verifies_peer(ssl);
         ssl.session_id_context() == Some(scope)
             && (!scope.is_empty()
                 || self.issuer.is_some() && self.issuer == issuer(ssl.ssl_context()))
             && self.peer.domain.eq_ignore_ascii_case(domain)
             && self.peer.sni == sni
             && (self.peer.verify_hostname || !verify_hostname)
-            && (self.verify_peer || !verifies_peer(ssl))
+            && (self.verify_peer || !verify_peer)
+            // Re-verification would reject an expired chain and fail the handshake.
+            && !(verify_peer && self.chain_expired())
     }
+
+    /// Returns whether a certificate in the peer chain has expired by now.
+    fn chain_expired(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|now| i64::try_from(now.as_secs()).ok());
+        matches!((self.not_after, now), (Some(not_after), Some(now)) if now >= not_after)
+    }
+}
+
+/// Returns the earliest expiry in the peer certificate chain, as POSIX time.
+fn chain_not_after(ssl: &SslRef) -> Option<i64> {
+    if !ssl.ssl_context().has_x509_support() {
+        return None;
+    }
+
+    // SAFETY: the context uses the X.509 method, and the chain lives as long as the session
+    // borrowed through `ssl`.
+    let chain = unsafe { ffi::SSL_get_peer_full_cert_chain(ssl.as_ptr()) };
+    if chain.is_null() {
+        return None;
+    }
+    let chain = unsafe { StackRef::<X509>::from_ptr(chain) };
+    chain
+        .iter()
+        .filter_map(|cert| {
+            let mut not_after = 0;
+            // SAFETY: `cert` is valid, and `not_after` is a valid output.
+            let ok = unsafe { ffi::ASN1_TIME_to_posix(cert.not_after().as_ptr(), &mut not_after) };
+            (ok == 1).then_some(not_after)
+        })
+        .min()
 }
 
 /// Returns the token of the client session callback installed on `context`.

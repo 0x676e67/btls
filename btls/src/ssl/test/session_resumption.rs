@@ -1,4 +1,7 @@
 use super::server::Server;
+use crate::asn1::Asn1Time;
+use crate::bn::BigNum;
+use crate::pkey::PKey;
 use crate::ssl::test::MessageDigest;
 use crate::ssl::ClientSession;
 use crate::ssl::ConnectConfiguration;
@@ -14,10 +17,14 @@ use crate::ssl::SslVersion;
 use crate::ssl::TicketKeyCallbackResult;
 use crate::symm::Cipher;
 use crate::symm::CipherCtxRef;
+use crate::x509::extension::SubjectAlternativeName;
+use crate::x509::{X509Name, X509};
+use std::fs;
 use std::io::Read;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static SUCCESS_ENCRYPTION_CALLED_BACK: AtomicU8 = AtomicU8::new(0);
 static SUCCESS_DECRYPTION_CALLED_BACK: AtomicU8 = AtomicU8::new(0);
@@ -214,6 +221,71 @@ fn client_session_resumes_within_scope_and_domain() {
         config.set_verify_hostname(false);
         config.set_verify(SslVerifyMode::NONE);
     }));
+}
+
+#[test]
+fn client_session_is_not_offered_after_its_chain_expires() {
+    // A foobar.com leaf from the test root that expired a day ago.
+    let day: libc::time_t = 24 * 60 * 60;
+    let now: libc::time_t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .try_into()
+        .unwrap();
+    let key = PKey::private_key_from_pem(&fs::read("test/key.pem").unwrap()).unwrap();
+    let ca = X509::from_pem(&fs::read("test/root-ca.pem").unwrap()).unwrap();
+    let ca_key = PKey::private_key_from_pem(&fs::read("test/root-ca.key").unwrap()).unwrap();
+    let mut name = X509Name::builder().unwrap();
+    name.append_entry_by_text("CN", "foobar.com").unwrap();
+    let name = name.build();
+    let mut leaf = X509::builder().unwrap();
+    leaf.set_version(2).unwrap();
+    let serial = BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap();
+    leaf.set_serial_number(&serial).unwrap();
+    leaf.set_subject_name(&name).unwrap();
+    leaf.set_issuer_name(ca.subject_name()).unwrap();
+    leaf.set_pubkey(&key).unwrap();
+    leaf.set_not_before(&Asn1Time::from_unix(now - 2 * day).unwrap())
+        .unwrap();
+    leaf.set_not_after(&Asn1Time::from_unix(now - day).unwrap())
+        .unwrap();
+    let san = SubjectAlternativeName::new()
+        .dns("foobar.com")
+        .build(&leaf.x509v3_context(Some(&ca), None))
+        .unwrap();
+    leaf.append_extension(&san).unwrap();
+    leaf.sign(&ca_key, MessageDigest::sha256()).unwrap();
+    let leaf = leaf.build();
+
+    let mut server = Server::builder();
+    server.ctx().set_certificate(&leaf).unwrap();
+    let server = server.build();
+
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_ca_file("test/root-ca.pem").unwrap();
+    let issued = sessions.clone();
+    connector.set_client_session_callback(move |_, session| issued.lock().unwrap().push(session));
+    let connector = connector.build();
+
+    // Verified as of a time inside the validity period.
+    let mut config = connector.configure().unwrap();
+    config.param_mut().set_time(now - day - day / 2);
+    let mut stream = config.connect("foobar.com", server.connect_tcp()).unwrap();
+    stream.read_exact(&mut [0]).unwrap();
+    let session = sessions.lock().unwrap().pop().unwrap();
+
+    let offers = |configure: fn(&mut ConnectConfiguration)| {
+        let mut config = connector
+            .configure()
+            .unwrap()
+            .client_session(session.clone());
+        configure(&mut config);
+        config.into_ssl("foobar.com").unwrap().session().is_some()
+    };
+    assert!(!offers(|_| {}));
+    assert!(offers(|config| config.set_verify(SslVerifyMode::NONE)));
 }
 
 #[test]
