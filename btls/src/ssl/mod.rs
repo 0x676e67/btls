@@ -108,7 +108,8 @@ pub use self::async_callbacks::{
     BoxPrivateKeyMethodFuture, BoxSelectCertFinish, BoxSelectCertFuture, ExDataFuture,
 };
 pub use self::connector::{
-    ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
+    ClientSession, ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector,
+    SslConnectorBuilder,
 };
 #[cfg(feature = "credential")]
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
@@ -391,9 +392,8 @@ bitflags! {
         /// Enable session caching on the client side.
         ///
         /// OpenSSL has no way of identifying the proper session to reuse automatically, so the
-        /// application is responsible for setting it explicitly via [`SslRef::set_session`].
-        ///
-        /// [`SslRef::set_session`]: struct.SslRef.html#method.set_session
+        /// application is responsible for setting it explicitly via
+        /// [`ConnectConfiguration::set_client_session`] or [`SslRef::set_session`].
         const CLIENT = ffi::SSL_SESS_CACHE_CLIENT;
 
         /// Enable session caching on the server side.
@@ -1474,7 +1474,9 @@ impl SslContextBuilder {
     ///
     /// A session is only used by a connection with the same identifier. Clients can use it to
     /// isolate compatible contexts in an external cache; servers must set it when peer
-    /// verification is enabled.
+    /// verification is enabled. A [`ClientSession`] is offered to any context sharing a non-empty
+    /// identifier, so share one only between contexts with the same trust, verification, client
+    /// identity, protocol, and cipher configuration.
     #[corresponds(SSL_CTX_set_session_id_context)]
     pub fn set_session_id_context(&mut self, sid_ctx: &[u8]) -> Result<(), ErrorStack> {
         unsafe {
@@ -1979,7 +1981,8 @@ impl SslContextBuilder {
     /// session callback is a portable way to deal with both cases.
     ///
     /// Note that session caching must be enabled for the callback to be invoked, and it defaults
-    /// off for clients. [`set_session_cache_mode`] controls that behavior.
+    /// off for clients. [`set_session_cache_mode`] controls that behavior. This replaces
+    /// [`SslConnectorBuilder::set_client_session_callback`], which uses the same BoringSSL callback.
     ///
     /// [`SslRef::session`]: struct.SslRef.html#method.session
     /// [`set_session_cache_mode`]: #method.set_session_cache_mode
@@ -3026,6 +3029,20 @@ impl SslSessionRef {
         }
     }
 
+    /// Returns the session ID context recorded when the session was created.
+    #[corresponds(SSL_SESSION_get0_id_context)]
+    fn id_context(&self) -> &[u8] {
+        unsafe {
+            let mut len = 0;
+            let p = ffi::SSL_SESSION_get0_id_context(self.as_ptr(), &mut len);
+            if p.is_null() {
+                &[]
+            } else {
+                slice::from_raw_parts(p, len as usize)
+            }
+        }
+    }
+
     to_der! {
         /// Serializes the session into a DER-encoded structure.
         #[corresponds(i2d_SSL_SESSION)]
@@ -3913,9 +3930,22 @@ impl SslRef {
     /// - the session authenticates the intended peer under the current verification and client
     ///   authentication policies; and
     /// - the session ID context, protocol, and cipher configuration are compatible.
+    ///
+    /// [`ConnectConfiguration::set_client_session`] is a checked alternative for sessions from
+    /// [`SslConnectorBuilder::set_client_session_callback`].
     #[corresponds(SSL_set_session)]
     pub unsafe fn set_session(&mut self, session: &SslSessionRef) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::SSL_set_session(self.as_ptr(), session.as_ptr())) }
+    }
+
+    /// Returns the session ID context new sessions on this connection will record.
+    #[corresponds(SSL_get0_session_id_context)]
+    fn session_id_context(&self) -> Option<&[u8]> {
+        unsafe {
+            let mut len = 0;
+            let p = ffi::SSL_get0_session_id_context(self.as_ptr(), &mut len);
+            (!p.is_null()).then(|| slice::from_raw_parts(p, len))
+        }
     }
 
     /// Determines if the session provided to `set_session` was successfully reused.

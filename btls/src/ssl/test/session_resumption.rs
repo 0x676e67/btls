@@ -1,6 +1,10 @@
 use super::server::Server;
 use crate::ssl::test::MessageDigest;
+use crate::ssl::ClientSession;
+use crate::ssl::ConnectConfiguration;
 use crate::ssl::HmacCtxRef;
+use crate::ssl::SslConnector;
+use crate::ssl::SslMethod;
 use crate::ssl::SslRef;
 use crate::ssl::SslSession;
 use crate::ssl::SslSessionCacheMode;
@@ -10,6 +14,7 @@ use crate::ssl::SslVersion;
 use crate::ssl::TicketKeyCallbackResult;
 use crate::symm::Cipher;
 use crate::symm::CipherCtxRef;
+use std::io::Read;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -125,6 +130,90 @@ fn client_session_cache_apis() {
     let resumed = resumed.connect();
     assert!(resumed.ssl().session_reused());
     assert_eq!(verify_count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn client_session_resumes_within_scope_and_domain() {
+    let mut server = Server::builder();
+    server.expected_connections_count(3);
+    let server = server.build();
+
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let connector = |scope: &[u8]| {
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        connector.set_ca_file("test/root-ca.pem").unwrap();
+        connector.set_session_id_context(scope).unwrap();
+        let sessions = sessions.clone();
+        connector.set_client_session_callback(move |_, session| {
+            sessions.lock().unwrap().push(session);
+        });
+        connector.build()
+    };
+    let issue = |connector: &SslConnector, configure: fn(&mut ConnectConfiguration)| {
+        let mut config = connector.configure().unwrap();
+        configure(&mut config);
+        let mut stream = config.connect("foobar.com", server.connect_tcp()).unwrap();
+        // Reading processes the tickets sent after the handshake.
+        stream.read_exact(&mut [0]).unwrap();
+        sessions.lock().unwrap().drain(..).next_back().unwrap()
+    };
+    let offers = |connector: &SslConnector,
+                  session: &ClientSession,
+                  domain,
+                  configure: fn(&mut ConnectConfiguration)| {
+        let mut config = connector
+            .configure()
+            .unwrap()
+            .client_session(session.clone());
+        configure(&mut config);
+        config.into_ssl(domain).unwrap().session().is_some()
+    };
+
+    // A shared session ID context resumes across contexts for the same domain and SNI use.
+    let session = issue(&connector(b"scope"), |_| {});
+    let shared = connector(b"scope");
+    assert!(offers(&shared, &session, "foobar.com", |_| {}));
+    assert!(offers(&shared, &session, "FOOBAR.com", |_| {}));
+    assert!(!offers(&shared, &session, "bogus.com", |config| {
+        config.set_verify_hostname(false)
+    }));
+    assert!(!offers(&shared, &session, "foobar.com", |config| {
+        config.set_use_server_name_indication(false)
+    }));
+    assert!(!offers(
+        &connector(b"other"),
+        &session,
+        "foobar.com",
+        |_| {}
+    ));
+    let resumed = shared
+        .configure()
+        .unwrap()
+        .client_session(session)
+        .connect("foobar.com", server.connect_tcp())
+        .unwrap();
+    assert!(resumed.ssl().session_reused());
+
+    // Without one, only the issuing context resumes, and never under stricter verification.
+    let unscoped = connector(b"");
+    let session = issue(&unscoped, |config| {
+        config.set_verify_hostname(false);
+        config.set_verify(SslVerifyMode::NONE);
+    });
+    assert!(offers(&unscoped, &session, "foobar.com", |config| {
+        config.set_verify_hostname(false);
+        config.set_verify(SslVerifyMode::NONE);
+    }));
+    assert!(!offers(&unscoped, &session, "foobar.com", |config| {
+        config.set_verify_hostname(false)
+    }));
+    assert!(!offers(&unscoped, &session, "foobar.com", |config| {
+        config.set_verify(SslVerifyMode::NONE)
+    }));
+    assert!(!offers(&connector(b""), &session, "foobar.com", |config| {
+        config.set_verify_hostname(false);
+        config.set_verify(SslVerifyMode::NONE);
+    }));
 }
 
 #[test]

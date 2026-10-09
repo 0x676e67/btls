@@ -1,16 +1,30 @@
 use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+
+use foreign_types::ForeignTypeRef;
+use openssl_macros::corresponds;
 
 use crate::dh::Dh;
 use crate::error::ErrorStack;
+use crate::ex_data::Index;
+use crate::ffi;
 use crate::ssl::{
     HandshakeError, Ssl, SslContext, SslContextBuilder, SslContextRef, SslMethod, SslMode,
-    SslOptions, SslRef, SslStream, SslVerifyMode,
+    SslOptions, SslRef, SslSession, SslSessionRef, SslStream, SslVerifyMode,
 };
 use crate::version;
 use std::net::IpAddr;
 
-use super::MidHandshakeSslStream;
+use super::callbacks::raw_client_session;
+use super::{MidHandshakeSslStream, SESSION_CTX_INDEX};
+
+pub(super) static CLIENT_SESSION_INDEX: LazyLock<Index<SslContext, ClientSessionCallback>> =
+    LazyLock::new(|| SslContext::new_ex_index().unwrap());
+pub(super) static SESSION_PEER_INDEX: LazyLock<Index<Ssl, SessionPeer>> =
+    LazyLock::new(|| Ssl::new_ex_index().unwrap());
+static NEXT_ISSUER: AtomicU64 = AtomicU64::new(1);
 
 const FFDHE_2048: &str = "
 -----BEGIN DH PARAMETERS-----
@@ -124,6 +138,7 @@ impl SslConnector {
             ssl,
             sni: true,
             verify_hostname: true,
+            session: None,
         })
     }
 
@@ -149,6 +164,29 @@ impl SslConnectorBuilder {
     pub fn build(self) -> SslConnector {
         SslConnector(self.0.build())
     }
+
+    /// Sets the callback which receives sessions for [`ConnectConfiguration::set_client_session`].
+    ///
+    /// Client session caching is enabled. Only connections created by
+    /// [`ConnectConfiguration::into_ssl`] report sessions. This shares BoringSSL's new session
+    /// callback with [`SslContextBuilder::set_new_session_callback`]; the last one set wins.
+    #[corresponds(SSL_CTX_sess_set_new_cb)]
+    pub fn set_client_session_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut SslRef, ClientSession) + 'static + Sync + Send,
+    {
+        let callback = ClientSessionCallback {
+            issuer: NEXT_ISSUER.fetch_add(1, Ordering::Relaxed),
+            callback: Box::new(callback),
+        };
+        self.replace_ex_data(*CLIENT_SESSION_INDEX, callback);
+        unsafe {
+            let mode =
+                ffi::SSL_CTX_get_session_cache_mode(self.as_ptr()) | ffi::SSL_SESS_CACHE_CLIENT;
+            ffi::SSL_CTX_set_session_cache_mode(self.as_ptr(), mode);
+            ffi::SSL_CTX_sess_set_new_cb(self.as_ptr(), Some(raw_client_session));
+        }
+    }
 }
 
 impl Deref for SslConnectorBuilder {
@@ -170,6 +208,89 @@ pub struct ConnectConfiguration {
     ssl: Ssl,
     sni: bool,
     verify_hostname: bool,
+    session: Option<ClientSession>,
+}
+
+/// A client session and the connection it was issued on.
+///
+/// Sessions come from [`SslConnectorBuilder::set_client_session_callback`].
+/// [`ConnectConfiguration::set_client_session`] offers one only to a connection with the same
+/// domain and SNI use, no stricter hostname or peer verification, and the same non-empty
+/// [session ID context](SslContextBuilder::set_session_id_context) or, without one, the same
+/// context. Other per-connection changes through [`SslRef`], such as verify callbacks, verify
+/// stores, or client certificates, are not tracked.
+#[derive(Clone)]
+pub struct ClientSession {
+    session: SslSession,
+    peer: SessionPeer,
+    verify_peer: bool,
+    /// Callback token of the issuing context, compared when the session has no session ID context.
+    issuer: Option<u64>,
+}
+
+/// Domain, SNI, and hostname verification of a connection created by
+/// [`ConnectConfiguration::into_ssl`].
+#[derive(Clone)]
+pub(super) struct SessionPeer {
+    domain: Arc<str>,
+    sni: bool,
+    verify_hostname: bool,
+}
+
+type ClientSessionFn = dyn Fn(&mut SslRef, ClientSession) + Sync + Send;
+
+/// Client session callback, boxed so connections can find it without knowing its type.
+///
+/// The issuer token identifies the context without keeping it alive.
+pub(super) struct ClientSessionCallback {
+    issuer: u64,
+    pub(super) callback: Box<ClientSessionFn>,
+}
+
+impl ClientSession {
+    pub(super) fn new(session: SslSession, peer: SessionPeer, ssl: &SslRef) -> Self {
+        ClientSession {
+            session,
+            peer,
+            verify_peer: verifies_peer(ssl),
+            issuer: issuer(ssl.ssl_context()),
+        }
+    }
+
+    /// Returns the underlying session.
+    #[must_use]
+    pub fn session(&self) -> &SslSessionRef {
+        &self.session
+    }
+
+    /// Checks the session against the connection `ssl` will make to `domain`.
+    ///
+    /// BoringSSL rejects another session ID context only after the server resumes, and skips
+    /// certificate checks on resumption unless reverify-on-resume runs a custom verifier.
+    fn resumes(&self, ssl: &SslRef, domain: &str, sni: bool, verify_hostname: bool) -> bool {
+        let scope = self.session.id_context();
+        ssl.session_id_context() == Some(scope)
+            && (!scope.is_empty()
+                || self.issuer.is_some() && self.issuer == issuer(ssl.ssl_context()))
+            && self.peer.domain.eq_ignore_ascii_case(domain)
+            && self.peer.sni == sni
+            && (self.peer.verify_hostname || !verify_hostname)
+            && (self.verify_peer || !verifies_peer(ssl))
+    }
+}
+
+/// Returns the token of the client session callback installed on `context`.
+fn issuer(context: &SslContextRef) -> Option<u64> {
+    context
+        .ex_data(*CLIENT_SESSION_INDEX)
+        .map(|callback| callback.issuer)
+}
+
+/// Returns whether `ssl` verifies the peer certificate; an unavailable mode counts as not.
+fn verifies_peer(ssl: &SslRef) -> bool {
+    // SAFETY: `ssl` is a valid connection; BoringSSL returns -1 when its configuration is gone.
+    let mode = unsafe { ffi::SSL_get_verify_mode(ssl.as_ptr()) };
+    mode >= 0 && SslVerifyMode::from_bits_retain(mode).contains(SslVerifyMode::PEER)
 }
 
 impl ConnectConfiguration {
@@ -207,16 +328,55 @@ impl ConnectConfiguration {
         self.verify_hostname = verify_hostname;
     }
 
+    /// A builder-style version of `set_client_session`.
+    #[must_use]
+    pub fn client_session(mut self, session: ClientSession) -> ConnectConfiguration {
+        self.set_client_session(session);
+        self
+    }
+
+    /// Offers a session for resumption.
+    ///
+    /// [`Self::into_ssl`] drops it unless it matches the connection as described on
+    /// [`ClientSession`], and the handshake then proceeds without resumption.
+    pub fn set_client_session(&mut self, session: ClientSession) {
+        self.session = Some(session);
+    }
+
     /// Returns an [`Ssl`] configured to connect to the provided domain.
     ///
     /// The domain is used for SNI (if it is not an IP address) and hostname verification if enabled.
     pub fn into_ssl(mut self, domain: &str) -> Result<Ssl, ErrorStack> {
-        if self.sni && domain.parse::<IpAddr>().is_err() {
+        let sni = self.sni && domain.parse::<IpAddr>().is_err();
+        if sni {
             self.ssl.set_hostname(domain)?;
         }
 
         if self.verify_hostname {
             setup_verify_hostname(&mut self.ssl, domain)?;
+        }
+
+        let reports_sessions = self
+            .ssl
+            .ex_data(*SESSION_CTX_INDEX)
+            .is_some_and(|context| context.ex_data(*CLIENT_SESSION_INDEX).is_some());
+        if reports_sessions {
+            let peer = SessionPeer {
+                domain: domain.into(),
+                sni,
+                verify_hostname: self.verify_hostname,
+            };
+            self.ssl.set_ex_data(*SESSION_PEER_INDEX, peer);
+        }
+
+        if let Some(session) = self
+            .session
+            .take()
+            .filter(|session| session.resumes(&self.ssl, domain, sni, self.verify_hostname))
+        {
+            // SAFETY: `self.ssl` has not been attached to a stream, so its handshake has not
+            // started, and the session was issued for a connection this one matches.
+            unsafe { self.ssl.set_session(&session.session)? };
         }
 
         Ok(self.ssl)
