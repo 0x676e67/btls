@@ -1,10 +1,11 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+use super::connector::{CLIENT_SESSION_INDEX, SESSION_PEER_INDEX};
 use super::{
-    AlpnError, CertificateCompressor, ClientHello, GetSessionPendingError, PrivateKeyMethod,
-    PrivateKeyMethodError, SelectCertError, SniError, Ssl, SslAlert, SslContext, SslContextRef,
-    SslInfoCallbackAlert, SslInfoCallbackMode, SslInfoCallbackValue, SslRef, SslSession,
-    SslSessionRef, SslSignatureAlgorithm, SslVerifyError, SESSION_CTX_INDEX,
+    AlpnError, CertificateCompressor, ClientHello, ClientSession, GetSessionPendingError,
+    PrivateKeyMethod, PrivateKeyMethodError, SelectCertError, SniError, Ssl, SslAlert, SslContext,
+    SslContextRef, SslInfoCallbackAlert, SslInfoCallbackMode, SslInfoCallbackValue, SslRef,
+    SslSession, SslSessionRef, SslSignatureAlgorithm, SslVerifyError, SESSION_CTX_INDEX,
 };
 use crate::error::ErrorStack;
 use crate::ffi;
@@ -447,6 +448,37 @@ where
     callback(ssl, session);
 
     // the return code doesn't indicate error vs success, but whether or not we consumed the session
+    1
+}
+
+pub(super) unsafe extern "C" fn raw_client_session(
+    ssl: *mut ffi::SSL,
+    session: *mut ffi::SSL_SESSION,
+) -> c_int {
+    // SAFETY: btls provides valid inputs.
+    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+    let session = unsafe { SslSession::from_ptr(session) };
+
+    // Sessions from connections not created by `ConnectConfiguration::into_ssl` have no recorded
+    // peer and are dropped.
+    let Some(peer) = ssl.ex_data(*SESSION_PEER_INDEX).cloned() else {
+        return 1;
+    };
+    let Some(callback) = ssl
+        .ex_data(*SESSION_CTX_INDEX)
+        .and_then(|context| context.ex_data(*CLIENT_SESSION_INDEX))
+    else {
+        return 1;
+    };
+    let session = ClientSession::new(session, peer, ssl);
+
+    // SAFETY: The callback is stored in the session context set in `Ssl::new`, which outlives
+    // this function's scope.
+    let callback = unsafe { &*std::ptr::from_ref(callback) };
+
+    (callback.callback)(ssl, session);
+
+    // The return value only reports that the session reference was consumed.
     1
 }
 
