@@ -1057,6 +1057,10 @@ impl Nid {
     pub const AUTH_ECDSA: Nid = Nid(ffi::NID_auth_ecdsa);
     pub const AUTH_PSK: Nid = Nid(ffi::NID_auth_psk);
     pub const AUTH_ANY: Nid = Nid(ffi::NID_auth_any);
+    pub const KX_RSA: Nid = Nid(ffi::NID_kx_rsa);
+    pub const KX_ECDHE: Nid = Nid(ffi::NID_kx_ecdhe);
+    pub const KX_PSK: Nid = Nid(ffi::NID_kx_psk);
+    pub const KX_ANY: Nid = Nid(ffi::NID_kx_any);
 }
 
 #[cfg(test)]
