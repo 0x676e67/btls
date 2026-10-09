@@ -17,7 +17,7 @@ use crate::ssl::{
 };
 use crate::stack::StackRef;
 use crate::version;
-use crate::x509::X509;
+use crate::x509::{X509Ref, X509};
 use std::net::IpAddr;
 
 use super::callbacks::raw_client_session;
@@ -311,8 +311,17 @@ fn chain_not_after(ssl: &SslRef) -> Option<i64> {
         return None;
     }
     let chain = unsafe { StackRef::<X509>::from_ptr(chain) };
-    chain
-        .iter()
+    earliest_not_after(chain)
+}
+
+/// Returns the earliest expiry among `certs`, as POSIX time.
+pub(super) fn earliest_not_after<I>(certs: I) -> Option<i64>
+where
+    I: IntoIterator,
+    I::Item: Deref<Target = X509Ref>,
+{
+    certs
+        .into_iter()
         .filter_map(|cert| {
             let mut not_after = 0;
             // SAFETY: `cert` is valid, and `not_after` is a valid output.
