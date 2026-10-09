@@ -119,6 +119,8 @@ pub use self::ech::SslEchKeysRef;
 pub use self::error::{Error, ErrorCode, HandshakeError};
 pub use self::quic::{QuicEncryptionLevel, QuicMethod, QuicMethodError};
 
+use self::connector::earliest_not_after;
+
 mod async_callbacks;
 mod bio;
 mod callbacks;
@@ -3054,6 +3056,28 @@ impl SslSessionRef {
         unsafe {
             cvt_p(ffi::SSL_SESSION_copy_without_early_data(self.as_ptr()))
                 .map(|session| SslSession::from_ptr(session))
+        }
+    }
+
+    /// Returns the earliest expiry in the peer certificate chain, as seconds since the Unix epoch.
+    ///
+    /// Returns `None` when the session holds no peer certificates.
+    #[corresponds(SSL_SESSION_get0_peer_certificates)]
+    #[must_use]
+    pub fn peer_chain_not_after(&self) -> Option<i64> {
+        // SAFETY: the session owns the stack and its buffers for the duration of this call, and
+        // each parsed certificate holds its own reference to its buffer.
+        unsafe {
+            let certs =
+                ffi::SSL_SESSION_get0_peer_certificates(self.as_ptr()).cast::<ffi::OPENSSL_STACK>();
+            if certs.is_null() {
+                return None;
+            }
+            earliest_not_after((0..ffi::OPENSSL_sk_num(certs)).filter_map(|index| {
+                let buffer = ffi::OPENSSL_sk_value(certs, index).cast::<ffi::CRYPTO_BUFFER>();
+                let cert = ffi::X509_parse_from_buffer(buffer);
+                (!cert.is_null()).then(|| X509::from_ptr(cert))
+            }))
         }
     }
 

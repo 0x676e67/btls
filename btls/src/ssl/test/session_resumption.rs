@@ -2,6 +2,7 @@ use super::server::Server;
 use crate::asn1::Asn1Time;
 use crate::bn::BigNum;
 use crate::pkey::PKey;
+use crate::ssl::connector::earliest_not_after;
 use crate::ssl::test::MessageDigest;
 use crate::ssl::ClientSession;
 use crate::ssl::ConnectConfiguration;
@@ -275,6 +276,9 @@ fn client_session_is_not_offered_after_its_chain_expires() {
     let mut stream = config.connect("foobar.com", server.connect_tcp()).unwrap();
     stream.read_exact(&mut [0]).unwrap();
     let session = sessions.lock().unwrap().pop().unwrap();
+    let not_after = session.session().peer_chain_not_after();
+    assert!(not_after.is_some());
+    assert_eq!(not_after, earliest_not_after([&*leaf]));
 
     let offers = |configure: fn(&mut ConnectConfiguration)| {
         let mut config = connector
