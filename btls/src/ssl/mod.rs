@@ -62,7 +62,7 @@ use openssl_macros::corresponds;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::ffi::{c_char, c_int, c_uchar, c_uint};
+use std::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_void};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::io::prelude::*;
@@ -97,7 +97,8 @@ use crate::try_int;
 use crate::x509::store::{X509Store, X509StoreBuilder, X509StoreBuilderRef, X509StoreRef};
 use crate::x509::verify::X509VerifyParamRef;
 use crate::x509::{
-    X509Name, X509Ref, X509StoreContextRef, X509VerifyError, X509VerifyResult, X509,
+    X509Name, X509Ref, X509StoreContext, X509StoreContextRef, X509VerifyError, X509VerifyResult,
+    X509,
 };
 use crate::{cvt, cvt_0i, cvt_n, cvt_p, init};
 use crate::{ffi, free_data_box};
@@ -382,6 +383,15 @@ pub enum SslVerifyError {
     Retry,
 }
 
+// Sends the alert BoringSSL's built-in verifier sends for the same result.
+impl From<X509VerifyError> for SslVerifyError {
+    fn from(err: X509VerifyError) -> Self {
+        // SAFETY: only maps an integer.
+        let alert = unsafe { ffi::SSL_alert_from_verify_result(c_long::from(err.as_raw())) };
+        SslVerifyError::Invalid(SslAlert(alert))
+    }
+}
+
 bitflags! {
     /// Options controlling the behavior of session caching.
     #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord, Hash)]
@@ -498,6 +508,16 @@ static SSL_INDEXES: LazyLock<Mutex<HashMap<TypeId, c_int>>> =
 static SESSION_CTX_INDEX: LazyLock<Index<Ssl, SslContext>> =
     LazyLock::new(|| Ssl::new_ex_index().unwrap());
 static X509_FLAG_INDEX: LazyLock<Index<SslContext, bool>> =
+    LazyLock::new(|| SslContext::new_ex_index().unwrap());
+
+type CertVerifyFn = unsafe extern "C" fn(*mut ffi::X509_STORE_CTX, *mut c_void) -> c_int;
+
+// Verify stores and the cert verify trampoline, which BoringSSL cannot return.
+static VERIFY_STORE_INDEX: LazyLock<Index<SslContext, X509Store>> =
+    LazyLock::new(|| SslContext::new_ex_index().unwrap());
+static SSL_VERIFY_STORE_INDEX: LazyLock<Index<Ssl, Option<X509Store>>> =
+    LazyLock::new(|| Ssl::new_ex_index().unwrap());
+static CERT_VERIFY_INDEX: LazyLock<Index<SslContext, CertVerifyFn>> =
     LazyLock::new(|| SslContext::new_ex_index().unwrap());
 
 /// An error returned from the SNI callback.
@@ -1138,6 +1158,7 @@ impl SslContextBuilder {
         // is what you need to register a new callback.
         // See the NOTE in `ssl_raw_verify` for confirmation.
         self.replace_ex_data(SslContext::cached_ex_index::<F>(), callback);
+        self.replace_ex_data(*CERT_VERIFY_INDEX, raw_cert_verify::<F> as CertVerifyFn);
         unsafe {
             ffi::SSL_CTX_set_cert_verify_callback(
                 self.as_ptr(),
@@ -1231,8 +1252,9 @@ impl SslContextBuilder {
 
     /// Configures whether resumed client sessions use the custom verification callback.
     ///
-    /// This only applies to [`Self::set_custom_verify_callback`] and is incompatible with
-    /// [`SslVerifyMode::NONE`].
+    /// Without [`Self::set_custom_verify_callback`] every resumption fails verification; call
+    /// [`SslRef::verify_peer_cert_chain`] from it to keep the built-in X.509 checks. Incompatible
+    /// with [`SslVerifyMode::NONE`], including a mode set on one connection.
     #[corresponds(SSL_CTX_set_reverify_on_resume)]
     pub fn set_reverify_on_resume(&mut self, enabled: bool) {
         unsafe { ffi::SSL_CTX_set_reverify_on_resume(self.as_ptr(), enabled as _) }
@@ -1328,16 +1350,18 @@ impl SslContextBuilder {
     }
 
     /// Sets a custom certificate store for verifying peer certificates.
-    #[corresponds(SSL_CTX_set0_verify_cert_store)]
+    #[corresponds(SSL_CTX_set1_verify_cert_store)]
     pub fn set_verify_cert_store(&mut self, cert_store: X509Store) -> Result<(), ErrorStack> {
         self.ctx.check_x509();
 
         unsafe {
-            cvt(ffi::SSL_CTX_set0_verify_cert_store(
+            cvt(ffi::SSL_CTX_set1_verify_cert_store(
                 self.as_ptr(),
-                cert_store.into_ptr(),
-            ))
+                cert_store.as_ptr(),
+            ))?;
         }
+        self.replace_ex_data(*VERIFY_STORE_INDEX, cert_store);
+        Ok(())
     }
 
     /// Replaces the context's certificate store, and keeps it immutable.
@@ -3382,16 +3406,18 @@ impl SslRef {
     }
 
     /// Sets a custom certificate store for verifying peer certificates.
-    #[corresponds(SSL_set0_verify_cert_store)]
+    #[corresponds(SSL_set1_verify_cert_store)]
     pub fn set_verify_cert_store(&mut self, cert_store: X509Store) -> Result<(), ErrorStack> {
         self.ssl_context().check_x509();
 
         unsafe {
-            cvt(ffi::SSL_set0_verify_cert_store(
+            cvt(ffi::SSL_set1_verify_cert_store(
                 self.as_ptr(),
-                cert_store.into_ptr(),
-            ))
+                cert_store.as_ptr(),
+            ))?;
         }
+        self.set_ex_data(*SSL_VERIFY_STORE_INDEX, Some(cert_store));
+        Ok(())
     }
 
     /// Like [`SslContextBuilder::set_custom_verify_callback`].
@@ -3854,7 +3880,15 @@ impl SslRef {
             "X.509 certificate support in old and new contexts doesn't match",
         );
 
-        unsafe { cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr())).map(|_| ()) }
+        let changed = self.ssl_context().as_ptr() != ctx.as_ptr();
+        unsafe { cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr()))? };
+        // BoringSSL copied the new context's certificate settings, dropping a per-connection store.
+        if changed {
+            if let Some(store) = self.ex_data_mut(*SSL_VERIFY_STORE_INDEX) {
+                *store = None;
+            }
+        }
+        Ok(())
     }
 
     /// Returns the context corresponding to the current connection.
@@ -3886,6 +3920,97 @@ impl SslRef {
         self.ssl_context().check_x509();
 
         unsafe { X509VerifyError::from_raw(ffi::SSL_get_verify_result(self.as_ptr()) as c_int) }
+    }
+
+    /// Verifies the peer certificate chain as BoringSSL's built-in X.509 verifier does.
+    ///
+    /// Call it from [`SslContextBuilder::set_custom_verify_callback`] to keep the built-in checks,
+    /// which lets [`SslContextBuilder::set_reverify_on_resume`] apply them to resumed sessions. It
+    /// uses the same verify store, this connection's [verify parameters](Self::verify_param_mut)
+    /// including the hostname, the ECH public name, and the verify and cert verify callbacks.
+    ///
+    /// BoringSSL reports a rejection through [`Self::verify_result`] as
+    /// [`X509VerifyError::APPLICATION_VERIFICATION`].
+    #[corresponds(X509_verify_cert)]
+    pub fn verify_peer_cert_chain(&self) -> X509VerifyResult {
+        let context = self.ssl_context();
+        if !context.has_x509_support() {
+            return Err(X509VerifyError::INVALID_CALL);
+        }
+
+        // SAFETY: the context uses the X.509 method, and the session under verification owns the
+        // chain while this connection is borrowed.
+        let chain = unsafe { ffi::SSL_get_peer_full_cert_chain(self.as_ptr()) };
+        if chain.is_null() {
+            return Err(X509VerifyError::INVALID_CALL);
+        }
+        let chain = unsafe { StackRef::<X509>::from_ptr(chain) };
+        let Some(leaf) = chain.get(0) else {
+            return Err(X509VerifyError::INVALID_CALL);
+        };
+
+        let store: &X509StoreRef = match (
+            self.ex_data(*SSL_VERIFY_STORE_INDEX),
+            context.ex_data(*VERIFY_STORE_INDEX),
+        ) {
+            (Some(Some(store)), _) | (_, Some(store)) => store,
+            _ => context.cert_store(),
+        };
+
+        let Ok(mut store_ctx) = X509StoreContext::new() else {
+            return Err(X509VerifyError::OUT_OF_MEM);
+        };
+        store_ctx
+            .init(store, leaf, chain, |store_ctx| {
+                let purpose = if self.is_server() {
+                    c"ssl_client"
+                } else {
+                    c"ssl_server"
+                };
+                // SAFETY: mirrors BoringSSL's built-in verifier; `self` outlives `store_ctx`,
+                // which `init` cleans up before returning.
+                let ret = unsafe {
+                    let ctx = store_ctx.as_ptr();
+                    let param = ffi::X509_STORE_CTX_get0_param(ctx);
+                    cvt(ffi::X509_STORE_CTX_set_ex_data(
+                        ctx,
+                        ffi::SSL_get_ex_data_X509_STORE_CTX_idx(),
+                        self.as_ptr().cast(),
+                    ))?;
+                    cvt(ffi::X509_STORE_CTX_set_default(ctx, purpose.as_ptr()))?;
+                    cvt(ffi::X509_VERIFY_PARAM_set1(
+                        param,
+                        ffi::SSL_get0_param(self.as_ptr()),
+                    ))?;
+                    if let Some(name) = self.get_ech_name_override().filter(|name| !name.is_empty())
+                    {
+                        cvt(ffi::X509_VERIFY_PARAM_set1_host(
+                            param,
+                            name.as_ptr().cast(),
+                            name.len(),
+                        ))?;
+                    }
+                    if let Some(callback) = ffi::SSL_get_verify_callback(self.as_ptr()) {
+                        ffi::X509_STORE_CTX_set_verify_cb(ctx, Some(callback));
+                    }
+                    match context.ex_data(*CERT_VERIFY_INDEX) {
+                        Some(&callback) => callback(ctx, ptr::null_mut()),
+                        None => ffi::X509_verify_cert(ctx),
+                    }
+                };
+
+                // A verify callback may accept a chain with a recorded error; the return decides.
+                Ok(if ret > 0 {
+                    unsafe { ffi::ERR_clear_error() };
+                    Ok(())
+                } else {
+                    Err(store_ctx
+                        .verify_result()
+                        .err()
+                        .unwrap_or(X509VerifyError::UNSPECIFIED))
+                })
+            })
+            .unwrap_or(Err(X509VerifyError::UNSPECIFIED))
     }
 
     /// Returns a shared reference to the SSL session.
