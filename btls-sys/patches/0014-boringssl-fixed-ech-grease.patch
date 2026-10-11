@@ -1,0 +1,23 @@
+From fd0e6d36e1b4d901fd95da4809e92d52df0221df Mon Sep 17 00:00:00 2001
+From: megalania <noreply@megalania.io>
+Date: Sun, 11 Oct 2026 14:43:10 +0300
+Subject: [PATCH] boringssl: fixed ECH GREASE length when extensions are not
+ permuted
+
+---
+ ssl/encrypted_client_hello.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
+index 46ba196..3ca8fd8 100644
+--- a/ssl/encrypted_client_hello.cc
++++ b/ssl/encrypted_client_hello.cc
+@@ -765,7 +765,7 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+   // estimate maximum_name_length to be between 32 and 100 bytes. Then round up
+   // to a multiple of 32, to match RFC 9849, section 6.1.3.
+   const size_t payload_len =
+-      32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
++      32 * (hs->config->permute_extensions ? random_size(128 / 32, 224 / 32) : 224 / 32) + aead_overhead(aead);
+   bssl::ScopedCBB cbb;
+   CBB enc_cbb, payload_cbb;
+   uint8_t *payload;
