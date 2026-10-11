@@ -74,7 +74,7 @@ impl Config {
             .as_ref()
             .is_some_and(|path| path.join("src").exists());
 
-        // DEP_BORINGSSL_VERSION_MAJOR
+        // DEP_BTLS_VERSION_MAJOR
         println!(
             "cargo:version_major={}",
             env::var("CARGO_PKG_VERSION_MAJOR").unwrap_or_default()
@@ -103,6 +103,27 @@ impl Config {
     fn check_feature_compatibility(&self) -> Result<(), &'static str> {
         if self.features.fips && self.features.rpk {
             return Err("`fips` and `rpk` features are mutually exclusive");
+        }
+
+        // BoringSSL's BUILDING.md: "symbol prefixing cannot be used with the combination of
+        // FIPS and static libraries". This crate always links BoringSSL statically, so the
+        // combination is unsupported and would silently produce an unprefixed FIPS module.
+        if self.features.is_fips_like() && self.features.prefix_symbols {
+            return Err(
+                "`fips` and `prefix-symbols` features are mutually exclusive, because BoringSSL \
+                does not support symbol prefixing for static FIPS builds",
+            );
+        }
+
+        // Symbol prefixing regenerates BoringSSL's prefix list from the patched headers,
+        // which means writing into the source tree. A caller-owned tree may be read-only,
+        // shared between concurrent target builds, or expected to stay untouched.
+        if self.features.prefix_symbols && self.env.source_path.is_some() {
+            return Err(
+                "`prefix-symbols` cannot be used with `BORING_BSSL{,_FIPS}_SOURCE_PATH`, \
+                because symbol prefixing regenerates BoringSSL's prefix list and would write \
+                it into the provided source tree. Build from the vendored submodule instead.",
+            );
         }
 
         let is_precompiled_native_lib = self.env.path.is_some();

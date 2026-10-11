@@ -17,6 +17,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
+    clippy::manual_div_ceil,
     clippy::ptr_offset_with_cast,
     clippy::useless_transmute,
     dead_code,
@@ -36,6 +37,8 @@ pub use generated::{FIPS_mode, SSL_CTX_set_compliance_policy}; // your include p
 pub use generated::{MLKEM768_encap, MLKEM768_private_key_from_seed}; // your include path is incorrect or has a version of boringssl without mlkem support
 #[cfg(feature = "rpk")]
 pub use generated::{SSL_CREDENTIAL_new_raw_public_key_empty, SSL_CREDENTIAL_set1_spki}; // your include path is incorrect or has a version of boringssl without rpk support
+#[cfg(not(feature = "fips"))]
+pub use generated::{SSL_seal_app_data, SSL_seal_app_data_limits}; // your include path is incorrect or has a version of boringssl without patch 0012 (seal-app-data)
 
 pub use generated::*;
 #[cfg(target_pointer_width = "64")]
@@ -79,28 +82,7 @@ pub fn cbs_init(data: &[u8]) -> CBS {
 }
 
 pub mod internal {
-    use super::EVP_MD;
-    use std::os::raw::c_int;
-
-    extern "C" {
-        /// Calculates `out_len` bytes of the TLS 1.2 PRF using `digest` and writes
-        /// them to `out`.
-        ///
-        /// This symbol is exported by BoringSSL, but it is declared in an internal
-        /// header (`crypto/fipsmodule/tls/internal.h`) and is therefore not present
-        /// in generated bindgen output.
-        pub fn CRYPTO_tls1_prf(
-            digest: *const EVP_MD,
-            out: *mut u8,
-            out_len: usize,
-            secret: *const u8,
-            secret_len: usize,
-            label: *const u8,
-            label_len: usize,
-            seed1: *const u8,
-            seed1_len: usize,
-            seed2: *const u8,
-            seed2_len: usize,
-        ) -> c_int;
-    }
+    // BoringSSL now exposes this in the public `openssl/tls_prf.h`, so bindgen
+    // generates it; kept as a re-export so the old path still works.
+    pub use super::CRYPTO_tls1_prf;
 }

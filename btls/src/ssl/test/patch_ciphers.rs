@@ -673,24 +673,36 @@ fn boringssl_patch_dhe_ciphers_negotiate_individually() {
         .iter()
         .filter(|cipher| cipher.peer == CipherPeer::OpenSslDhe)
     {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // s_server takes a port number, so the test reserves a free port and
+        // releases it first. A parallel test can take the port in between:
+        // s_server then exits with "Address already in use", and the probe or
+        // handshake may even reach the other test's listener. Retry on a new
+        // port whenever s_server failed to bind; other errors fail the test.
+        const ATTEMPTS: usize = 5;
+        for attempt in 1..=ATTEMPTS {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
 
-        let mut server = OpenSslServer::spawn(addr, cipher)
-            .unwrap_or_else(|error| panic!("{}: {error}", cipher.rule_name));
-        let result = match server.wait_until_listening(addr) {
-            Ok(()) => negotiate_with_openssl(addr, cipher),
-            Err(error) => Err(error),
-        };
-        let output = server.stop();
+            let mut server = OpenSslServer::spawn(addr, cipher)
+                .unwrap_or_else(|error| panic!("{}: {error}", cipher.rule_name));
+            let result = match server.wait_until_listening(addr) {
+                Ok(()) => negotiate_with_openssl(addr, cipher),
+                Err(error) => Err(error),
+            };
+            let output = server.stop();
 
-        if let Err(error) = result {
+            let Err(error) = result else {
+                break;
+            };
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if attempt < ATTEMPTS && stderr.contains("Address already in use") {
+                continue;
+            }
             panic!(
-                "{}: {error}\nOpenSSL stdout:\n{}\nOpenSSL stderr:\n{}",
+                "{}: {error}\nOpenSSL stdout:\n{}\nOpenSSL stderr:\n{stderr}",
                 cipher.rule_name,
                 String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
             );
         }
     }

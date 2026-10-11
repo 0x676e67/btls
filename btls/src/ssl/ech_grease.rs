@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::num::NonZeroU16;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::{ptr, slice};
 
@@ -27,7 +28,8 @@ pub struct EchGreaseParameters {
     /// AEAD identifier to advertise; the payload remains random bytes.
     pub aead: EchGreaseAead,
     /// Final payload length, including the simulated tag but not ECH framing.
-    pub payload_length: usize,
+    /// Must not exceed [`EchGreaseInfo::max_payload_length`].
+    pub payload_length: NonZeroU16,
 }
 
 /// A read-only view of the first ClientHello, valid only during the callback.
@@ -119,7 +121,7 @@ unsafe extern "C" fn parameter_callback(
             unsafe {
                 *out = ffi::SSL_ECH_GREASE_PARAMETERS {
                     aead_id: parameters.aead.0,
-                    payload_length: parameters.payload_length,
+                    payload_length: usize::from(parameters.payload_length.get()),
                 }
             };
             1

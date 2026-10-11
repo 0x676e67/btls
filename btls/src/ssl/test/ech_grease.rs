@@ -1,6 +1,7 @@
 #![cfg(not(feature = "fips"))]
 
 use std::ffi::c_void;
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +18,7 @@ use crate::ssl::{
 fn parameters(info: &EchGreaseInfo<'_>, payload_length: usize) -> EchGreaseParameters {
     EchGreaseParameters {
         aead: info.default_aead(),
-        payload_length,
+        payload_length: NonZeroU16::new(u16::try_from(payload_length).unwrap()).unwrap(),
     }
 }
 
@@ -107,7 +108,7 @@ fn ech(hello: &[u8]) -> Vec<u8> {
 fn ech_callback_fixed_lengths_and_order() {
     let baseline = handshake(|_| {}, false);
     assert!([186, 218, 250, 282].contains(&ech(&baseline[0]).len()));
-    for requested in [144, 176, 208, 239, 240] {
+    for requested in [1, 144, 176, 208, 239, 240] {
         let messages = handshake(
             |ssl| {
                 ssl.set_ech_grease_callback(move |info| Ok(parameters(info, requested)))
@@ -158,7 +159,7 @@ fn ech_policy_callback_metadata_and_hrr_reuse() {
                 // A deliberately simple size-dependent policy, not an NSS emulator.
                 Ok(EchGreaseParameters {
                     aead: EchGreaseAead::CHACHA20_POLY1305,
-                    payload_length: info.aead_overhead() + 2 * info.extensions().len(),
+                    ..parameters(info, info.aead_overhead() + 2 * info.extensions().len())
                 })
             })
             .unwrap();
@@ -197,7 +198,7 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
                         assert_eq!(info.default_aead(), default_aead);
                         Ok(EchGreaseParameters {
                             aead,
-                            payload_length: 239,
+                            payload_length: NonZeroU16::new(239).unwrap(),
                         })
                     })
                     .unwrap();
@@ -248,7 +249,8 @@ fn ech_policy_disabled_and_tls12_do_not_call_callback() {
 
 #[test]
 fn ech_policy_callback_errors_and_panics_fail_handshake() {
-    for failure in 0..5 {
+    // Zero and oversized size_t values remain covered by the native C tests.
+    for failure in 0..4 {
         let mut server = Server::builder();
         server.should_error();
         let server = server.build();
@@ -259,8 +261,7 @@ fn ech_policy_callback_errors_and_panics_fail_handshake() {
             .set_ech_grease_callback(move |info| match failure {
                 0 => Err(ErrorStack::internal_error_str("test sizing error")),
                 1 => panic!("test sizing panic"),
-                2 => Ok(parameters(info, usize::MAX)),
-                3 => Ok(parameters(info, 0)),
+                2 => Ok(parameters(info, usize::from(u16::MAX))),
                 _ => Ok(parameters(info, info.max_payload_length() + 1)),
             })
             .unwrap();
