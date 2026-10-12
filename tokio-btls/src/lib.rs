@@ -529,8 +529,19 @@ where
             }))?;
         }
 
-        // close_notify is buffered like any record.
-        ready!(self.as_mut().poll_flush(ctx))?;
+        // close_notify is buffered like any record; drain write_buf directly without tls_flush.
+        ready!(self.as_mut().with_context(ctx, |s| {
+            let StreamWrapper {
+                transport,
+                write_buf,
+                ..
+            } = s.get_mut();
+            match write_buf.drain(transport) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+                Err(e) => Poll::Ready(Err(e)),
+            }
+        }))?;
         self.get_pin_mut().poll_shutdown(ctx)
     }
 }
