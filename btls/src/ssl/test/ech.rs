@@ -79,7 +79,7 @@ fn ech_real_configuration_bypasses_custom_grease_policy() {
     client.ssl().set_enable_ech_grease(true);
     client
         .ssl()
-        .set_ech_grease_callback(|_| panic!("real ECH used GREASE policy"))
+        .set_ech_grease_callback(|_, _| panic!("real ECH used GREASE policy"))
         .unwrap();
     assert!(client.connect().ssl().ech_accepted());
 }
@@ -91,7 +91,7 @@ fn ech_rejection_does_not_invoke_custom_grease_policy() {
     client.ssl().set_enable_ech_grease(true);
     client
         .ssl()
-        .set_ech_grease_callback(|_| panic!("rejected real ECH used GREASE policy"))
+        .set_ech_grease_callback(|_, _| panic!("rejected real ECH used GREASE policy"))
         .unwrap();
     let HandshakeError::Failure(failed) = client.connect_err() else {
         panic!("expected ECH rejection");

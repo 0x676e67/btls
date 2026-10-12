@@ -1,12 +1,11 @@
 use std::ffi::c_void;
 use std::num::NonZeroU16;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::{ptr, slice};
 
 use foreign_types::ForeignTypeRef;
 use openssl_macros::corresponds;
 
-use super::{Ssl, SslRef};
+use super::{Ssl, SslContext, SslContextBuilder, SslRef};
 use crate::error::ErrorStack;
 use crate::{cvt_0i, ffi};
 
@@ -34,8 +33,7 @@ pub struct EchGreaseParameters {
 
 /// A read-only view of the first ClientHello, valid only during the callback.
 ///
-/// Extension sizes exclude ECH, padding and PSK. The PSK size is supplied
-/// separately. No extension writers are rerun to produce this view.
+/// Extension sizes exclude their headers; PSK is reported separately.
 pub struct EchGreaseInfo<'a>(&'a ffi::SSL_ECH_GREASE_SIZE_INFO);
 
 impl EchGreaseInfo<'_> {
@@ -48,7 +46,7 @@ impl EchGreaseInfo<'_> {
         unsafe { slice::from_raw_parts(self.0.cipher_suites, self.0.cipher_suites_length) }
     }
 
-    /// Extension type and body length, excluding the four-byte extension header.
+    /// Extension type and body length, excluding ECH, padding, PSK and headers.
     pub fn extensions(&self) -> impl ExactSizeIterator<Item = (u16, usize)> + '_ {
         let extensions = if self.0.num_extensions == 0 {
             &[]
@@ -59,12 +57,13 @@ impl EchGreaseInfo<'_> {
         extensions.iter().map(|ext| (ext.type_, ext.length))
     }
 
-    /// ClientHello preamble length, excluding handshake and extensions headers.
+    /// Wire preamble length, including the session ID and DTLS cookie, excluding
+    /// handshake and extensions headers. This is not an encoded ECH Inner size.
     pub fn preamble_length(&self) -> usize {
         self.0.preamble_length
     }
 
-    /// Pending PSK extension length, including its header; zero if absent.
+    /// Pending PSK extension body length; zero if absent.
     pub fn psk_extension_length(&self) -> usize {
         self.0.psk_extension_length
     }
@@ -84,7 +83,9 @@ impl EchGreaseInfo<'_> {
         self.0.aead_overhead
     }
 
-    /// Maximum payload that fits alongside this ClientHello's other extensions.
+    /// CH1's remaining extensions-vector frame budget, not a peer acceptance limit.
+    /// BoringSSL servers normally limit a handshake message to 16 KiB.
+    /// HRR may need more room for a cookie or a larger key share in CH2.
     pub fn max_payload_length(&self) -> usize {
         self.0.max_payload_length
     }
@@ -100,24 +101,35 @@ impl EchGreaseInfo<'_> {
     }
 }
 
-type ParameterCallback =
-    dyn Fn(&EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack> + Send + Sync;
-struct Callback(Box<ParameterCallback>);
-type StoredCallback = Option<Box<Callback>>;
+struct Callback<F>(F);
 
-unsafe extern "C" fn parameter_callback(
+unsafe extern "C" fn parameter_callback<F, const CONTEXT: bool>(
     info: *const ffi::SSL_ECH_GREASE_SIZE_INFO,
     out: *mut ffi::SSL_ECH_GREASE_PARAMETERS,
-    arg: *mut c_void,
-) -> libc::c_int {
-    // The SSL's ex_data owns this stable Box until replacement or SSL destruction.
-    // Neither the view nor its slices can escape the borrowed call.
-    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-        let callback = &*arg.cast::<Callback>();
-        (callback.0)(&EchGreaseInfo(&*info))
-    }));
-    match result {
-        Ok(Ok(parameters)) => {
+    _: *mut c_void,
+) -> libc::c_int
+where
+    F: Fn(&SslRef, &EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+        + Send
+        + Sync
+        + 'static,
+{
+    // Both views borrow the synchronous invocation. Shared SSL access prevents
+    // safe code from replacing the closure or reentering this handshake.
+    let info = unsafe { &*info };
+    let ssl = unsafe { SslRef::from_ptr(info.ssl.cast_mut()) };
+    let callback = if CONTEXT {
+        ssl.ssl_context()
+            .ex_data(SslContext::cached_ex_index::<Option<Callback<F>>>())
+    } else {
+        ssl.ex_data(Ssl::cached_ex_index::<Option<Callback<F>>>())
+    };
+    let Some(Some(callback)) = callback else {
+        return 0;
+    };
+    // Like the other SSL callbacks, a panic aborts at this extern "C" boundary.
+    match (callback.0)(ssl, &EchGreaseInfo(info)) {
+        Ok(parameters) => {
             unsafe {
                 *out = ffi::SSL_ECH_GREASE_PARAMETERS {
                     aead_id: parameters.aead.0,
@@ -126,44 +138,60 @@ unsafe extern "C" fn parameter_callback(
             };
             1
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             error.put();
             0
         }
-        Err(_) => 0,
     }
 }
 
-impl SslRef {
-    /// Selects ECH GREASE's AEAD identifier and final payload length together.
+impl SslContextBuilder {
+    /// Sets the default ECH GREASE policy for connections using this context.
     ///
-    /// Set before building ClientHello. Called once only when GREASE is needed;
-    /// HRR and retransmissions reuse its bytes. This does not enable GREASE or
-    /// affect real ECH or TLS cipher preferences. Replacing the callback after
-    /// ClientHello starts fails without changing the previous callback.
-    /// The callback belongs to this `Ssl`; install it separately on each new connection.
-    ///
-    /// Return a nonzero payload length at most [`EchGreaseInfo::max_payload_length`],
-    /// including the simulated AEAD tag but excluding ECH framing. The callback
-    /// controls AEAD selection and sizing; BoringSSL still generates the random bytes.
-    /// Arbitrary lengths need not match [RFC 9849]'s recommended distribution.
-    /// Returning an error or an invalid length fails the handshake.
-    /// Panics are caught when unwinding is enabled and fail the handshake too.
+    /// Called once when CH1 needs GREASE; HRR reuses its bytes. Does not enable
+    /// GREASE or change real ECH or TLS cipher preferences. Errors or oversized
+    /// output fail the handshake; panics abort, as with other SSL callbacks.
+    /// See [`EchGreaseInfo::max_payload_length`] for sizing limits. Arbitrary
+    /// lengths need not follow [RFC 9849]'s recommended distribution.
     ///
     /// [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849.html#section-6.2.1
-    #[corresponds(SSL_set_ech_grease_callback)]
-    pub fn set_ech_grease_callback<F>(&mut self, callback: F) -> Result<(), ErrorStack>
+    #[corresponds(SSL_CTX_set_ech_grease_callback)]
+    pub fn set_ech_grease_callback<F>(&mut self, callback: F)
     where
-        F: Fn(&EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+        F: Fn(&SslRef, &EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
             + Send
             + Sync
             + 'static,
     {
-        let mut callback = Box::new(Callback(Box::new(callback)));
-        let arg = ptr::from_mut(callback.as_mut()).cast::<c_void>();
+        let old = self.replace_ex_data(
+            SslContext::cached_ex_index::<Option<Callback<F>>>(),
+            Some(Callback(callback)),
+        );
+        unsafe {
+            ffi::SSL_CTX_set_ech_grease_callback(
+                self.as_ptr(),
+                Some(parameter_callback::<F, true>),
+                ptr::null_mut(),
+            );
+        }
+        drop(old);
+    }
+}
+
+impl SslRef {
+    /// Overrides [`SslContextBuilder::set_ech_grease_callback`] for this connection.
+    /// Must be set before CH1 starts; a late replacement fails without changing
+    /// the active callback. The same sizing, error and panic rules apply.
+    #[corresponds(SSL_set_ech_grease_callback)]
+    pub fn set_ech_grease_callback<F>(&mut self, callback: F) -> Result<(), ErrorStack>
+    where
+        F: Fn(&SslRef, &EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+            + Send
+            + Sync
+            + 'static,
+    {
         let ssl = self.as_ptr();
-        // Allocate the ex_data slot before installing a pointer into the Box.
-        let index = Ssl::cached_ex_index::<StoredCallback>();
+        let index = Ssl::cached_ex_index::<Option<Callback<F>>>();
         if self.ex_data(index).is_none() {
             self.set_ex_data(index, None);
         }
@@ -173,12 +201,11 @@ impl SslRef {
         unsafe {
             cvt_0i(ffi::SSL_set_ech_grease_callback(
                 ssl,
-                Some(parameter_callback),
-                arg,
+                Some(parameter_callback::<F, false>),
+                ptr::null_mut(),
             ))?;
         }
-        // Store the new owner before dropping the old closure, whose Drop may panic.
-        drop(slot.replace(callback));
+        drop(slot.replace(Callback(callback)));
         Ok(())
     }
 }
