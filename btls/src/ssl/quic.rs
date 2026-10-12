@@ -2,12 +2,15 @@
 //!
 //! A QUIC connection has no BIO. BoringSSL hands its secrets and handshake messages to the
 //! [`QuicMethod`] of the context instead of writing records, and takes the peer's handshake
-//! messages through [`SslRef::provide_quic_data`].
+//! messages through [`Ssl::provide_quic_data`].
+//!
+//! Handshake input, role selection and driving methods require an owned [`Ssl`]. Callbacks
+//! only receive [`SslRef`], so they cannot reenter the handshake or invalidate its input.
 
-use super::{ErrorCode, SslAlert, SslCipherRef, SslContext, SslContextBuilder, SslRef};
+use super::{ErrorCode, Ssl, SslAlert, SslCipherRef, SslContext, SslContextBuilder, SslRef};
 use crate::error::ErrorStack;
 use crate::{cvt, ffi};
-use foreign_types::ForeignTypeRef;
+use foreign_types::{ForeignType, ForeignTypeRef};
 use openssl_macros::corresponds;
 use std::ffi::c_int;
 use std::marker::PhantomData;
@@ -34,10 +37,11 @@ pub struct QuicMethodError;
 
 /// The QUIC hooks of a context (`SSL_QUIC_METHOD`), see [`SslContextBuilder::set_quic_method`].
 ///
-/// BoringSSL calls them from inside [`SslRef::do_handshake`] and
-/// [`SslRef::process_quic_post_handshake`], and from calls that send an alert, never from
-/// [`SslRef::provide_quic_data`]. They must not drive the handshake themselves. Per-connection
-/// state belongs in the connection's ex data. An error terminates the handshake.
+/// BoringSSL calls them from inside [`Ssl::do_handshake`] and
+/// [`Ssl::process_quic_post_handshake`], and from calls that send an alert, never from
+/// [`Ssl::provide_quic_data`]. Callbacks receive an [`SslRef`] for configuration and queries;
+/// handshake input and driving require the [`Ssl`] owner after the callback returns.
+/// Per-connection state belongs in the connection's ex data. An error terminates the handshake.
 pub trait QuicMethod: Send + Sync + 'static {
     /// Installs the read secret and cipher suite of `level`. BoringSSL calls it at most once per
     /// level, and only after the write secret that ACKs the packets it protects.
@@ -114,14 +118,30 @@ impl SslContextBuilder {
     }
 }
 
-impl SslRef {
+impl Ssl {
     /// Makes the connection a client, for connections without a BIO such as QUIC ones.
+    ///
+    /// Callbacks cannot change the connection role.
+    ///
+    /// ```compile_fail,E0599
+    /// fn callback(ssl: &mut btls::ssl::SslRef) {
+    ///     ssl.set_connect_state();
+    /// }
+    /// ```
     #[corresponds(SSL_set_connect_state)]
     pub fn set_connect_state(&mut self) {
         unsafe { ffi::SSL_set_connect_state(self.as_ptr()) }
     }
 
     /// Makes the connection a server, for connections without a BIO such as QUIC ones.
+    ///
+    /// Callbacks cannot change the connection role.
+    ///
+    /// ```compile_fail,E0599
+    /// fn callback(ssl: &mut btls::ssl::SslRef) {
+    ///     ssl.set_accept_state();
+    /// }
+    /// ```
     #[corresponds(SSL_set_accept_state)]
     pub fn set_accept_state(&mut self) {
         unsafe { ffi::SSL_set_accept_state(self.as_ptr()) }
@@ -132,6 +152,14 @@ impl SslRef {
     ///
     /// [`ErrorCode::WANT_READ`] means the handshake waits for peer data. On [`ErrorCode::SSL`],
     /// the reason is on the error queue.
+    ///
+    /// Callbacks cannot reenter the handshake through their borrowed connection.
+    ///
+    /// ```compile_fail,E0599
+    /// fn callback(ssl: &mut btls::ssl::SslRef) {
+    ///     let _ = ssl.do_handshake();
+    /// }
+    /// ```
     #[corresponds(SSL_do_handshake)]
     pub fn do_handshake(&mut self) -> Result<(), ErrorCode> {
         let ret = unsafe { ffi::SSL_do_handshake(self.as_ptr()) };
@@ -142,6 +170,60 @@ impl SslRef {
         }
     }
 
+    /// Provides handshake data the peer sent at `level`, which the next
+    /// [`Ssl::do_handshake`] or [`Ssl::process_quic_post_handshake`] processes.
+    ///
+    /// It fails with `SSL_R_WRONG_ENCRYPTION_LEVEL_RECEIVED` if `level` is not
+    /// [`SslRef::quic_read_level`], and with `SSL_R_EXCESSIVE_MESSAGE_SIZE` if the buffered data
+    /// would exceed [`SslRef::quic_max_handshake_flight_len`]. The connection should then be
+    /// closed.
+    ///
+    /// Callbacks cannot change the input buffer while BoringSSL is processing it.
+    ///
+    /// ```compile_fail,E0599
+    /// fn callback(ssl: &mut btls::ssl::SslRef) {
+    ///     let _ = ssl.provide_quic_data(btls::ssl::QuicEncryptionLevel::INITIAL, &[]);
+    /// }
+    /// ```
+    #[corresponds(SSL_provide_quic_data)]
+    pub fn provide_quic_data(
+        &mut self,
+        level: QuicEncryptionLevel,
+        data: &[u8],
+    ) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_provide_quic_data(
+                self.as_ptr(),
+                level.0,
+                data.as_ptr(),
+                data.len(),
+            ))
+        }
+    }
+
+    /// Processes the handshake data provided after the handshake, such as session tickets.
+    ///
+    /// On [`ErrorCode::SSL`], the reason is on the error queue.
+    ///
+    /// Callbacks cannot reenter post-handshake processing.
+    ///
+    /// ```compile_fail,E0599
+    /// fn callback(ssl: &mut btls::ssl::SslRef) {
+    ///     let _ = ssl.process_quic_post_handshake();
+    /// }
+    /// ```
+    #[corresponds(SSL_process_quic_post_handshake)]
+    pub fn process_quic_post_handshake(&mut self) -> Result<(), ErrorCode> {
+        let ret = unsafe { ffi::SSL_process_quic_post_handshake(self.as_ptr()) };
+        if ret == 1 {
+            Ok(())
+        } else {
+            Err(self.error_code(ret))
+        }
+    }
+}
+
+impl SslRef {
     /// Sets the transport parameters this endpoint sends
     /// ([RFC 9001 §8.2](https://www.rfc-editor.org/rfc/rfc9001#section-8.2)).
     #[corresponds(SSL_set_quic_transport_params)]
@@ -218,42 +300,6 @@ impl SslRef {
     #[must_use]
     pub fn quic_max_handshake_flight_len(&self, level: QuicEncryptionLevel) -> usize {
         unsafe { ffi::SSL_quic_max_handshake_flight_len(self.as_ptr(), level.0) }
-    }
-
-    /// Provides handshake data the peer sent at `level`, which the next
-    /// [`SslRef::do_handshake`] or [`SslRef::process_quic_post_handshake`] processes.
-    ///
-    /// It fails with `SSL_R_WRONG_ENCRYPTION_LEVEL_RECEIVED` if `level` is not
-    /// [`SslRef::quic_read_level`], and with `SSL_R_EXCESSIVE_MESSAGE_SIZE` if the buffered data
-    /// would exceed [`SslRef::quic_max_handshake_flight_len`]. The connection should then be
-    /// closed.
-    #[corresponds(SSL_provide_quic_data)]
-    pub fn provide_quic_data(
-        &mut self,
-        level: QuicEncryptionLevel,
-        data: &[u8],
-    ) -> Result<(), ErrorStack> {
-        unsafe {
-            cvt(ffi::SSL_provide_quic_data(
-                self.as_ptr(),
-                level.0,
-                data.as_ptr(),
-                data.len(),
-            ))
-        }
-    }
-
-    /// Processes the handshake data provided after the handshake, such as session tickets.
-    ///
-    /// On [`ErrorCode::SSL`], the reason is on the error queue.
-    #[corresponds(SSL_process_quic_post_handshake)]
-    pub fn process_quic_post_handshake(&mut self) -> Result<(), ErrorCode> {
-        let ret = unsafe { ffi::SSL_process_quic_post_handshake(self.as_ptr()) };
-        if ret == 1 {
-            Ok(())
-        } else {
-            Err(self.error_code(ret))
-        }
     }
 }
 
