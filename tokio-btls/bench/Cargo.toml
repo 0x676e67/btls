@@ -1,0 +1,67 @@
+[package]
+name = "tokio-btls-bench"
+version = { workspace = true }
+edition = { workspace = true }
+publish = false
+description = "Read and write benchmarks for tokio-btls and tokio-rustls"
+
+# Keep cargo-release's shared version bump off this crate.
+[package.metadata.release]
+release = false
+
+[features]
+# Link jemalloc as the allocator of the whole process, BoringSSL and AWS-LC included.
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+tikv-jemallocator = { workspace = true, optional = true, features = ["unprefixed_malloc_on_supported_platforms"] }
+
+[dev-dependencies]
+aws-lc-rs = { workspace = true }
+btls = { workspace = true }
+cpu-time = { workspace = true }
+criterion = { workspace = true, features = ["async_tokio"] }
+libc = { workspace = true }
+sysinfo = { workspace = true, features = ["system"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-btls = { workspace = true }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs"] }
+
+[[test]]
+name = "support"
+path = "tests.rs"
+
+[[bench]]
+name = "read_memory"
+path = "read_memory.rs"
+harness = false
+
+[[bench]]
+name = "write_memory"
+path = "write_memory.rs"
+harness = false
+
+[[bench]]
+name = "read_tcp"
+path = "read_tcp.rs"
+harness = false
+
+[[bench]]
+name = "write_tcp"
+path = "write_tcp.rs"
+harness = false
+
+[[bench]]
+name = "read_tcp_cpu_time"
+path = "read_tcp_cpu_time.rs"
+harness = false
+
+[[bench]]
+name = "write_tcp_cpu_time"
+path = "write_tcp_cpu_time.rs"
+harness = false
+
+[[bench]]
+name = "concurrency_memory"
+path = "concurrency_memory.rs"
+harness = false
