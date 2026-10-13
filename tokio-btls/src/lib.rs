@@ -63,7 +63,7 @@ struct StreamWrapper<S> {
     // Set while sealing the last record of a write, which goes straight to the transport unless
     // `write_buf` is blocked.
     write_through: bool,
-    // Set once `SSL_shutdown` has queued close_notify; later polls only flush it.
+    // Set once `SSL_shutdown` has nothing left to send; later polls only flush.
     shutdown_sent: bool,
     // The end or error a read met after taking plaintext, reported by the next read.
     read_end: Option<io::Result<()>>,
@@ -150,19 +150,6 @@ fn cvt<T>(r: io::Result<T>) -> Poll<io::Result<T>> {
     }
 }
 
-/// Whether `SSL_shutdown` failed because a fatal alert already closed the write side.
-///
-/// `SSL_shutdown` raises `PROTOCOL_IS_SHUTDOWN` only when a fatal alert, rather than
-/// close_notify, set the write shutdown state; the read or write that sent it reported the error.
-fn closed_by_alert(e: &ssl::Error) -> bool {
-    e.ssl_error().is_some_and(|stack| {
-        stack
-            .errors()
-            .iter()
-            .any(|e| e.library_reason(ffi::ERR_LIB_SSL) == Some(ffi::SSL_R_PROTOCOL_IS_SHUTDOWN))
-    })
-}
-
 fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
     match r {
         Ok(v) => Poll::Ready(Ok(v)),
@@ -171,6 +158,18 @@ fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
             _ => Poll::Ready(Err(e)),
         },
     }
+}
+
+/// Whether `SSL_shutdown` failed because a fatal alert already closed the write side.
+///
+/// `SSL_shutdown` raises `PROTOCOL_IS_SHUTDOWN` only when a fatal alert, rather than
+/// close_notify, closed the write side; reads keep reporting the error that sent it.
+fn closed_by_alert(e: &ssl::Error) -> bool {
+    e.ssl_error().is_some_and(|stack| {
+        stack.errors().iter().any(|err| {
+            err.library_reason(ffi::ERR_LIB_SSL) == Some(ffi::SSL_R_PROTOCOL_IS_SHUTDOWN)
+        })
+    })
 }
 
 // ===== impl SslStream =====
@@ -524,14 +523,14 @@ where
                 match s.shutdown() {
                     Ok(ShutdownResult::Sent) | Ok(ShutdownResult::Received) => {}
                     Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => {}
+                    // A fatal alert already closed the write side; flush it and close the transport.
+                    Err(ref e) if closed_by_alert(e) => {}
                     Err(ref e)
                         if e.code() == ErrorCode::WANT_READ
                             || e.code() == ErrorCode::WANT_WRITE =>
                     {
                         return Poll::Pending;
                     }
-                    // A fatal alert already closed the write side; flush it and close the transport.
-                    Err(ref e) if closed_by_alert(e) => {}
                     Err(e) => {
                         return Poll::Ready(Err(e
                             .into_io_error()
@@ -545,7 +544,7 @@ where
             }))?;
         }
 
-        // close_notify, or the fatal alert sent instead, is buffered like any record.
+        // close_notify, or a fatal alert sent earlier, is buffered like any record.
         ready!(self.as_mut().poll_flush(ctx))?;
         self.get_pin_mut().poll_shutdown(ctx)
     }
@@ -1911,16 +1910,15 @@ mod tests {
         let mut read = ReadBuf::new(&mut buf);
         let res = Pin::new(&mut client).poll_read(&mut cx, &mut read);
         assert!(matches!(res, Poll::Ready(Err(_))), "{res:?}");
-        assert!(client.get_ref().tap.is_empty());
+        let alert = client.0.get_ref().write_buf.buffered().to_vec();
+        assert!(matches!(records(&alert)[..], [(21, _)]), "{alert:?}");
 
-        // Shutdown sends the alert in place of close_notify and closes the transport, every time.
+        // Shutdown sends the alert in place of close_notify and closes the transport.
         client.get_mut().open = true;
-        client.shutdown().await.unwrap();
         client.shutdown().await.unwrap();
         let mut wire = Vec::new();
         server.get_mut().read_to_end(&mut wire).await.unwrap();
-        assert_eq!(wire, client.get_ref().tap);
-        assert!(matches!(records(&wire)[..], [(21, _)]), "{wire:?}");
+        assert_eq!(wire, alert);
     }
 
     #[test]
