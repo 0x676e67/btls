@@ -39,10 +39,10 @@ prefix-symbols = ["btls/prefix-symbols"]
 
 [dependencies]
 btls = { workspace = true }
+btls-sys = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-btls-sys = { workspace = true }
 foreign-types = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = [ "full" ] }

@@ -24,6 +24,7 @@ use btls::{
         SslStream as SslStreamCore,
     },
 };
+use btls_sys as ffi;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Capacity of the ciphertext read buffer, large enough for one TLS record
@@ -147,6 +148,19 @@ fn cvt<T>(r: io::Result<T>) -> Poll<io::Result<T>> {
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
         Err(e) => Poll::Ready(Err(e)),
     }
+}
+
+/// Whether `SSL_shutdown` failed because a fatal alert already closed the write side.
+///
+/// `SSL_shutdown` raises `PROTOCOL_IS_SHUTDOWN` only when a fatal alert, rather than
+/// close_notify, set the write shutdown state; the read or write that sent it reported the error.
+fn closed_by_alert(e: &ssl::Error) -> bool {
+    e.ssl_error().is_some_and(|stack| {
+        stack
+            .errors()
+            .iter()
+            .any(|e| e.library_reason(ffi::ERR_LIB_SSL) == Some(ffi::SSL_R_PROTOCOL_IS_SHUTDOWN))
+    })
 }
 
 fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
@@ -516,6 +530,8 @@ where
                     {
                         return Poll::Pending;
                     }
+                    // A fatal alert already closed the write side; flush it and close the transport.
+                    Err(ref e) if closed_by_alert(e) => {}
                     Err(e) => {
                         return Poll::Ready(Err(e
                             .into_io_error()
@@ -529,7 +545,7 @@ where
             }))?;
         }
 
-        // close_notify is buffered like any record.
+        // close_notify, or the fatal alert sent instead, is buffered like any record.
         ready!(self.as_mut().poll_flush(ctx))?;
         self.get_pin_mut().poll_shutdown(ctx)
     }
@@ -1878,6 +1894,33 @@ mod tests {
         let mut received = Vec::new();
         server.read_to_end(&mut received).await.unwrap();
         assert!(received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_fatal_alert_closes_the_transport() {
+        let (mut client, mut server) = tls_pair().await;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        // A record that fails to open makes the client send a fatal alert, which stays buffered
+        // while the transport takes nothing.
+        let mut record = vec![23, 3, 3, 0, 32];
+        record.resize(5 + 32, 0);
+        server.get_mut().write_all(&record).await.unwrap();
+        client.get_mut().open = false;
+        let mut buf = [0; 16];
+        let mut read = ReadBuf::new(&mut buf);
+        let res = Pin::new(&mut client).poll_read(&mut cx, &mut read);
+        assert!(matches!(res, Poll::Ready(Err(_))), "{res:?}");
+        assert!(client.get_ref().tap.is_empty());
+
+        // Shutdown sends the alert in place of close_notify and closes the transport, every time.
+        client.get_mut().open = true;
+        client.shutdown().await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut wire = Vec::new();
+        server.get_mut().read_to_end(&mut wire).await.unwrap();
+        assert_eq!(wire, client.get_ref().tap);
+        assert!(matches!(records(&wire)[..], [(21, _)]), "{wire:?}");
     }
 
     #[test]
