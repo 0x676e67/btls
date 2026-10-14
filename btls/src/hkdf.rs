@@ -62,6 +62,40 @@ impl HkdfSuite {
         Ok(prk)
     }
 
+    /// Like [`HkdfSuite::extract`], but writes the pseudorandom key into `out` and returns its
+    /// length, so that the caller controls the memory holding it, for example to zero it.
+    ///
+    /// `out` must hold at least [`HkdfSuite::prk_size`] bytes.
+    pub fn extract_into(
+        &self,
+        salt: &[u8],
+        ikm: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, ErrorStack> {
+        if out.len() < self.prk_size() {
+            return Err(ErrorStack::internal_error_str(
+                "HKDF PRK buffer is shorter than the digest output",
+            ));
+        }
+        ffi::init();
+
+        let mut len = 0;
+        // BoringSSL's native HKDF_extract API orders these arguments as
+        // secret/IKM, then salt, unlike the RFC 5869 notation and this API.
+        unsafe {
+            cvt(ffi::HKDF_extract(
+                out.as_mut_ptr(),
+                &mut len,
+                self.digest.as_ptr(),
+                ikm.as_ptr(),
+                ikm.len(),
+                salt.as_ptr(),
+                salt.len(),
+            ))?;
+        }
+        Ok(len)
+    }
+
     /// Computes HKDF-Expand as specified in [RFC 5869, Section
     /// 2.3](https://www.rfc-editor.org/rfc/rfc5869.html#section-2.3).
     ///
