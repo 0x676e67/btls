@@ -66,6 +66,7 @@ struct StreamWrapper<S> {
     shutdown_sent: bool,
     // The end or error a read met after taking plaintext, reported by the next read.
     read_end: Option<io::Result<()>>,
+    single_record_mode: bool,
 }
 
 /// The underlying stream and the task context of the poll driving it.
@@ -245,6 +246,49 @@ impl<S> SslStream<S> {
     pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut S> {
         // SAFETY: the stream is structurally pinned; it is never moved out of a pinned `SslStream`.
         unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0.get_mut().transport.stream) }
+    }
+
+    /// Consumes the `SslStream`, returning the underlying stream and any unconsumed raw bytes
+    /// remaining in both BoringSSL's internal read buffer and tokio-btls's transport read buffer.
+    ///
+    /// This is essential for zero-copy direct splice protocols (like XTLS-Vision), where the
+    /// stream transitions from TLS to plaintext transport while raw bytes may have already
+    /// been buffered.
+    pub fn into_parts(self) -> (S, Vec<u8>) {
+        let mut leftover = self.ssl().unconsumed_read_buffer().to_vec();
+        let wrapper = self.0.into_inner();
+        if wrapper.read_buf.pos < wrapper.read_buf.bytes.len() {
+            leftover.extend_from_slice(&wrapper.read_buf.bytes[wrapper.read_buf.pos..]);
+        }
+        (wrapper.transport.stream, leftover)
+    }
+
+    #[inline]
+    /// Configures whether [`poll_read`](AsyncRead::poll_read) returns immediately after taking
+    /// plaintext from at most one TLS record.
+    ///
+    /// When disabled (default), `poll_read` greedily loops while buffered ciphertext is available
+    /// to fill the caller's buffer.
+    ///
+    /// When enabled, `poll_read` stops and returns after taking plaintext from at most one record.
+    /// This is essential for protocol handovers (such as proxy unwrapping, STARTTLS, or protocol upgrades)
+    /// that unwrap the stream via [`into_parts`](Self::into_parts) after a specific record, preventing
+    /// subsequent transport data from being mistakenly passed into `SSL_read`.
+    pub fn set_single_record_mode(&mut self, enabled: bool) {
+        self.0.get_mut().single_record_mode = enabled;
+    }
+
+    #[inline]
+    /// Configures single record mode on a pinned stream.
+    pub fn set_single_record_mode_pinned(self: Pin<&mut Self>, enabled: bool) {
+        // SAFETY: mutating `single_record_mode` does not move the stream.
+        unsafe { self.get_unchecked_mut().set_single_record_mode(enabled) };
+    }
+
+    #[inline]
+    /// Returns whether single record mode is enabled.
+    pub fn single_record_mode(&self) -> bool {
+        self.0.get_ref().single_record_mode
     }
 
     /// Runs `f` with `ctx` installed as the context of the transport I/O BoringSSL performs in it.
@@ -448,6 +492,7 @@ where
             // fill the caller's buffer. An end or error met after taking plaintext is reported by
             // the next read.
             let start = buf.filled().len();
+            let single_record = s.get_ref().single_record_mode;
             let end = loop {
                 // SAFETY: read_uninit does not de-initialize the buffer.
                 match cvt(s.read_uninit(unsafe { buf.unfilled_mut() })) {
@@ -456,8 +501,9 @@ where
                         // SAFETY: read_uninit guarantees that nread bytes have been initialized.
                         unsafe { buf.assume_init(nread) };
                         buf.advance(nread);
-                        // Without buffered ciphertext, another record needs a transport poll.
-                        if buf.remaining() == 0 || s.get_ref().read_buf.is_empty() {
+                        // In single record mode, return immediately after reading at least one record.
+                        // Otherwise, without buffered ciphertext, another record needs a transport poll.
+                        if single_record || buf.remaining() == 0 || s.get_ref().read_buf.is_empty() {
                             break None;
                         }
                     }
@@ -546,6 +592,7 @@ impl<S> StreamWrapper<S> {
             write_through: false,
             shutdown_sent: false,
             read_end: None,
+            single_record_mode: false,
         }
     }
 }
@@ -1960,5 +2007,100 @@ mod tests {
         let err = wrapper.read(&mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(wrapper.read_buf.bytes.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn single_record_mode_stops_at_record_boundary() {
+        let (mut client, mut server) = tls_pair().await;
+
+        // Server writes two distinct TLS application data records
+        server.write_all(b"RECORD_ONE").await.unwrap();
+        server.flush().await.unwrap();
+
+        server.write_all(b"RECORD_TWO").await.unwrap();
+        server.flush().await.unwrap();
+
+        // Enable single record mode on client: should stop after reading exactly the first record
+        client.set_single_record_mode(true);
+        assert!(client.single_record_mode());
+
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"RECORD_ONE");
+
+        // The second record is left in buffer or transport, accessible on the next read call
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"RECORD_TWO");
+    }
+
+    #[tokio::test]
+    async fn into_parts_preserves_leftover_transport_buffer() {
+        let (mut client, mut server) = tls_pair().await;
+
+        // Server writes a TLS application record
+        server.write_all(b"LAST_TLS_RECORD").await.unwrap();
+        server.flush().await.unwrap();
+
+        // Server immediately writes extra raw bytes directly to underlying transport bypassing TLS
+        server.get_mut().write_all(b"EXTRA_RAW_PLAINTEXT").await.unwrap();
+        server.get_mut().flush().await.unwrap();
+
+        client.set_single_record_mode(true);
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"LAST_TLS_RECORD");
+
+        // Unwrap the TLS stream via into_parts: leftover + subsequent read from unwrap stream must contain the raw bytes
+        let (mut gate, leftover) = client.into_parts();
+        let mut combined = leftover;
+        if combined.is_empty() {
+            let mut rest = vec![0u8; 64];
+            let n = tokio::time::timeout(std::time::Duration::from_millis(100), gate.io.read(&mut rest))
+                .await
+                .unwrap()
+                .unwrap();
+            combined.extend_from_slice(&rest[..n]);
+        }
+
+        assert!(
+            combined.ends_with(b"EXTRA_RAW_PLAINTEXT"),
+            "Raw unconsumed bytes must be preserved in leftover or underlying stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_handover_tls_to_raw() {
+        let (mut client, mut server) = tls_pair().await;
+
+        // Phase 1: TLS negotiation
+        server.write_all(b"UPGRADE_OK").await.unwrap();
+        server.flush().await.unwrap();
+
+        client.set_single_record_mode(true);
+        let mut buf = [0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"UPGRADE_OK");
+
+        // Phase 2: Unwrap both streams into raw transport
+        let (mut client_gate, client_leftover) = client.into_parts();
+        let (mut server_stream, server_leftover) = server.into_parts();
+
+        assert!(client_leftover.is_empty());
+        assert!(server_leftover.is_empty());
+
+        // Phase 3: Raw bidirectional transmission without TLS
+        client_gate.io.write_all(b"RAW_FROM_CLIENT").await.unwrap();
+        client_gate.io.flush().await.unwrap();
+
+        let mut s_buf = [0u8; 32];
+        let n = server_stream.read(&mut s_buf).await.unwrap();
+        assert_eq!(&s_buf[..n], b"RAW_FROM_CLIENT");
+
+        server_stream.write_all(b"RAW_FROM_SERVER").await.unwrap();
+        server_stream.flush().await.unwrap();
+
+        let mut c_buf = [0u8; 32];
+        let n = client_gate.io.read(&mut c_buf).await.unwrap();
+        assert_eq!(&c_buf[..n], b"RAW_FROM_SERVER");
     }
 }
