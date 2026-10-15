@@ -47,6 +47,10 @@ impl EchGreaseInfo<'_> {
     }
 
     /// Extension type and body length, excluding ECH, padding, PSK and headers.
+    /// Includes [RFC 8701] GREASE extensions in wire order, after any permutation.
+    /// Size policies must account for these GREASE entries too.
+    ///
+    /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
     pub fn extensions(&self) -> impl ExactSizeIterator<Item = (u16, usize)> + '_ {
         let extensions = if self.0.num_extensions == 0 {
             &[]
@@ -153,6 +157,9 @@ impl SslContextBuilder {
     /// output fail the handshake; panics abort, as with other SSL callbacks.
     /// See [`EchGreaseInfo::max_payload_length`] for sizing limits. Arbitrary
     /// lengths need not follow [RFC 9849]'s recommended distribution.
+    /// Unlike NSS, this also applies to DTLS when ECH GREASE is enabled.
+    /// Callbacks of other closure types may remain stored until this context
+    /// is freed, even after replacement.
     ///
     /// [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849.html#section-6.2.1
     #[corresponds(SSL_CTX_set_ech_grease_callback)]
@@ -163,7 +170,7 @@ impl SslContextBuilder {
             + Sync
             + 'static,
     {
-        let old = self.replace_ex_data(
+        let _old = self.replace_ex_data(
             SslContext::cached_ex_index::<Option<Callback<F>>>(),
             Some(Callback(callback)),
         );
@@ -174,14 +181,26 @@ impl SslContextBuilder {
                 ptr::null_mut(),
             );
         }
-        drop(old);
+    }
+
+    /// Removes the context policy, restoring BoringSSL's default parameters.
+    /// Per-connection overrides and the GREASE enable flag are unchanged.
+    /// Stored closures remain owned by the context until replaced or freed.
+    #[corresponds(SSL_CTX_set_ech_grease_callback)]
+    pub fn clear_ech_grease_callback(&mut self) {
+        unsafe {
+            ffi::SSL_CTX_set_ech_grease_callback(self.as_ptr(), None, ptr::null_mut());
+        }
     }
 }
 
 impl SslRef {
     /// Overrides [`SslContextBuilder::set_ech_grease_callback`] for this connection.
-    /// Must be set before CH1 starts; a late replacement fails without changing
-    /// the active callback. The same sizing, error and panic rules apply.
+    /// Requires retained handshake configuration and a handshake that has not
+    /// started CH1. Rejection leaves the active callback unchanged.
+    /// The same sizing, error and panic rules apply.
+    /// Callbacks of other closure types may remain stored until this connection
+    /// is freed, even after replacement.
     #[corresponds(SSL_set_ech_grease_callback)]
     pub fn set_ech_grease_callback<F>(&mut self, callback: F) -> Result<(), ErrorStack>
     where
@@ -206,6 +225,23 @@ impl SslRef {
             ))?;
         }
         drop(slot.replace(Callback(callback)));
+        Ok(())
+    }
+
+    /// Removes the connection override, falling back to the current context's
+    /// policy or BoringSSL's default parameters. Does not disable GREASE.
+    /// Fails without changing the policy if CH1 has started, the handshake has
+    /// finished, or the handshake configuration has been discarded.
+    /// Stored closures remain owned by the connection until replaced or freed.
+    #[corresponds(SSL_set_ech_grease_callback)]
+    pub fn clear_ech_grease_callback(&mut self) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_set_ech_grease_callback(
+                self.as_ptr(),
+                None,
+                ptr::null_mut(),
+            ))?;
+        }
         Ok(())
     }
 }
