@@ -71,31 +71,3 @@ fn ech_grease() {
     let ssl_stream = client.connect();
     assert!(!ssl_stream.ssl().ech_accepted());
 }
-
-#[cfg(not(feature = "fips"))]
-#[test]
-fn ech_real_configuration_bypasses_custom_grease_policy() {
-    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, ECH_CONFIG_LIST);
-    client.ssl().set_enable_ech_grease(true);
-    client
-        .ssl()
-        .set_ech_grease_callback(|_, _| panic!("real ECH used GREASE policy"))
-        .unwrap();
-    assert!(client.connect().ssl().ech_accepted());
-}
-
-#[cfg(not(feature = "fips"))]
-#[test]
-fn ech_rejection_does_not_invoke_custom_grease_policy() {
-    let (_server, mut client) = bootstrap_ech(ECH_CONFIG_2, ECH_KEY_2, ECH_CONFIG_LIST);
-    client.ssl().set_enable_ech_grease(true);
-    client
-        .ssl()
-        .set_ech_grease_callback(|_, _| panic!("rejected real ECH used GREASE policy"))
-        .unwrap();
-    let HandshakeError::Failure(failed) = client.connect_err() else {
-        panic!("expected ECH rejection");
-    };
-    assert!(failed.ssl().get_ech_retry_configs().is_some());
-    assert!(!failed.ssl().ech_accepted());
-}

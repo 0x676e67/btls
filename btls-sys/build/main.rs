@@ -545,7 +545,6 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
             "0011-boringssl-prefix-struct-tags.patch",
             "0012-boringssl-seal-app-data.patch",
             "0013-boringssl-cheap-error-reset.patch",
-            "0014-ech-grease-payload-policy.patch",
         ] {
             println!("cargo:warning=applying {patch_name} to boringssl");
             apply_patch(config, patch_name)?;
