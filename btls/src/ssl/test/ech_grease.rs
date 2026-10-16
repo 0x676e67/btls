@@ -18,6 +18,8 @@ use crate::ssl::{
 const TLS_EXTENSION_HEADER_LEN: usize = 4;
 // Outer type and KDF ID.
 const ECH_AEAD_OFFSET: usize = 1 + 2;
+// Outer type, KDF, AEAD, config ID and enc length.
+const ECH_ENC_OFFSET: usize = 1 + 2 + 2 + 1 + 2;
 // Outer type, KDF, AEAD, config ID, enc length, and X25519 encapsulated key.
 const ECH_PAYLOAD_LENGTH_OFFSET: usize = 1 + 2 + 2 + 1 + 2 + 32;
 const ECH_BODY_FRAMING_LEN: usize = ECH_PAYLOAD_LENGTH_OFFSET + 2;
@@ -27,6 +29,7 @@ fn parameters(info: &EchGreaseInfo<'_>, payload_length: usize) -> EchGreaseParam
     EchGreaseParameters {
         aead: info.default_aead(),
         payload_length: NonZeroU16::new(u16::try_from(payload_length).unwrap()).unwrap(),
+        random_enc: false,
     }
 }
 
@@ -345,6 +348,7 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
                         Ok(EchGreaseParameters {
                             aead,
                             payload_length: NonZeroU16::new(239).unwrap(),
+                            random_enc: false,
                         })
                     })
                     .unwrap();
@@ -356,6 +360,38 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
             assert_eq!(extension.len(), 239 + ECH_BODY_FRAMING_LEN);
             assert_eq!(ciphers(&messages[0]), ciphers(&baseline[0]));
         }
+    }
+}
+
+// A canonical X25519 public key always has bit 255 clear; NSS sends random
+// bytes, so the opt-in must set that bit in about half of the hellos.
+#[test]
+fn ech_callback_random_enc_sets_high_bit() {
+    for random_enc in [false, true] {
+        let rounds = if random_enc { 32 } else { 4 };
+        let mut server = Server::builder();
+        server.expected_connections_count(rounds);
+        let server = server.build();
+        let mut high_bits = 0;
+        for _ in 0..rounds {
+            let mut client = server.client_with_root_ca().build().builder();
+            client.ssl().set_enable_ech_grease(true);
+            client
+                .ssl()
+                .set_ech_grease_callback(move |_, info| {
+                    Ok(EchGreaseParameters {
+                        random_enc,
+                        ..parameters(info, 239)
+                    })
+                })
+                .unwrap();
+            let messages = connect_and_capture(client, None);
+            let extension = ech(&messages[0]);
+            assert_eq!(extension.len(), 239 + ECH_BODY_FRAMING_LEN);
+            high_bits += usize::from(extension[ECH_ENC_OFFSET + 31] & 0x80 != 0);
+        }
+        // The random case fails with probability 2^-32.
+        assert_eq!(high_bits > 0, random_enc);
     }
 }
 

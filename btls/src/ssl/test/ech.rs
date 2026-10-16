@@ -15,7 +15,7 @@ static ECH_KEY: &[u8] = include_bytes!("../../../test/echkey");
 static ECH_CONFIG_2: &[u8] = include_bytes!("../../../test/echconfig-2");
 static ECH_KEY_2: &[u8] = include_bytes!("../../../test/echkey-2");
 
-fn bootstrap_ech(config: &[u8], key: &[u8], list: &[u8]) -> (Server, ClientSslBuilder) {
+fn bootstrap_ech(config: &[u8], key: &[u8], list: Option<&[u8]>) -> (Server, ClientSslBuilder) {
     let server = {
         let key = HpkeKey::dhkem_p256_sha256(key).unwrap();
         let mut ech_keys_builder = SslEchKeys::builder().unwrap();
@@ -29,7 +29,9 @@ fn bootstrap_ech(config: &[u8], key: &[u8], list: &[u8]) -> (Server, ClientSslBu
     };
 
     let mut client = server.client_with_root_ca().build().builder();
-    client.ssl().set_ech_config_list(list).unwrap();
+    if let Some(list) = list {
+        client.ssl().set_ech_config_list(list).unwrap();
+    }
     client.ssl().set_hostname("foobar.com").unwrap();
 
     (server, client)
@@ -37,7 +39,7 @@ fn bootstrap_ech(config: &[u8], key: &[u8], list: &[u8]) -> (Server, ClientSslBu
 
 #[test]
 fn ech() {
-    let (_server, client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, ECH_CONFIG_LIST);
+    let (_server, client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, Some(ECH_CONFIG_LIST));
 
     let ssl_stream = client.connect();
     assert!(ssl_stream.ssl().ech_accepted());
@@ -47,7 +49,7 @@ fn ech() {
 fn ech_rejection() {
     // Server is initialized using `ECH_CONFIG_2`, so using `ECH_CONFIG_LIST` instead of
     // `ECH_CONFIG_LIST_2` should trigger rejection.
-    let (_server, client) = bootstrap_ech(ECH_CONFIG_2, ECH_KEY_2, ECH_CONFIG_LIST);
+    let (_server, client) = bootstrap_ech(ECH_CONFIG_2, ECH_KEY_2, Some(ECH_CONFIG_LIST));
 
     let HandshakeError::Failure(failed_ssl_stream) = client.connect_err() else {
         panic!("wrong HandshakeError failure variant!");
@@ -72,10 +74,38 @@ fn ech_grease() {
     assert!(!ssl_stream.ssl().ech_accepted());
 }
 
+// An ECH server answers GREASE with retry configs in EncryptedExtensions, which
+// the client only accepts when its rotated GREASE extension counts as sent.
+#[cfg(not(feature = "fips"))]
+#[test]
+fn ech_grease_policy_accepts_retry_configs() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, None);
+    client.ssl().set_enable_ech_grease(true);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    client
+        .ssl()
+        .set_ech_grease_callback(move |_, info| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ssl::EchGreaseParameters {
+                aead: info.default_aead(),
+                payload_length: std::num::NonZeroU16::new(239).unwrap(),
+                random_enc: true,
+            })
+        })
+        .unwrap();
+    let stream = client.connect();
+    assert!(!stream.ssl().ech_accepted());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(not(feature = "fips"))]
 #[test]
 fn ech_real_configuration_bypasses_custom_grease_policy() {
-    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, ECH_CONFIG_LIST);
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, Some(ECH_CONFIG_LIST));
     client.ssl().set_enable_ech_grease(true);
     client
         .ssl()
@@ -87,7 +117,7 @@ fn ech_real_configuration_bypasses_custom_grease_policy() {
 #[cfg(not(feature = "fips"))]
 #[test]
 fn ech_rejection_does_not_invoke_custom_grease_policy() {
-    let (_server, mut client) = bootstrap_ech(ECH_CONFIG_2, ECH_KEY_2, ECH_CONFIG_LIST);
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG_2, ECH_KEY_2, Some(ECH_CONFIG_LIST));
     client.ssl().set_enable_ech_grease(true);
     client
         .ssl()
