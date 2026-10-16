@@ -29,6 +29,10 @@ pub struct EchGreaseParameters {
     /// Final payload length, including the simulated tag but not ECH framing.
     /// Must not exceed [`EchGreaseInfo::max_payload_length`].
     pub payload_length: NonZeroU16,
+    /// Send uniformly random bytes as `enc`, as NSS does, instead of an X25519
+    /// public key. A canonical key always has bit 255 clear, so the choice is
+    /// observable across connections.
+    pub random_enc: bool,
 }
 
 /// A read-only view of the first ClientHello, valid only during the callback.
@@ -138,6 +142,7 @@ where
                 *out = ffi::SSL_ECH_GREASE_PARAMETERS {
                     aead_id: parameters.aead.0,
                     payload_length: usize::from(parameters.payload_length.get()),
+                    random_enc: libc::c_int::from(parameters.random_enc),
                 }
             };
             1
