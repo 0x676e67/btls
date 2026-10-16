@@ -367,13 +367,13 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
 // bytes, so the opt-in must set that bit in about half of the hellos.
 #[test]
 fn ech_callback_random_enc_sets_high_bit() {
+    const ROUNDS: usize = 64;
     for random_enc in [false, true] {
-        let rounds = if random_enc { 32 } else { 4 };
         let mut server = Server::builder();
-        server.expected_connections_count(rounds);
+        server.expected_connections_count(ROUNDS);
         let server = server.build();
         let mut high_bits = 0;
-        for _ in 0..rounds {
+        for _ in 0..ROUNDS {
             let mut client = server.client_with_root_ca().build().builder();
             client.ssl().set_enable_ech_grease(true);
             client
@@ -390,9 +390,39 @@ fn ech_callback_random_enc_sets_high_bit() {
             assert_eq!(extension.len(), 239 + ECH_BODY_FRAMING_LEN);
             high_bits += usize::from(extension[ECH_ENC_OFFSET + 31] & 0x80 != 0);
         }
-        // The random case fails with probability 2^-32.
-        assert_eq!(high_bits > 0, random_enc);
+        if random_enc {
+            // Seeing only one bit value has probability 2^-63.
+            assert!(
+                high_bits > 0 && high_bits < ROUNDS,
+                "high_bits = {high_bits}"
+            );
+        } else {
+            assert_eq!(high_bits, 0);
+        }
     }
+}
+
+#[test]
+fn ech_callback_random_enc_is_reused_after_hrr() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    let messages = handshake(
+        move |ssl| {
+            ssl.set_ech_grease_callback(move |_, info| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(EchGreaseParameters {
+                    random_enc: true,
+                    ..parameters(info, 239)
+                })
+            })
+            .unwrap();
+        },
+        true,
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ech(&messages[0]).len(), 239 + ECH_BODY_FRAMING_LEN);
+    // Reuse enc and the payload: https://www.rfc-editor.org/rfc/rfc9849#section-6.2.1
+    assert_eq!(ech(&messages[0]), ech(&messages[1]));
 }
 
 #[test]
