@@ -28,6 +28,7 @@ mod cert_compressor;
 mod cert_verify;
 mod custom_verify;
 mod ech;
+mod ech_grease;
 mod grease_sigalgs;
 mod patch_ciphers;
 mod patches;
