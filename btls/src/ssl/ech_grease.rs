@@ -7,7 +7,12 @@ use openssl_macros::corresponds;
 
 use super::{Ssl, SslContext, SslContextBuilder, SslRef};
 use crate::error::ErrorStack;
+use crate::rand::rand_bytes;
 use crate::{cvt_0i, ffi};
+
+const TLS_EXTENSION_HEADER_LEN: usize = 4;
+// NSS's deprecated ticket_early_data_info, dropped from the inner hello.
+const NSS_TICKET_EARLY_DATA_INFO: u16 = 46;
 
 /// An AEAD identifier advertised in an ECH GREASE extension.
 /// This does not select the cipher used to protect the TLS connection.
@@ -38,7 +43,7 @@ pub struct EchGreaseParameters {
 /// A read-only view of the first ClientHello, valid only during the callback.
 ///
 /// Extension sizes exclude their headers; PSK is reported separately.
-pub struct EchGreaseInfo<'a>(&'a ffi::SSL_ECH_GREASE_SIZE_INFO);
+pub struct EchGreaseInfo<'a>(pub(crate) &'a ffi::SSL_ECH_GREASE_SIZE_INFO);
 
 impl EchGreaseInfo<'_> {
     /// Cipher suite IDs in wire order, each encoded as two big-endian bytes.
@@ -76,7 +81,8 @@ impl EchGreaseInfo<'_> {
         self.0.psk_extension_length
     }
 
-    /// Encoded SNI hostname length, or `None` when SNI is absent.
+    /// Host name length read from the serialized SNI extension, or `None` when
+    /// no hostname was set; the connector sets none for IP literals.
     pub fn server_name_length(&self) -> Option<usize> {
         (self.0.has_server_name != 0).then_some(self.0.server_name_length)
     }
@@ -92,10 +98,21 @@ impl EchGreaseInfo<'_> {
     }
 
     /// CH1's remaining extensions-vector frame budget, not a peer acceptance limit.
-    /// BoringSSL servers normally limit a handshake message to 16 KiB.
+    /// See [`message_length`](Self::message_length) for the 16 KiB BoringSSL limit.
     /// HRR may need more room for a cookie or a larger key share in CH2.
     pub fn max_payload_length(&self) -> usize {
         self.0.max_payload_length
+    }
+
+    /// ClientHello body length before the payload, including ECH framing, PSK
+    /// and reserved padding. CH1's body is this plus the payload length, except
+    /// that TLS over TCP pads a message of 256 to 511 bytes, header included,
+    /// to at least 512 ([RFC 7685]). A BoringSSL server rejects a ClientHello
+    /// above 16 KiB unless it requests client certificates.
+    ///
+    /// [RFC 7685]: https://www.rfc-editor.org/rfc/rfc7685.html
+    pub fn message_length(&self) -> usize {
+        self.0.message_length
     }
 
     /// Whether this is a DTLS ClientHello.
@@ -107,6 +124,97 @@ impl EchGreaseInfo<'_> {
     pub fn is_quic(&self) -> bool {
         self.0.is_quic != 0
     }
+
+    /// Payload length NSS would send for this ClientHello, including the tag.
+    ///
+    /// Follows NSS's [`tls13_MaybeGreaseEch`]: the inner hello keeps
+    /// `server_name`, `supported_versions` (TLS 1.3 only) and `pre_shared_key`
+    /// in full, drops the TLS 1.2-only extensions, compresses the rest, pads
+    /// the host name to `max_name_len` and rounds up to a multiple of 32
+    /// ([RFC 9849] 6.1.3).
+    /// `max_name_len` is Firefox's `security.tls.ech.grease_size`, 100 by
+    /// default. `host_len` is the URL host length, which NSS narrows to `u8`
+    /// and applies even without SNI, as for IP literals. A GREASE version is
+    /// assumed exactly when [RFC 8701] GREASE extensions are present, since
+    /// BoringSSL emits both under the same flag. NSS never GREASEs DTLS; the
+    /// rule is still evaluated there. Wire order follows the configured
+    /// extension order, so list ECH last to match NSS; with GREASE enabled the
+    /// trailing [RFC 8701] extension still follows ECH, unlike NSS.
+    ///
+    /// [`tls13_MaybeGreaseEch`]: https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L2143
+    /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
+    /// [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3
+    pub fn nss_payload_length(&self, max_name_len: u8, host_len: u8) -> usize {
+        // EncodedClientHelloInner uses an empty session ID and the outer ciphers.
+        let mut len = 2 + 32 + 1 + 2 + self.cipher_suites().len() + 1 + 1 + 2;
+        len += TLS_EXTENSION_HEADER_LEN + 1; // Inner encrypted_client_hello marker.
+        if let Some(sni) = self.server_name_length() {
+            len += TLS_EXTENSION_HEADER_LEN + 5 + sni;
+        }
+        let mut compressed = 0;
+        let mut grease_version = false;
+        for (kind, _) in self.extensions() {
+            if is_grease_type(kind) {
+                grease_version = true;
+            }
+            // Omit the TLS 1.2-only extensions and ticket_early_data_info.
+            if ![
+                ffi::TLSEXT_TYPE_server_name as u16,
+                ffi::TLSEXT_TYPE_supported_versions as u16,
+                ffi::TLSEXT_TYPE_ec_point_formats as u16,
+                ffi::TLSEXT_TYPE_extended_master_secret as u16,
+                ffi::TLSEXT_TYPE_session_ticket as u16,
+                NSS_TICKET_EARLY_DATA_INFO,
+                ffi::TLSEXT_TYPE_renegotiate as u16,
+            ]
+            .contains(&kind)
+            {
+                compressed += 1;
+            }
+        }
+        len += TLS_EXTENSION_HEADER_LEN + 3 + if grease_version { 2 } else { 0 };
+        if self.psk_extension_length() != 0 {
+            len += TLS_EXTENSION_HEADER_LEN + self.psk_extension_length();
+        }
+        if compressed != 0 {
+            len += TLS_EXTENSION_HEADER_LEN + 1 + 2 * compressed;
+        }
+        len += usize::from(max_name_len.saturating_sub(host_len));
+        len += 31 - ((len - 1) % 32);
+        len + self.aead_overhead()
+    }
+
+    /// NSS-shaped parameters: [`nss_payload_length`](Self::nss_payload_length),
+    /// an AEAD drawn uniformly from the two accepted ones and a random `enc`.
+    /// Fails if the length exceeds [`max_payload_length`](Self::max_payload_length).
+    pub fn nss_parameters(
+        &self,
+        max_name_len: u8,
+        host_len: u8,
+    ) -> Result<EchGreaseParameters, ErrorStack> {
+        let payload_length = self.nss_payload_length(max_name_len, host_len);
+        let payload_length = u16::try_from(payload_length)
+            .ok()
+            .filter(|len| usize::from(*len) <= self.max_payload_length())
+            .and_then(NonZeroU16::new)
+            .ok_or_else(|| ErrorStack::internal_error_str("ECH GREASE payload exceeds budget"))?;
+        let mut coin = [0];
+        rand_bytes(&mut coin)?;
+        Ok(EchGreaseParameters {
+            aead: if coin[0] & 1 == 1 {
+                EchGreaseAead::AES_128_GCM
+            } else {
+                EchGreaseAead::CHACHA20_POLY1305
+            },
+            payload_length,
+            random_enc: true,
+        })
+    }
+}
+
+/// Whether `kind` is an RFC 8701 GREASE extension type.
+fn is_grease_type(kind: u16) -> bool {
+    kind & 0x0f0f == 0x0a0a && kind >> 8 == kind & 0xff
 }
 
 struct Callback<F>(F);
@@ -122,8 +230,9 @@ where
         + Sync
         + 'static,
 {
-    // Both views borrow the synchronous invocation. Shared SSL access prevents
-    // safe code from replacing the closure or reentering this handshake.
+    // Both views borrow the synchronous invocation. BoringSSL locks the policy
+    // while it runs, so the closure cannot be replaced from inside, and the
+    // shared SSL setters still callable do not affect the extension being built.
     let info = unsafe { &*info };
     let ssl = unsafe { SslRef::from_ptr(info.ssl.cast_mut()) };
     let callback = if CONTEXT {
@@ -157,11 +266,15 @@ where
 impl SslContextBuilder {
     /// Sets the default ECH GREASE policy for connections using this context.
     ///
-    /// Called once when CH1 needs GREASE; HRR reuses its bytes. Does not enable
-    /// GREASE or change real ECH or TLS cipher preferences. Errors or oversized
-    /// output fail the handshake; panics abort, as with other SSL callbacks.
+    /// Called once when CH1 needs GREASE; HRR and DTLS HelloVerifyRequest reuse
+    /// its bytes. Does not enable GREASE or change real ECH or TLS cipher
+    /// preferences. An installed policy decides every GREASE ClientHello: it
+    /// can neither skip one nor defer to BoringSSL's random draw. Errors or
+    /// oversized output fail the handshake; panics abort, as with other SSL
+    /// callbacks.
     /// See [`EchGreaseInfo::max_payload_length`] for sizing limits. Arbitrary
-    /// lengths need not follow [RFC 9849]'s recommended distribution.
+    /// lengths need not follow [RFC 9849]'s recommended distribution;
+    /// [`EchGreaseInfo::nss_parameters`] reproduces Firefox.
     /// Unlike NSS, this also applies to DTLS when ECH GREASE is enabled.
     /// Callbacks of other closure types may remain stored until this context
     /// is freed, even after replacement.
