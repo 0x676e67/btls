@@ -283,6 +283,7 @@ jobs:
         with:
           go-version: ">=1.22.0"
       - name: Install target-specific APT dependencies
+        timeout-minutes: 10
         if: "matrix.apt_packages != ''"
         run: sudo apt update && sudo apt install -y ${{ matrix.apt_packages }}
         shell: bash
@@ -413,6 +414,7 @@ jobs:
       with:
         go-version: '>=1.22.0'
     - name: Install build tools (clang, cmake)
+      timeout-minutes: 10
       run: |
         sudo apt-get update
         sudo apt-get install -y clang libclang-rt-dev cmake
@@ -720,6 +722,7 @@ jobs:
         shell: bash
         run: rustup target add ${{ matrix.target }}
       - name: Install target-specific APT dependencies
+        timeout-minutes: 10
         if: matrix.apt_packages != ''
         run: sudo apt update && sudo apt install -y ${{ matrix.apt_packages }}
       - name: Install cargo-ndk
