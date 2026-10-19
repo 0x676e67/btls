@@ -37,12 +37,13 @@ impl EchGreaseAead {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum EchGreaseRounding {
-    /// NSS before 3.127, as used by Firefox 117-154: pad to `32k + 31`.
+    /// NSS before 3.127, as used by Firefox 119-154: pad to `32k + 31`.
     /// This reproduces the historical behavior, not RFC 9849's padding rule.
     NssPre3127,
-    /// Round up to a multiple of 32, as in NSS 3.127 / Firefox 155 onward.
-    /// See the [official fix] for Bug 2060720.
+    /// Round up to a multiple of 32 ([RFC 9849] 6.1.3), as in NSS 3.127 /
+    /// Firefox 155 onward. See the [official fix] for Bug 2060720.
     ///
+    /// [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3
     /// [official fix]: https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
     Rfc9849,
 }
@@ -153,7 +154,7 @@ impl EchGreaseInfo<'_> {
     /// `server_name`, `supported_versions` (TLS 1.3 only) and `pre_shared_key`
     /// in full, drops the TLS 1.2-only extensions, compresses the rest, pads
     /// the host name to `max_name_len`, then applies `rounding`. Use
-    /// [`EchGreaseRounding::NssPre3127`] for Firefox 117-154 or
+    /// [`EchGreaseRounding::NssPre3127`] for Firefox 119-154 or
     /// [`EchGreaseRounding::Rfc9849`] for the [NSS 3.127] fix.
     /// `max_name_len` is Firefox's `security.tls.ech.grease_size`, 100 by
     /// default. `host_len` is the URL host length, which NSS narrows to `u8`
@@ -167,7 +168,6 @@ impl EchGreaseInfo<'_> {
     /// [NSS 3.127]: https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
     /// [`tls13_MaybeGreaseEch`]: https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L2143
     /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
-    /// [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3
     pub fn nss_payload_length(
         &self,
         max_name_len: u8,
