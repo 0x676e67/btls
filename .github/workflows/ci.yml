@@ -288,9 +288,15 @@ jobs:
         run: sudo apt update && sudo apt install -y ${{ matrix.apt_packages }}
         shell: bash
       - name: Install nasm
+        timeout-minutes: 10
         if: startsWith(matrix.os, 'windows')
-        run: choco install nasm
-        shell: cmd
+        run: |
+          for attempt in 1 2 3 4 5; do
+            choco install nasm --no-progress && exit 0
+            sleep $((15 * attempt))
+          done
+          exit 1
+        shell: bash
       - name: Setup 32-bit MSYS2
         if: matrix.thing == 'i686-mingw'
         uses: msys2/setup-msys2@v2
