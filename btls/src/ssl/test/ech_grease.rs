@@ -1,6 +1,7 @@
 #![cfg(not(feature = "fips"))]
 
 use std::ffi::c_void;
+use std::io::Read;
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,9 +11,10 @@ use foreign_types::ForeignTypeRef;
 use super::server::{ClientSslBuilder, Server};
 use crate::error::ErrorStack;
 use crate::ffi;
+use crate::ssl::EchGreaseRounding::{NssPre3127, Rfc9849};
 use crate::ssl::{
-    EchGreaseAead, EchGreaseInfo, EchGreaseParameters, Ssl, SslContext, SslMethod, SslRef,
-    SslVerifyMode, SslVersion,
+    EchGreaseAead, EchGreaseInfo, EchGreaseParameters, ExtensionType, Ssl, SslConnector,
+    SslContext, SslMethod, SslRef, SslVerifyMode, SslVersion,
 };
 
 const TLS_EXTENSION_HEADER_LEN: usize = 4;
@@ -303,6 +305,7 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
             (EchGreaseAead::AES_128_GCM, 1),
             (EchGreaseAead::CHACHA20_POLY1305, 3),
         ] {
+            assert_eq!(aead.id(), u16::from(id));
             let messages = handshake(
                 |ssl| {
                     ssl.set_aes_hw_override(aes_hw);
@@ -618,6 +621,160 @@ fn ech_metadata_includes_grease_in_wire_order() {
     );
 }
 
+#[test]
+fn ech_policy_accounts_for_record_size_limit() {
+    let order: Vec<_> = firefox_tcp(0)
+        .extensions
+        .iter()
+        .map(|ext| ExtensionType::from(ext.type_))
+        .chain([ExtensionType::ENCRYPTED_CLIENT_HELLO])
+        .collect();
+    let mut lengths = Vec::new();
+    for limit in [0u16, 512] {
+        let mut server = Server::builder();
+        server.ctx().set_record_size_limit(512);
+        let server = server.build();
+        let observed = Arc::new(Mutex::new(None));
+        let metadata = Arc::clone(&observed);
+        let mut client = server.client_with_root_ca();
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client.ctx().set_record_size_limit(limit);
+        client.ctx().set_extension_permutation(&order).unwrap();
+        client.ctx().set_ech_grease_callback(move |_, info| {
+            *metadata.lock().unwrap() =
+                Some((info.extensions().collect::<Vec<_>>(), info.message_length()));
+            // Stay above the small-ClientHello padding range to compare exact sizes.
+            Ok(parameters(info, 4096))
+        });
+        let mut client = client.build().builder();
+        client.ssl().set_enable_ech_grease(true);
+        let messages = connect_and_capture(client, None);
+        assert_eq!(messages.len(), 1);
+        let wire = extensions(&messages[0]);
+        let (metadata, message_length) = observed.lock().unwrap().take().unwrap();
+        assert_eq!(
+            wire.last().unwrap().0,
+            ffi::TLSEXT_TYPE_encrypted_client_hello as u16
+        );
+        assert_eq!(
+            metadata,
+            wire[..wire.len() - 1]
+                .iter()
+                .map(|(id, body)| (*id, body.len()))
+                .collect::<Vec<_>>()
+        );
+        let rsl = wire
+            .iter()
+            .find(|(id, _)| *id == ffi::TLSEXT_TYPE_record_size_limit as u16);
+        assert_eq!(
+            rsl.map(|(_, body)| body.as_slice()),
+            (limit != 0).then_some(limit.to_be_bytes().as_slice())
+        );
+        assert_eq!(messages[0].len(), message_length + 4096 + 4);
+        lengths.push((message_length, messages[0].len()));
+    }
+    assert_eq!(lengths[1].0 - lengths[0].0, TLS_EXTENSION_HEADER_LEN + 2);
+    assert_eq!(lengths[1].1 - lengths[0].1, TLS_EXTENSION_HEADER_LEN + 2);
+}
+
+#[test]
+fn ech_connector_policy_uses_per_connection_host_length() {
+    use crate::hash::MessageDigest;
+    use crate::pkey::PKey;
+    use crate::x509::extension::SubjectAlternativeName;
+    use crate::x509::X509;
+
+    // Trust a local identity valid for both names; keep certificate and host checks enabled.
+    let key = PKey::private_key_from_pem(super::KEY).unwrap();
+    let fixture = X509::from_pem(super::CERT).unwrap();
+    let mut certificate = X509::builder().unwrap();
+    certificate.set_version(2).unwrap();
+    certificate
+        .set_serial_number(fixture.serial_number())
+        .unwrap();
+    certificate
+        .set_subject_name(fixture.subject_name())
+        .unwrap();
+    certificate.set_issuer_name(fixture.subject_name()).unwrap();
+    certificate.set_not_before(fixture.not_before()).unwrap();
+    certificate.set_not_after(fixture.not_after()).unwrap();
+    certificate.set_pubkey(&key).unwrap();
+    let names = SubjectAlternativeName::new()
+        .dns("foobar.com")
+        .ip("127.0.0.1")
+        .build(&certificate.x509v3_context(None, None))
+        .unwrap();
+    certificate.append_extension(&names).unwrap();
+    certificate.sign(&key, MessageDigest::sha256()).unwrap();
+    let certificate = certificate.build();
+    let wire = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&wire);
+    let mut server = Server::builder();
+    server.expected_connections_count(4);
+    server.ctx().set_certificate(&certificate).unwrap();
+    server.ctx().set_select_certificate_callback(move |hello| {
+        captured.lock().unwrap().push((
+            hello.get_extension(ExtensionType::SERVER_NAME).is_some(),
+            hello
+                .get_extension(ExtensionType::ENCRYPTED_CLIENT_HELLO)
+                .unwrap()
+                .to_vec(),
+        ));
+        Ok(())
+    });
+    let server = server.build();
+    let host_length = Ssl::new_ex_index::<u8>().unwrap();
+    for rounding in [NssPre3127, Rfc9849] {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let metadata = Arc::clone(&observed);
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder
+            .cert_store_mut()
+            .add_cert(certificate.clone())
+            .unwrap();
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        builder.set_ech_grease_callback(move |ssl, info| {
+            let host_len = *ssl.ex_data(host_length).unwrap();
+            let parameters = info.nss_parameters(100, host_len, rounding)?;
+            metadata
+                .lock()
+                .unwrap()
+                .push((host_len, info.server_name_length(), parameters));
+            Ok(parameters)
+        });
+        let connector = builder.build();
+        for host in ["foobar.com", "127.0.0.1"] {
+            let mut connection = connector.configure().unwrap();
+            connection.set_enable_ech_grease(true);
+            connection.set_ex_data(host_length, u8::try_from(host.len()).unwrap());
+            let ssl = connection.into_ssl(host).unwrap();
+            let mut stream = ssl.connect(server.connect_tcp()).unwrap();
+            stream.read_exact(&mut [0]).unwrap();
+            let (length, sni, parameters) = *observed.lock().unwrap().last().unwrap();
+            let expected_sni = (host == "foobar.com").then_some(host.len());
+            assert_eq!(usize::from(length), host.len());
+            assert_eq!(sni, expected_sni);
+            let (has_sni, ech) = wire.lock().unwrap().last().unwrap().clone();
+            assert_eq!(has_sni, expected_sni.is_some());
+            assert_eq!(
+                ech.len(),
+                ECH_BODY_FRAMING_LEN + usize::from(parameters.payload_length.get())
+            );
+            assert_eq!(
+                u16::from_be_bytes([ech[ECH_AEAD_OFFSET], ech[ECH_AEAD_OFFSET + 1]]),
+                parameters.aead.id()
+            );
+        }
+        assert_eq!(observed.lock().unwrap().len(), 2);
+    }
+    assert_eq!(wire.lock().unwrap().len(), 4);
+}
+
 // A synthetic view for exercising the NSS rule without a handshake.
 struct NssVector {
     cipher_suites: Vec<u8>,
@@ -713,48 +870,9 @@ fn firefox_quic(host_len: usize) -> NssVector {
     }
 }
 
-// Example application policy for Firefox 117-154's NSS, not a library default.
-// These releases pad the inner length to 32k + 31, including at a 32-byte
-// boundary. Subtracting one from the modern helper is therefore incorrect.
-// https://github.com/mozilla-firefox/firefox/blob/FIREFOX_117_0_RELEASE/security/nss/lib/ssl/tls13ech.c
-// https://github.com/mozilla-firefox/firefox/blob/FIREFOX_154_0_RELEASE/security/nss/lib/ssl/tls13ech.c
-fn legacy_nss_payload_length(info: &EchGreaseInfo<'_>, max_name_len: u8, host_len: u8) -> usize {
-    let mut len = 2 + 32 + 1 + 2 + info.cipher_suites().len() + 1 + 1 + 2;
-    len += TLS_EXTENSION_HEADER_LEN + 1;
-    let mut compressed = 0;
-    let mut grease_version = false;
-    let omitted = [
-        ffi::TLSEXT_TYPE_server_name as u16,
-        ffi::TLSEXT_TYPE_supported_versions as u16,
-        ffi::TLSEXT_TYPE_ec_point_formats as u16,
-        ffi::TLSEXT_TYPE_extended_master_secret as u16,
-        ffi::TLSEXT_TYPE_session_ticket as u16,
-        ffi::TLSEXT_TYPE_renegotiate as u16,
-        46, // NSS's obsolete ticket_early_data_info extension.
-    ];
-    for (kind, _) in info.extensions() {
-        grease_version |= kind & 0x0f0f == 0x0a0a && kind >> 8 == kind & 0xff;
-        if !omitted.contains(&kind) {
-            compressed += 1;
-        }
-    }
-    if let Some(sni) = info.server_name_length() {
-        len += TLS_EXTENSION_HEADER_LEN + 5 + sni;
-    }
-    len += TLS_EXTENSION_HEADER_LEN + 3 + if grease_version { 2 } else { 0 };
-    if info.psk_extension_length() != 0 {
-        len += TLS_EXTENSION_HEADER_LEN + info.psk_extension_length();
-    }
-    if compressed != 0 {
-        len += TLS_EXTENSION_HEADER_LEN + 1 + 2 * compressed;
-    }
-    len += usize::from(max_name_len.saturating_sub(host_len));
-    len + 31 - (len % 32) + info.aead_overhead()
-}
-
 #[test]
 fn ech_nss_historical_payload_lengths() {
-    // Source-derived inputs, not browser captures. The same sizing formula
+    // Source-derived inputs, not packet captures. The same sizing formula
     // spans Firefox 117-154; Firefox 155 (NSS 3.127) fixes the rounding.
     // NSS 3.127 release notes list this as Bug 2060720:
     // https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
@@ -772,12 +890,30 @@ fn ech_nss_historical_payload_lengths() {
     no_sni.server_name_length = None;
     let mut grease = firefox_tcp(19);
     grease.extensions.extend([ext(0x0a0a, 0), ext(0x1a1a, 1)]);
-    // Expected legacy/current lengths are pinned independently of either helper.
+    let mut resumed_quic = firefox_quic(19);
+    resumed_quic
+        .extensions
+        .push(ext(ffi::TLSEXT_TYPE_early_data as u16, 0));
+    resumed_quic.psk_extension_length = 123;
+    let mut quic_literal = firefox_quic(0);
+    quic_literal.extensions.remove(0);
+    quic_literal.server_name_length = None;
+    // Expected lengths are independent of the shared sizing implementation.
+    // https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L1351-L1653
     for (name, vector, max_name, host, expected) in [
         ("TCP", firefox_tcp(19), 100, 19, [239, 240]),
         ("long SNI", firefox_tcp(120), 100, 120, [271, 272]),
         ("resumption and early_data", resumed, 100, 19, [367, 368]),
         ("QUIC extension set", quic, 100, 19, [207, 208]),
+        (
+            "QUIC with record size limit",
+            firefox_quic(19),
+            100,
+            19,
+            [239, 240],
+        ),
+        ("QUIC resumption", resumed_quic, 100, 19, [367, 368]),
+        ("QUIC without SNI", quic_literal, 100, 9, [207, 208]),
         ("IP without SNI", no_sni, 93, 9, [239, 208]),
         ("GREASE L=223", grease, 100, 19, [239, 240]),
     ] {
@@ -785,8 +921,8 @@ fn ech_nss_historical_payload_lengths() {
         let info = EchGreaseInfo(&raw);
         assert_eq!(
             [
-                legacy_nss_payload_length(&info, max_name, host),
-                info.nss_payload_length(max_name, host)
+                info.nss_payload_length(max_name, host, NssPre3127),
+                info.nss_payload_length(max_name, host, Rfc9849)
             ],
             expected,
             "{name}",
@@ -815,8 +951,8 @@ fn ech_nss_historical_rounding_boundaries() {
     ] {
         assert_eq!(
             [
-                legacy_nss_payload_length(&info, max_name, 19),
-                info.nss_payload_length(max_name, 19)
+                info.nss_payload_length(max_name, 19, NssPre3127),
+                info.nss_payload_length(max_name, 19, Rfc9849)
             ],
             expected,
             "max_name_len={max_name}",
@@ -824,138 +960,158 @@ fn ech_nss_historical_rounding_boundaries() {
     }
 }
 
+// Copy these callback bodies into a per-connection policy. host_len must come
+// from the normalized URL host, not SNI alone: IP literals have no SNI.
 #[test]
-fn ech_historical_firefox_policy_handshakes() {
-    // Compiled release defaults: 117/118 disable GREASE, 119 enables it,
-    // 155 fixes padding. Overrides can enable the legacy policy in 117/118.
-    // These rows select policies on BoringSSL, not complete browser profiles.
-    // https://github.com/mozilla-firefox/firefox/blob/FIREFOX_119_0_RELEASE/modules/libpref/init/StaticPrefList.yaml
-    for (release, enabled, legacy) in [
-        (117, false, true),
-        (118, false, true),
-        (117, true, true),
-        (119, true, true),
-        (130, true, true),
-        (140, true, true),
-        (154, true, true),
-        (155, true, false),
-        (156, true, false),
-        (158, true, false),
-    ] {
-        for hrr in [false, true] {
+fn ech_firefox_117_154_complete_policy() {
+    check_firefox_policy([207, 239, 271], |info, host_len| {
+        info.nss_parameters(100, host_len, NssPre3127)
+    });
+}
+
+#[test]
+fn ech_firefox_155_plus_complete_policy() {
+    check_firefox_policy([208, 240, 272], |info, host_len| {
+        info.nss_parameters(100, host_len, Rfc9849)
+    });
+}
+
+fn check_firefox_policy(
+    allowed_lengths: [usize; 3],
+    policy: impl Fn(&EchGreaseInfo<'_>, u8) -> Result<EchGreaseParameters, ErrorStack>
+        + Copy
+        + Send
+        + Sync
+        + 'static,
+) {
+    const ROUNDS: usize = 64;
+    // A bounded 15-suite test configuration. Neither range is a universal
+    // limit: tickets and different extensions can grow it.
+    const CIPHERS: &str = concat!(
+        "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384:",
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:",
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:",
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:",
+        "ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:",
+        "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-SHA:AES256-SHA",
+    );
+    let long_host = format!("{}.{}.example", "a".repeat(60), "b".repeat(51));
+    let order: Vec<_> = firefox_tcp(0)
+        .extensions
+        .iter()
+        .map(|ext| crate::ssl::ExtensionType::from(ext.type_))
+        .chain([crate::ssl::ExtensionType::ENCRYPTED_CLIENT_HELLO])
+        .collect();
+    for aes_hw in [None, Some(false), Some(true)] {
+        let mut server = Server::builder();
+        server.expected_connections_count(ROUNDS);
+        server.ctx().set_curves_list("P-384").unwrap();
+        let server = server.build();
+        let mut client = server.client_with_root_ca();
+        client.ctx().set_verify(SslVerifyMode::PEER);
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .unwrap();
+        client.ctx().set_preserve_tls13_cipher_list(true);
+        client.ctx().set_cipher_list(CIPHERS).unwrap();
+        client.ctx().set_alpn_protos(b"\x02h2\x08http/1.1").unwrap();
+        client.ctx().set_grease_enabled(false);
+        client.ctx().set_extension_permutation(&order).unwrap();
+        let client = client.build();
+        let mut aes = 0;
+        let mut high_bits = 0;
+        let mut host_lengths = [None; 3];
+        for round in 0..ROUNDS {
+            let host = ["localhost", long_host.as_str(), "127.0.0.1"][round % 3];
+            let host_len = u8::try_from(host.len()).unwrap();
+            let hrr = round % 2 != 0;
             let calls = Arc::new(AtomicUsize::new(0));
-            let expected = Arc::new(AtomicUsize::new(0));
-            let count = Arc::clone(&calls);
-            let length = Arc::clone(&expected);
-            let messages = handshake(
-                |ssl| {
-                    ssl.set_hostname("localhost").unwrap();
-                    ssl.set_enable_ech_grease(enabled);
-                    ssl.set_ech_grease_callback(move |_, info| {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        assert!(enabled, "Firefox {release}: disabled policy called");
-                        let size = if legacy {
-                            legacy_nss_payload_length(info, 100, 9)
-                        } else {
-                            info.nss_payload_length(100, 9)
-                        };
-                        assert_eq!(
-                            (size - info.aead_overhead()) % 32,
-                            if legacy { 31 } else { 0 }
-                        );
-                        length.store(size, Ordering::SeqCst);
-                        Ok(EchGreaseParameters {
-                            random_enc: true,
-                            ..parameters(info, size)
-                        })
-                    })
-                    .unwrap();
-                },
-                hrr,
+            let called = Arc::clone(&calls);
+            let mut connection = client.builder();
+            if host.parse::<std::net::IpAddr>().is_err() {
+                connection.ssl().set_hostname(host).unwrap();
+            }
+            connection
+                .ssl()
+                .set_curves_list(if hrr { "X25519:P-384" } else { "P-384:X25519" })
+                .unwrap();
+            if let Some(enabled) = aes_hw {
+                connection.ssl().set_aes_hw_override(enabled);
+            }
+            connection.ssl().set_enable_ech_grease(true);
+            connection
+                .ssl()
+                .set_ech_grease_callback(move |_, info| {
+                    called.fetch_add(1, Ordering::SeqCst);
+                    let parameters = policy(info, host_len)?;
+                    let size = usize::from(parameters.payload_length.get());
+                    assert!(size <= info.max_payload_length());
+                    assert!(info.message_length() + size <= 16384);
+                    Ok(parameters)
+                })
+                .unwrap();
+            let messages = connect_and_capture(connection, None);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(messages.len(), if hrr { 2 } else { 1 });
+            let body = ech(&messages[0]);
+            let length = usize::from(u16::from_be_bytes([
+                body[ECH_PAYLOAD_LENGTH_OFFSET],
+                body[ECH_PAYLOAD_LENGTH_OFFSET + 1],
+            ]));
+            assert!(
+                allowed_lengths.contains(&length),
+                "host={host}, length={length}"
             );
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                usize::from(enabled),
-                "Firefox {release}"
-            );
+            if let Some(previous) = host_lengths[round % 3].replace(length) {
+                assert_eq!(length, previous, "randomness must not change sizing");
+            }
+            assert_eq!(body.len(), ECH_BODY_FRAMING_LEN + length);
+            assert_eq!(&body[..ECH_AEAD_OFFSET], &[0, 0, 1]); // Outer, HKDF-SHA256.
+            assert_eq!(&body[ECH_ENC_OFFSET - 2..ECH_ENC_OFFSET], &[0, 32]);
+            let aead = u16::from_be_bytes([body[ECH_AEAD_OFFSET], body[ECH_AEAD_OFFSET + 1]]);
+            assert!([1, 3].contains(&aead));
+            aes += usize::from(aead == 1);
+            high_bits += usize::from(body[ECH_ENC_OFFSET + 31] & 0x80 != 0);
             for message in &messages {
-                if !enabled {
-                    assert!(!extensions(message)
-                        .iter()
-                        .any(|(id, _)| *id == ffi::TLSEXT_TYPE_encrypted_client_hello as u16));
-                    continue;
-                }
-                let extension = ech(message);
-                let size = usize::from(u16::from_be_bytes([
-                    extension[ECH_PAYLOAD_LENGTH_OFFSET],
-                    extension[ECH_PAYLOAD_LENGTH_OFFSET + 1],
-                ]));
-                assert_eq!(size, expected.load(Ordering::SeqCst), "Firefox {release}");
-                assert_eq!(extension.len(), ECH_BODY_FRAMING_LEN + size);
-                assert_eq!(extension, ech(&messages[0]));
+                assert_eq!(ech(message), body);
+                let wire = extensions(message);
+                let position = wire
+                    .iter()
+                    .position(|(id, _)| *id == ffi::TLSEXT_TYPE_encrypted_client_hello as u16)
+                    .unwrap();
+                assert!(wire[position + 1..]
+                    .iter()
+                    .all(|(id, _)| *id == ffi::TLSEXT_TYPE_padding as u16));
             }
         }
+        // This profile's 120-byte name crosses one more padding block. A
+        // constant per-version length would pass the range check, but not this.
+        assert_eq!(host_lengths[1].unwrap(), host_lengths[0].unwrap() + 32);
+        assert!(host_lengths[2].unwrap() <= host_lengths[0].unwrap());
+        // For each hardware setting, an all-equal sample has probability 2^-63.
+        assert!(aes > 0 && aes < ROUNDS, "aes_hw={aes_hw:?}, aes={aes}");
+        assert!(
+            high_bits > 0 && high_bits < ROUNDS,
+            "aes_hw={aes_hw:?}, high_bits={high_bits}"
+        );
     }
 }
 
-// Synthetic reference vectors derived from NSS's inner encoding and padding,
-// not independent browser captures. The fixed source defines their arithmetic:
-// https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L1351-L1653
-// https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3
 #[test]
-fn ech_nss_payload_length_reference_vectors() {
-    let fresh = firefox_tcp(19);
-    assert_eq!(
-        EchGreaseInfo(&fresh.info()).nss_payload_length(100, 19),
-        240
-    );
-    // Hosts beyond grease_size get no name padding.
-    let long = firefox_tcp(120);
-    assert_eq!(
-        EchGreaseInfo(&long.info()).nss_payload_length(100, 120),
-        272
-    );
-    // Resumption copies the 107-byte pre_shared_key (64-byte ticket, SHA-256
-    // binder) into the inner hello and offers early_data.
-    let mut resumed = firefox_tcp(19);
-    resumed.extensions.push(ext(0x002a, 0));
-    resumed.psk_extension_length = 107;
-    assert_eq!(
-        EchGreaseInfo(&resumed.info()).nss_payload_length(100, 19),
-        368
-    );
-    // IP literals send no SNI but still pad by the URL host, so the result
-    // steps at a grease_size boundary: 127.0.0.1 at 93/94 and ::1 at 87/88.
-    let mut literal = firefox_tcp(0);
-    literal.extensions.remove(0);
-    literal.server_name_length = None;
-    let literal = literal.info();
+fn ech_nss_ip_host_length_without_sni() {
+    // No SNI is emitted, but NSS still uses the URL host for name padding.
+    let mut vector = firefox_tcp(0);
+    vector.extensions.remove(0);
+    vector.server_name_length = None;
+    let raw = vector.info();
+    let info = EchGreaseInfo(&raw);
     for (host_len, below, above) in [(9, 93, 94), (3, 87, 88)] {
-        assert_eq!(
-            EchGreaseInfo(&literal).nss_payload_length(below, host_len),
-            208
-        );
-        assert_eq!(
-            EchGreaseInfo(&literal).nss_payload_length(above, host_len),
-            240
-        );
+        for (rounding, lower, upper) in [(NssPre3127, 239, 239), (Rfc9849, 208, 240)] {
+            assert_eq!(info.nss_payload_length(below, host_len, rounding), lower);
+            assert_eq!(info.nss_payload_length(above, host_len, rounding), upper);
+        }
     }
-    let quic = firefox_quic(19);
-    assert_eq!(EchGreaseInfo(&quic.info()).nss_payload_length(100, 19), 240);
-    let mut quic_resumed = firefox_quic(19);
-    quic_resumed.extensions.push(ext(0x002a, 0));
-    quic_resumed.psk_extension_length = 123;
-    assert_eq!(
-        EchGreaseInfo(&quic_resumed.info()).nss_payload_length(100, 19),
-        368
-    );
-    let mut quic_literal = firefox_quic(0);
-    quic_literal.extensions.remove(0);
-    quic_literal.server_name_length = None;
-    assert_eq!(
-        EchGreaseInfo(&quic_literal.info()).nss_payload_length(100, 9),
-        208
-    );
 }
 
 #[test]
@@ -964,74 +1120,82 @@ fn ech_nss_grease_crosses_padding_boundary() {
     let mut grease = firefox_tcp(19);
     grease.extensions.insert(0, ext(0x0a0a, 0));
     grease.extensions.push(ext(0x1a1a, 1));
-    // At max_name_len=100, the inner length is 217 before rounding. GREASE
-    // adds four compressed-extension bytes and two version bytes: 223/224/225
-    // at 100/101/102. Omitting the version bytes misses the final 32-byte step.
-    for (max_name_len, expected) in [(100, 240), (101, 240), (102, 272)] {
-        assert_eq!(
-            EchGreaseInfo(&plain.info()).nss_payload_length(max_name_len, 19),
-            240,
-            "without GREASE, max_name_len={max_name_len}",
-        );
-        assert_eq!(
-            EchGreaseInfo(&grease.info()).nss_payload_length(max_name_len, 19),
-            expected,
-            "with GREASE, max_name_len={max_name_len}",
-        );
-    }
-}
-
-// NSS picks the AEAD from a random bit, so both must appear.
-#[test]
-fn ech_nss_parameters_draw_both_aeads() {
-    let vector = firefox_tcp(19);
-    let info = vector.info();
-    let mut aes = 0;
-    for _ in 0..64 {
-        let parameters = EchGreaseInfo(&info).nss_parameters(100, 19).unwrap();
-        assert_eq!(parameters.payload_length.get(), 240);
-        assert!(parameters.random_enc);
-        aes += usize::from(parameters.aead == EchGreaseAead::AES_128_GCM);
-    }
-    // Seeing only one AEAD has probability 2^-63.
-    assert!(aes > 0 && aes < 64);
-    let mut tight = vector.info();
-    tight.max_payload_length = 239;
-    assert!(EchGreaseInfo(&tight).nss_parameters(100, 19).is_err());
-}
-
-#[test]
-fn ech_nss_sizing_example() {
-    for grease in [false, true] {
-        let server = Server::builder().build();
-        let expected = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&expected);
-        let mut client = server.client_with_root_ca();
-        client.ctx().set_grease_enabled(grease);
-        client.ctx().set_ech_grease_callback(move |_, info| {
-            let host_len = "localhost".len();
-            assert_eq!(info.server_name_length(), Some(host_len));
-            let host_len = u8::try_from(host_len).unwrap();
-            let length = info.nss_payload_length(100, host_len);
-            assert_eq!((length - info.aead_overhead()) % 32, 0);
-            assert_eq!(info.nss_payload_length(132, host_len), length + 32);
+    // GREASE adds four compressed-extension bytes and two version bytes:
+    // unrounded lengths 223/224/225 at maximum names 100/101/102.
+    for (max_name, expected) in [(100, [239, 240]), (101, [271, 240]), (102, [271, 272])] {
+        for (index, rounding) in [NssPre3127, Rfc9849].into_iter().enumerate() {
             assert_eq!(
-                info.nss_payload_length(0, host_len),
-                info.nss_payload_length(host_len, host_len)
+                EchGreaseInfo(&plain.info()).nss_payload_length(max_name, 19, rounding),
+                [239, 240][index]
             );
-            observed.store(length, Ordering::SeqCst);
-            let parameters = info.nss_parameters(100, host_len)?;
-            assert_eq!(usize::from(parameters.payload_length.get()), length);
-            Ok(parameters)
-        });
-        let mut connection = client.build().builder();
-        connection.ssl().set_hostname("localhost").unwrap();
-        connection.ssl().set_enable_ech_grease(true);
-        let messages = connect_and_capture(connection, None);
+            assert_eq!(
+                EchGreaseInfo(&grease.info()).nss_payload_length(max_name, 19, rounding),
+                expected[index]
+            );
+        }
+    }
+}
+
+#[test]
+fn ech_nss_sizing_ablation() {
+    // The baseline inner length is 225. Remove one contribution at a time,
+    // retaining independently calculated wire lengths for both rounding rules.
+    for (factor, expected) in [
+        ("baseline", [271, 272]),
+        ("one cipher", [239, 240]),
+        ("one compressed extension", [239, 240]),
+        ("SNI", [239, 240]),
+        ("name padding", [175, 176]),
+        ("AEAD tag", [255, 256]),
+    ] {
+        let mut vector = firefox_tcp(19);
+        let mut max_name = 108;
+        match factor {
+            "one cipher" => {
+                vector.cipher_suites.truncate(28);
+            }
+            "one compressed extension" => {
+                vector.extensions.pop();
+            }
+            "SNI" => {
+                vector.extensions.remove(0);
+                vector.server_name_length = None;
+            }
+            "name padding" => max_name = 0,
+            _ => {}
+        }
+        let mut raw = vector.info();
+        if factor == "AEAD tag" {
+            raw.aead_overhead = 0;
+        }
+        let info = EchGreaseInfo(&raw);
         assert_eq!(
-            ech(&messages[0]).len(),
-            expected.load(Ordering::SeqCst) + ECH_BODY_FRAMING_LEN
+            [
+                info.nss_payload_length(max_name, 19, NssPre3127),
+                info.nss_payload_length(max_name, 19, Rfc9849)
+            ],
+            expected,
+            "{factor}"
         );
+    }
+}
+
+#[test]
+fn ech_nss_parameters_enforce_budget() {
+    let vector = firefox_tcp(19);
+    for (rounding, length) in [(NssPre3127, 239), (Rfc9849, 240)] {
+        for budget in [0, length - 1, length, length + 1] {
+            let mut raw = vector.info();
+            raw.max_payload_length = budget;
+            let result = EchGreaseInfo(&raw).nss_parameters(100, 19, rounding);
+            if budget < length {
+                assert!(result.is_err());
+            } else {
+                let parameters = result.unwrap();
+                assert_eq!(usize::from(parameters.payload_length.get()), length);
+                assert!(parameters.random_enc);
+            }
+        }
     }
 }
 
@@ -1087,7 +1251,7 @@ fn ech_context_policy_and_connection_override() {
 
 #[test]
 fn ech_policy_resumption_preserves_psk_binder() {
-    for legacy in [false, true] {
+    for rounding in [NssPre3127, Rfc9849] {
         let mut server = Server::builder();
         server.expected_connections_count(2);
         server
@@ -1109,19 +1273,7 @@ fn ech_policy_resumption_preserves_psk_binder() {
         client.ctx().set_ech_grease_callback(move |_, info| {
             let resumed = count.fetch_add(1, Ordering::SeqCst) != 0;
             assert_eq!(info.psk_extension_length() != 0, resumed);
-            let length = if legacy {
-                legacy_nss_payload_length(info, 100, 9)
-            } else {
-                info.nss_payload_length(100, 9)
-            };
-            assert_eq!(
-                (length - info.aead_overhead()) % 32,
-                if legacy { 31 } else { 0 }
-            );
-            Ok(EchGreaseParameters {
-                random_enc: true,
-                ..parameters(info, length)
-            })
+            info.nss_parameters(100, 9, rounding)
         });
         let client = client.build();
         let mut first = client.builder();

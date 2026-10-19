@@ -121,14 +121,14 @@ diff --git a/ssl/internal.h b/ssl/internal.h
    bool GetIV(const uint8_t **out_iv, size_t *out_iv_len) const;
  
   private:
-@@ -3740,6 +3749,81 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
+@@ -3793,6 +3802,81 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
  int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
                         size_t *out_bytes_written, Span<const uint8_t> in);
  
 +// tls_app_data_fragment returns the most plaintext in one application data
 +// record, before any 0-RTT budget. `tls_write_app_data` and
-+// `tls_seal_app_data` both use it; a peer `record_size_limit` (RFC 8449)
-+// would also apply here.
++// `tls_seal_app_data` both use it, so both honor the peer's
++// `record_size_limit` (RFC 8449).
 +size_t tls_app_data_fragment(const SSLImpl *ssl);
 +
 +// tls_can_seal_app_data returns whether `tls_seal_app_data` can seal now
@@ -210,17 +210,17 @@ diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
    const bool is_early_data_write =
        !ssl->server && SSL_in_early_data(ssl) && ssl->s3->hs->can_early_write;
    for (;;) {
--    size_t max_send_fragment = ssl->max_send_fragment;
+-    size_t max_send_fragment = tls_max_send_fragment(ssl);
 +    size_t max_send_fragment = tls_app_data_fragment(ssl);
      if (is_early_data_write) {
        SSL_HANDSHAKE *hs = ssl->s3->hs.get();
        if (hs->early_data_written >= hs->early_session->ticket_max_early_data) {
-@@ -104,6 +104,152 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
+@@ -112,6 +112,152 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
    }
  }
  
 +size_t tls_app_data_fragment(const SSLImpl *ssl) {
-+  return ssl->max_send_fragment;
++  return tls_max_send_fragment(ssl);
 +}
 +
 +bool tls_can_seal_app_data(const SSLImpl *ssl) {
@@ -1751,7 +1751,7 @@ diff --git a/ssl/test/test_config.h b/ssl/test/test_config.h
 diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
 --- a/ssl/tls_record.cc
 +++ b/ssl/tls_record.cc
-@@ -263,9 +263,14 @@ ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
+@@ -271,9 +271,14 @@ ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
    return ssl_open_record_success;
  }
  
@@ -1769,7 +1769,7 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
    SSLAEADContext *aead = ssl->s3->aead_write_ctx.get();
    uint8_t *extra_in = nullptr;
    size_t extra_in_len = 0;
-@@ -282,9 +287,17 @@ static bool do_seal_record(SSLImpl *ssl, uint8_t *out_prefix, uint8_t *out,
+@@ -293,9 +298,17 @@ static bool do_seal_record(SSLImpl *ssl, uint8_t *out_prefix, uint8_t *out,
      return false;
    }
  
@@ -1790,7 +1790,7 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
  
    if (extra_in_len) {
      out_prefix[0] = SSL3_RT_APPLICATION_DATA;
-@@ -305,17 +318,28 @@ static bool do_seal_record(SSLImpl *ssl, uint8_t *out_prefix, uint8_t *out,
+@@ -316,17 +329,28 @@ static bool do_seal_record(SSLImpl *ssl, uint8_t *out_prefix, uint8_t *out,
      return false;
    }
  
@@ -1822,7 +1822,7 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
  static size_t tls_seal_scatter_prefix_len(const SSLImpl *ssl, uint8_t type,
                                            size_t in_len) {
    size_t ret = SSL3_RT_HEADER_LENGTH;
-@@ -499,6 +523,153 @@ enum ssl_open_record_t ssl_process_alert(SSLImpl *ssl, uint8_t *out_alert,
+@@ -510,6 +534,153 @@ enum ssl_open_record_t ssl_process_alert(SSLImpl *ssl, uint8_t *out_alert,
    return ssl_open_record_error;
  }
  
