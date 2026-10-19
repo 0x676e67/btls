@@ -4264,7 +4264,7 @@ impl SslRef {
         }
     }
 
-    // Whether or not `SSL` negotiated ECH.
+    /// Whether or not `SSL` negotiated ECH.
     #[corresponds(SSL_ech_accepted)]
     #[must_use]
     pub fn ech_accepted(&self) -> bool {
