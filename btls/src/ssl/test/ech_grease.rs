@@ -33,59 +33,6 @@ fn parameters(info: &EchGreaseInfo<'_>, payload_length: usize) -> EchGreaseParam
     }
 }
 
-// Test-only NSS-style sizing for TLS with a configured hostname, not a complete
-// Firefox fingerprint. Includes the AEAD tag, but excludes ECH framing.
-// https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L2143
-// https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3
-fn nss_payload_length(
-    info: &EchGreaseInfo<'_>,
-    max_name_len: usize,
-    host_len: usize,
-    grease_version_offered: bool,
-) -> usize {
-    assert!(!info.is_dtls());
-    assert!(max_name_len <= usize::from(u8::MAX));
-    assert!((1..=usize::from(u8::MAX)).contains(&host_len));
-
-    // EncodedClientHelloInner uses an empty session ID and the outer ciphers.
-    let mut len = 2 + 32 + 1 + 2 + info.cipher_suites().len() + 1 + 1 + 2;
-    len += TLS_EXTENSION_HEADER_LEN + 1; // Inner encrypted_client_hello marker.
-    if let Some(sni) = info.server_name_length() {
-        len += TLS_EXTENSION_HEADER_LEN + 5 + sni;
-    }
-    // Keep TLS 1.3 and, if offered, the GREASE version.
-    len += TLS_EXTENSION_HEADER_LEN + 3 + if grease_version_offered { 2 } else { 0 };
-    if info.psk_extension_length() != 0 {
-        len += TLS_EXTENSION_HEADER_LEN + info.psk_extension_length();
-    }
-
-    // Compress the remaining extensions, including RFC 8701 GREASE. Omit the
-    // TLS 1.2-only extensions and NSS's deprecated ticket_early_data_info (46).
-    const NSS_TICKET_EARLY_DATA_INFO: u16 = 46;
-    let compressed = info
-        .extensions()
-        .filter(|(kind, _)| {
-            ![
-                ffi::TLSEXT_TYPE_server_name as u16,
-                ffi::TLSEXT_TYPE_supported_versions as u16,
-                ffi::TLSEXT_TYPE_ec_point_formats as u16,
-                ffi::TLSEXT_TYPE_extended_master_secret as u16,
-                ffi::TLSEXT_TYPE_session_ticket as u16,
-                NSS_TICKET_EARLY_DATA_INFO,
-                ffi::TLSEXT_TYPE_renegotiate as u16,
-            ]
-            .contains(kind)
-        })
-        .count();
-    assert!(2 * compressed <= usize::from(u8::MAX));
-    if compressed != 0 {
-        len += TLS_EXTENSION_HEADER_LEN + 1 + 2 * compressed;
-    }
-    len += max_name_len.saturating_sub(host_len);
-    len += 31 - ((len - 1) % 32);
-    len + info.aead_overhead()
-}
-
 #[derive(Default)]
 struct Capture {
     messages: Vec<Vec<u8>>,
@@ -237,13 +184,29 @@ fn ech_callback_fixed_lengths_and_order() {
     let baseline = handshake(|_| {}, false);
     assert!(DEFAULT_PAYLOAD_LENGTHS.contains(&(ech(&baseline[0]).len() - ECH_BODY_FRAMING_LEN)));
     for requested in [1, 239, 4096] {
+        let reported = Arc::new(AtomicUsize::new(0));
+        let message_length = Arc::clone(&reported);
         let messages = handshake(
             |ssl| {
-                ssl.set_ech_grease_callback(move |_, info| Ok(parameters(info, requested)))
-                    .unwrap();
+                ssl.set_ech_grease_callback(move |_, info| {
+                    // No hostname was configured, so no SNI is reported.
+                    assert_eq!(info.server_name_length(), None);
+                    message_length.store(info.message_length(), Ordering::SeqCst);
+                    Ok(parameters(info, requested))
+                })
+                .unwrap();
             },
             false,
         );
+        // The message is message_length + payload + header, except that RFC 7685
+        // pads 256 to 511 bytes to 512, or up to 516 when fewer than five bytes
+        // remain for the padding extension.
+        let expected = reported.load(Ordering::SeqCst) + requested + 4;
+        if (0x100..0x200).contains(&expected) {
+            assert!((0x200..=0x204).contains(&messages[0].len()));
+        } else {
+            assert_eq!(messages[0].len(), expected);
+        }
         let extension = ech(&messages[0]);
         let payload_len = usize::from(u16::from_be_bytes([
             extension[ECH_PAYLOAD_LENGTH_OFFSET],
@@ -511,10 +474,22 @@ fn ech_policy_callback_ownership() {
     assert_eq!(Arc::strong_count(&marker), 2);
     install(&mut ssl);
     assert_eq!(Arc::strong_count(&marker), 2);
+    // A closure of another type takes over without freeing the earlier one.
+    let other = Arc::new(());
+    let captured = Arc::clone(&other);
+    ssl.set_ech_grease_callback(move |_, info| {
+        let _ = &captured;
+        Ok(parameters(info, 240))
+    })
+    .unwrap();
+    assert_eq!(Arc::strong_count(&marker), 2);
+    assert_eq!(Arc::strong_count(&other), 2);
     ssl.clear_ech_grease_callback().unwrap();
     assert_eq!(Arc::strong_count(&marker), 2);
+    assert_eq!(Arc::strong_count(&other), 2);
     drop(ssl);
     assert_eq!(Arc::strong_count(&marker), 1);
+    assert_eq!(Arc::strong_count(&other), 1);
 }
 
 #[test]
@@ -643,6 +618,203 @@ fn ech_metadata_includes_grease_in_wire_order() {
     );
 }
 
+// A synthetic view for exercising the NSS rule without a handshake.
+struct NssVector {
+    cipher_suites: Vec<u8>,
+    extensions: Vec<ffi::SSL_ECH_GREASE_EXTENSION>,
+    server_name_length: Option<usize>,
+    psk_extension_length: usize,
+}
+
+impl NssVector {
+    fn info(&self) -> ffi::SSL_ECH_GREASE_SIZE_INFO {
+        ffi::SSL_ECH_GREASE_SIZE_INFO {
+            ssl: std::ptr::null(),
+            cipher_suites: self.cipher_suites.as_ptr(),
+            cipher_suites_length: self.cipher_suites.len(),
+            extensions: self.extensions.as_ptr(),
+            num_extensions: self.extensions.len(),
+            preamble_length: 0,
+            psk_extension_length: self.psk_extension_length,
+            server_name_length: self.server_name_length.unwrap_or(0),
+            has_server_name: self.server_name_length.is_some().into(),
+            is_dtls: 0,
+            is_quic: 0,
+            default_aead_id: ffi::EVP_HPKE_AES_128_GCM as u16,
+            aead_overhead: 16,
+            max_payload_length: 4096,
+            message_length: 0,
+        }
+    }
+}
+
+fn ext(type_: u16, length: usize) -> ffi::SSL_ECH_GREASE_EXTENSION {
+    ffi::SSL_ECH_GREASE_EXTENSION { type_, length }
+}
+
+// Synthetic Firefox-shaped TCP metadata, not a captured ClientHello. Only the
+// suite count, extension types and server_name length affect the rule; other
+// body lengths are representative. 15 cipher suites, then server_name,
+// extended_master_secret, renegotiation_info, supported_groups,
+// ec_point_formats, session_ticket, ALPN, status_request,
+// delegated_credentials, signed_certificate_timestamp, key_share,
+// supported_versions, signature_algorithms, psk_key_exchange_modes,
+// record_size_limit and compress_certificate.
+fn firefox_tcp(host_len: usize) -> NssVector {
+    NssVector {
+        cipher_suites: vec![0; 30],
+        extensions: vec![
+            ext(0x0000, 5 + host_len),
+            ext(0x0017, 0),
+            ext(0xff01, 1),
+            ext(0x000a, 16),
+            ext(0x000b, 2),
+            ext(0x0023, 0),
+            ext(0x0010, 14),
+            ext(0x0005, 5),
+            ext(0x0022, 11),
+            ext(0x0012, 0),
+            ext(0x0033, 1263),
+            ext(0x002b, 5),
+            ext(0x000d, 24),
+            ext(0x002d, 2),
+            ext(0x001c, 2),
+            ext(0x001b, 3),
+        ],
+        server_name_length: Some(host_len),
+        psk_extension_length: 0,
+    }
+}
+
+// Synthetic QUIC metadata: the TLS 1.3 suites, server_name, then
+// supported_groups, ALPN, status_request, delegated_credentials,
+// signed_certificate_timestamp, key_share, supported_versions,
+// signature_algorithms, psk_key_exchange_modes, record_size_limit and
+// quic_transport_parameters.
+fn firefox_quic(host_len: usize) -> NssVector {
+    NssVector {
+        cipher_suites: vec![0; 6],
+        extensions: vec![
+            ext(0x0000, 5 + host_len),
+            ext(0x000a, 16),
+            ext(0x0010, 5),
+            ext(0x0005, 5),
+            ext(0x0022, 11),
+            ext(0x0012, 0),
+            ext(0x0033, 1263),
+            ext(0x002b, 3),
+            ext(0x000d, 24),
+            ext(0x002d, 2),
+            ext(0x001c, 2),
+            ext(0x0039, 87),
+        ],
+        server_name_length: Some(host_len),
+        psk_extension_length: 0,
+    }
+}
+
+// Synthetic reference vectors derived from NSS's inner encoding and padding,
+// not independent browser captures. The fixed source defines their arithmetic:
+// https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L1351-L1653
+// https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3
+#[test]
+fn ech_nss_payload_length_reference_vectors() {
+    let fresh = firefox_tcp(19);
+    assert_eq!(
+        EchGreaseInfo(&fresh.info()).nss_payload_length(100, 19),
+        240
+    );
+    // Hosts beyond grease_size get no name padding.
+    let long = firefox_tcp(120);
+    assert_eq!(
+        EchGreaseInfo(&long.info()).nss_payload_length(100, 120),
+        272
+    );
+    // Resumption copies the 107-byte pre_shared_key (64-byte ticket, SHA-256
+    // binder) into the inner hello and offers early_data.
+    let mut resumed = firefox_tcp(19);
+    resumed.extensions.push(ext(0x002a, 0));
+    resumed.psk_extension_length = 107;
+    assert_eq!(
+        EchGreaseInfo(&resumed.info()).nss_payload_length(100, 19),
+        368
+    );
+    // IP literals send no SNI but still pad by the URL host, so the result
+    // steps at a grease_size boundary: 127.0.0.1 at 93/94 and ::1 at 87/88.
+    let mut literal = firefox_tcp(0);
+    literal.extensions.remove(0);
+    literal.server_name_length = None;
+    let literal = literal.info();
+    for (host_len, below, above) in [(9, 93, 94), (3, 87, 88)] {
+        assert_eq!(
+            EchGreaseInfo(&literal).nss_payload_length(below, host_len),
+            208
+        );
+        assert_eq!(
+            EchGreaseInfo(&literal).nss_payload_length(above, host_len),
+            240
+        );
+    }
+    let quic = firefox_quic(19);
+    assert_eq!(EchGreaseInfo(&quic.info()).nss_payload_length(100, 19), 240);
+    let mut quic_resumed = firefox_quic(19);
+    quic_resumed.extensions.push(ext(0x002a, 0));
+    quic_resumed.psk_extension_length = 123;
+    assert_eq!(
+        EchGreaseInfo(&quic_resumed.info()).nss_payload_length(100, 19),
+        368
+    );
+    let mut quic_literal = firefox_quic(0);
+    quic_literal.extensions.remove(0);
+    quic_literal.server_name_length = None;
+    assert_eq!(
+        EchGreaseInfo(&quic_literal.info()).nss_payload_length(100, 9),
+        208
+    );
+}
+
+#[test]
+fn ech_nss_grease_crosses_padding_boundary() {
+    let plain = firefox_tcp(19);
+    let mut grease = firefox_tcp(19);
+    grease.extensions.insert(0, ext(0x0a0a, 0));
+    grease.extensions.push(ext(0x1a1a, 1));
+    // At max_name_len=100, the inner length is 217 before rounding. GREASE
+    // adds four compressed-extension bytes and two version bytes: 223/224/225
+    // at 100/101/102. Omitting the version bytes misses the final 32-byte step.
+    for (max_name_len, expected) in [(100, 240), (101, 240), (102, 272)] {
+        assert_eq!(
+            EchGreaseInfo(&plain.info()).nss_payload_length(max_name_len, 19),
+            240,
+            "without GREASE, max_name_len={max_name_len}",
+        );
+        assert_eq!(
+            EchGreaseInfo(&grease.info()).nss_payload_length(max_name_len, 19),
+            expected,
+            "with GREASE, max_name_len={max_name_len}",
+        );
+    }
+}
+
+// NSS picks the AEAD from a random bit, so both must appear.
+#[test]
+fn ech_nss_parameters_draw_both_aeads() {
+    let vector = firefox_tcp(19);
+    let info = vector.info();
+    let mut aes = 0;
+    for _ in 0..64 {
+        let parameters = EchGreaseInfo(&info).nss_parameters(100, 19).unwrap();
+        assert_eq!(parameters.payload_length.get(), 240);
+        assert!(parameters.random_enc);
+        aes += usize::from(parameters.aead == EchGreaseAead::AES_128_GCM);
+    }
+    // Seeing only one AEAD has probability 2^-63.
+    assert!(aes > 0 && aes < 64);
+    let mut tight = vector.info();
+    tight.max_payload_length = 239;
+    assert!(EchGreaseInfo(&tight).nss_parameters(100, 19).is_err());
+}
+
 #[test]
 fn ech_nss_sizing_example() {
     for grease in [false, true] {
@@ -654,16 +826,18 @@ fn ech_nss_sizing_example() {
         client.ctx().set_ech_grease_callback(move |_, info| {
             let host_len = "localhost".len();
             assert_eq!(info.server_name_length(), Some(host_len));
-            let length = nss_payload_length(info, 100, host_len, grease);
+            let host_len = u8::try_from(host_len).unwrap();
+            let length = info.nss_payload_length(100, host_len);
             assert_eq!((length - info.aead_overhead()) % 32, 0);
-            assert_eq!(nss_payload_length(info, 132, host_len, grease), length + 32);
+            assert_eq!(info.nss_payload_length(132, host_len), length + 32);
             assert_eq!(
-                nss_payload_length(info, 0, host_len, grease),
-                nss_payload_length(info, host_len, host_len, grease)
+                info.nss_payload_length(0, host_len),
+                info.nss_payload_length(host_len, host_len)
             );
-            assert!(length <= info.max_payload_length());
             observed.store(length, Ordering::SeqCst);
-            Ok(parameters(info, length))
+            let parameters = info.nss_parameters(100, host_len)?;
+            assert_eq!(usize::from(parameters.payload_length.get()), length);
+            Ok(parameters)
         });
         let mut connection = client.build().builder();
         connection.ssl().set_hostname("localhost").unwrap();
@@ -766,10 +940,7 @@ fn ech_policy_resumption_preserves_psk_binder() {
         .set_ech_grease_callback(move |_, info| {
             assert!(info.psk_extension_length() > 4);
             count.fetch_add(1, Ordering::SeqCst);
-            Ok(parameters(
-                info,
-                nss_payload_length(info, 100, "localhost".len(), false),
-            ))
+            Ok(parameters(info, info.nss_payload_length(100, 9)))
         })
         .unwrap();
     assert!(second.connect().ssl().session_reused());
