@@ -24,6 +24,27 @@ impl EchGreaseAead {
     pub const AES_128_GCM: Self = Self(ffi::EVP_HPKE_AES_128_GCM as u16);
     /// ChaCha20-Poly1305.
     pub const CHACHA20_POLY1305: Self = Self(ffi::EVP_HPKE_CHACHA20_POLY1305 as u16);
+
+    /// Returns the HPKE AEAD identifier encoded in the extension.
+    pub const fn id(self) -> u16 {
+        self.0
+    }
+}
+
+/// Rounding used by NSS when padding an ECH GREASE inner ClientHello.
+/// This does not change other TLS settings.
+/// Custom callbacks can return [`EchGreaseParameters`] without using these rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EchGreaseRounding {
+    /// NSS before 3.127, as used by Firefox 117-154: pad to `32k + 31`.
+    /// This reproduces the historical behavior, not RFC 9849's padding rule.
+    NssPre3127,
+    /// Round up to a multiple of 32, as in NSS 3.127 / Firefox 155 onward.
+    /// See the [official fix] for Bug 2060720.
+    ///
+    /// [official fix]: https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
+    Rfc9849,
 }
 
 /// Parameters for one ECH GREASE extension, reused unchanged after HRR.
@@ -99,7 +120,8 @@ impl EchGreaseInfo<'_> {
 
     /// CH1's remaining extensions-vector frame budget, not a peer acceptance limit.
     /// See [`message_length`](Self::message_length) for the 16 KiB BoringSSL limit.
-    /// HRR may need more room for a cookie or a larger key share in CH2.
+    /// HRR may need more room for a cookie or a larger key share in CH2;
+    /// dropping CH1's padding can also make CH2 shorter.
     pub fn max_payload_length(&self) -> usize {
         self.0.max_payload_length
     }
@@ -125,13 +147,14 @@ impl EchGreaseInfo<'_> {
         self.0.is_quic != 0
     }
 
-    /// Payload length NSS would send for this ClientHello, including the tag.
+    /// NSS-shaped payload length, including the tag, with explicit rounding.
     ///
     /// Follows NSS's [`tls13_MaybeGreaseEch`]: the inner hello keeps
     /// `server_name`, `supported_versions` (TLS 1.3 only) and `pre_shared_key`
     /// in full, drops the TLS 1.2-only extensions, compresses the rest, pads
-    /// the host name to `max_name_len` and rounds up to a multiple of 32
-    /// ([RFC 9849] 6.1.3).
+    /// the host name to `max_name_len`, then applies `rounding`. Use
+    /// [`EchGreaseRounding::NssPre3127`] for Firefox 117-154 or
+    /// [`EchGreaseRounding::Rfc9849`] for the [NSS 3.127] fix.
     /// `max_name_len` is Firefox's `security.tls.ech.grease_size`, 100 by
     /// default. `host_len` is the URL host length, which NSS narrows to `u8`
     /// and applies even without SNI, as for IP literals. A GREASE version is
@@ -141,10 +164,16 @@ impl EchGreaseInfo<'_> {
     /// extension order, so list ECH last to match NSS; with GREASE enabled the
     /// trailing [RFC 8701] extension still follows ECH, unlike NSS.
     ///
+    /// [NSS 3.127]: https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
     /// [`tls13_MaybeGreaseEch`]: https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L2143
     /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
     /// [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3
-    pub fn nss_payload_length(&self, max_name_len: u8, host_len: u8) -> usize {
+    pub fn nss_payload_length(
+        &self,
+        max_name_len: u8,
+        host_len: u8,
+        rounding: EchGreaseRounding,
+    ) -> usize {
         // EncodedClientHelloInner uses an empty session ID and the outer ciphers.
         let mut len = 2 + 32 + 1 + 2 + self.cipher_suites().len() + 1 + 1 + 2;
         len += TLS_EXTENSION_HEADER_LEN + 1; // Inner encrypted_client_hello marker.
@@ -180,19 +209,47 @@ impl EchGreaseInfo<'_> {
             len += TLS_EXTENSION_HEADER_LEN + 1 + 2 * compressed;
         }
         len += usize::from(max_name_len.saturating_sub(host_len));
-        len += 31 - ((len - 1) % 32);
+        let remainder = match rounding {
+            EchGreaseRounding::NssPre3127 => len % 32,
+            EchGreaseRounding::Rfc9849 => (len - 1) % 32,
+        };
+        len += 31 - remainder;
         len + self.aead_overhead()
     }
 
     /// NSS-shaped parameters: [`nss_payload_length`](Self::nss_payload_length),
     /// an AEAD drawn uniformly from the two accepted ones and a random `enc`.
     /// Fails if the length exceeds [`max_payload_length`](Self::max_payload_length).
+    ///
+    /// Capture the normalized URL host length, including for IPs without SNI.
+    /// A context policy can instead read it from [`SslRef::ex_data`], populated
+    /// with [`SslRef::set_ex_data`] on each configured connection.
+    /// Use `Rfc9849` instead of `NssPre3127` for Firefox 155 and later:
+    ///
+    /// ```no_run
+    /// use std::net::TcpStream;
+    /// use btls::ssl::{EchGreaseRounding, SslConnector, SslMethod};
+    /// # fn connect() -> Result<(), Box<dyn std::error::Error>> {
+    /// let host = "127.0.0.1";
+    /// let host_length = u8::try_from(host.len())?;
+    /// let connector = SslConnector::builder(SslMethod::tls())?.build();
+    /// let mut connection = connector.configure()?;
+    /// connection.set_enable_ech_grease(true);
+    /// connection.set_ech_grease_callback(move |_, info| {
+    ///     info.nss_parameters(100, host_length, EchGreaseRounding::NssPre3127)
+    /// })?;
+    /// let ssl = connection.into_ssl(host)?; // No SNI for an IP literal.
+    /// let _stream = ssl.connect(TcpStream::connect((host, 443))?)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn nss_parameters(
         &self,
         max_name_len: u8,
         host_len: u8,
+        rounding: EchGreaseRounding,
     ) -> Result<EchGreaseParameters, ErrorStack> {
-        let payload_length = self.nss_payload_length(max_name_len, host_len);
+        let payload_length = self.nss_payload_length(max_name_len, host_len, rounding);
         let payload_length = u16::try_from(payload_length)
             .ok()
             .filter(|len| usize::from(*len) <= self.max_payload_length())
@@ -267,14 +324,15 @@ impl SslContextBuilder {
     /// Sets the default ECH GREASE policy for connections using this context.
     ///
     /// Called once when CH1 needs GREASE; HRR and DTLS HelloVerifyRequest reuse
-    /// its bytes. Does not enable GREASE or change real ECH or TLS cipher
-    /// preferences. An installed policy decides every GREASE ClientHello: it
+    /// its bytes. Servers accept the policy but never call it.
+    /// Does not enable [`GREASE`](SslRef::set_enable_ech_grease) or change real
+    /// ECH or TLS cipher preferences. An installed policy decides every GREASE ClientHello: it
     /// can neither skip one nor defer to BoringSSL's random draw. Errors or
     /// oversized output fail the handshake; panics abort, as with other SSL
     /// callbacks.
     /// See [`EchGreaseInfo::max_payload_length`] for sizing limits. Arbitrary
     /// lengths need not follow [RFC 9849]'s recommended distribution;
-    /// [`EchGreaseInfo::nss_parameters`] reproduces Firefox.
+    /// [`EchGreaseInfo::nss_parameters`] provides NSS-shaped parameters.
     /// Unlike NSS, this also applies to DTLS when ECH GREASE is enabled.
     /// Callbacks of other closure types may remain stored until this context
     /// is freed, even after replacement.

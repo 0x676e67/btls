@@ -114,7 +114,7 @@ pub use self::connector::{
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
 pub use self::ech::SslEchKeysRef;
 #[cfg(not(feature = "fips"))]
-pub use self::ech_grease::{EchGreaseAead, EchGreaseInfo, EchGreaseParameters};
+pub use self::ech_grease::{EchGreaseAead, EchGreaseInfo, EchGreaseParameters, EchGreaseRounding};
 pub use self::error::{Error, ErrorCode, HandshakeError};
 
 mod async_callbacks;
@@ -4271,7 +4271,8 @@ impl SslRef {
         unsafe { ffi::SSL_ech_accepted(self.as_ptr()) != 0 }
     }
 
-    // Whether or not to enable ECH grease on `SSL`.
+    /// Enables ECH GREASE when no supported ECH configuration is available.
+    /// Set before the first ClientHello. This does not enable real ECH.
     #[corresponds(SSL_set_enable_ech_grease)]
     pub fn set_enable_ech_grease(&self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
