@@ -873,7 +873,7 @@ fn firefox_quic(host_len: usize) -> NssVector {
 #[test]
 fn ech_nss_historical_payload_lengths() {
     // Source-derived inputs, not packet captures. The same sizing formula
-    // spans Firefox 117-154; Firefox 155 (NSS 3.127) fixes the rounding.
+    // spans Firefox 119-154; Firefox 155 (NSS 3.127) fixes the rounding.
     // NSS 3.127 release notes list this as Bug 2060720:
     // https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
     // https://github.com/nss-dev/nss/commit/22b22ee0a3444bcc306553c88ca4d07f14baa6d6
@@ -963,7 +963,7 @@ fn ech_nss_historical_rounding_boundaries() {
 // Copy these callback bodies into a per-connection policy. host_len must come
 // from the normalized URL host, not SNI alone: IP literals have no SNI.
 #[test]
-fn ech_firefox_117_154_complete_policy() {
+fn ech_firefox_119_154_complete_policy() {
     check_firefox_policy([207, 239, 271], |info, host_len| {
         info.nss_parameters(100, host_len, NssPre3127)
     });
