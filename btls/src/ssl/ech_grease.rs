@@ -125,7 +125,8 @@ impl EchGreaseInfo<'_> {
         self.0.is_quic != 0
     }
 
-    /// Payload length NSS would send for this ClientHello, including the tag.
+    /// Payload length using [NSS 3.127]'s rounding, including the tag.
+    /// Older NSS releases used different rounding; this is not a version selector.
     ///
     /// Follows NSS's [`tls13_MaybeGreaseEch`]: the inner hello keeps
     /// `server_name`, `supported_versions` (TLS 1.3 only) and `pre_shared_key`
@@ -141,6 +142,7 @@ impl EchGreaseInfo<'_> {
     /// extension order, so list ECH last to match NSS; with GREASE enabled the
     /// trailing [RFC 8701] extension still follows ECH, unlike NSS.
     ///
+    /// [NSS 3.127]: https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
     /// [`tls13_MaybeGreaseEch`]: https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L2143
     /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
     /// [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3

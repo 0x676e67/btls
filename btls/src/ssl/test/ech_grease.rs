@@ -713,6 +713,191 @@ fn firefox_quic(host_len: usize) -> NssVector {
     }
 }
 
+// Example application policy for Firefox 117-154's NSS, not a library default.
+// These releases pad the inner length to 32k + 31, including at a 32-byte
+// boundary. Subtracting one from the modern helper is therefore incorrect.
+// https://github.com/mozilla-firefox/firefox/blob/FIREFOX_117_0_RELEASE/security/nss/lib/ssl/tls13ech.c
+// https://github.com/mozilla-firefox/firefox/blob/FIREFOX_154_0_RELEASE/security/nss/lib/ssl/tls13ech.c
+fn legacy_nss_payload_length(info: &EchGreaseInfo<'_>, max_name_len: u8, host_len: u8) -> usize {
+    let mut len = 2 + 32 + 1 + 2 + info.cipher_suites().len() + 1 + 1 + 2;
+    len += TLS_EXTENSION_HEADER_LEN + 1;
+    let mut compressed = 0;
+    let mut grease_version = false;
+    let omitted = [
+        ffi::TLSEXT_TYPE_server_name as u16,
+        ffi::TLSEXT_TYPE_supported_versions as u16,
+        ffi::TLSEXT_TYPE_ec_point_formats as u16,
+        ffi::TLSEXT_TYPE_extended_master_secret as u16,
+        ffi::TLSEXT_TYPE_session_ticket as u16,
+        ffi::TLSEXT_TYPE_renegotiate as u16,
+        46, // NSS's obsolete ticket_early_data_info extension.
+    ];
+    for (kind, _) in info.extensions() {
+        grease_version |= kind & 0x0f0f == 0x0a0a && kind >> 8 == kind & 0xff;
+        if !omitted.contains(&kind) {
+            compressed += 1;
+        }
+    }
+    if let Some(sni) = info.server_name_length() {
+        len += TLS_EXTENSION_HEADER_LEN + 5 + sni;
+    }
+    len += TLS_EXTENSION_HEADER_LEN + 3 + if grease_version { 2 } else { 0 };
+    if info.psk_extension_length() != 0 {
+        len += TLS_EXTENSION_HEADER_LEN + info.psk_extension_length();
+    }
+    if compressed != 0 {
+        len += TLS_EXTENSION_HEADER_LEN + 1 + 2 * compressed;
+    }
+    len += usize::from(max_name_len.saturating_sub(host_len));
+    len + 31 - (len % 32) + info.aead_overhead()
+}
+
+#[test]
+fn ech_nss_historical_payload_lengths() {
+    // Source-derived inputs, not browser captures. The same sizing formula
+    // spans Firefox 117-154; Firefox 155 (NSS 3.127) fixes the rounding.
+    // NSS 3.127 release notes list this as Bug 2060720:
+    // https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
+    // https://github.com/nss-dev/nss/commit/22b22ee0a3444bcc306553c88ca4d07f14baa6d6
+    let mut resumed = firefox_tcp(19);
+    resumed
+        .extensions
+        .push(ext(ffi::TLSEXT_TYPE_early_data as u16, 0));
+    resumed.psk_extension_length = 107;
+    let mut quic = firefox_quic(19);
+    quic.extensions
+        .retain(|ext| ext.type_ != ffi::TLSEXT_TYPE_record_size_limit as u16);
+    let mut no_sni = firefox_tcp(0);
+    no_sni.extensions.remove(0);
+    no_sni.server_name_length = None;
+    let mut grease = firefox_tcp(19);
+    grease.extensions.extend([ext(0x0a0a, 0), ext(0x1a1a, 1)]);
+    // Expected legacy/current lengths are pinned independently of either helper.
+    for (name, vector, max_name, host, expected) in [
+        ("TCP", firefox_tcp(19), 100, 19, [239, 240]),
+        ("long SNI", firefox_tcp(120), 100, 120, [271, 272]),
+        ("resumption and early_data", resumed, 100, 19, [367, 368]),
+        ("QUIC extension set", quic, 100, 19, [207, 208]),
+        ("IP without SNI", no_sni, 93, 9, [239, 208]),
+        ("GREASE L=223", grease, 100, 19, [239, 240]),
+    ] {
+        let raw = vector.info();
+        let info = EchGreaseInfo(&raw);
+        assert_eq!(
+            [
+                legacy_nss_payload_length(&info, max_name, host),
+                info.nss_payload_length(max_name, host)
+            ],
+            expected,
+            "{name}",
+        );
+    }
+}
+
+#[test]
+fn ech_nss_historical_rounding_boundaries() {
+    let mut vector = firefox_tcp(19);
+    vector.extensions.extend([ext(0x0a0a, 0), ext(0x1a1a, 1)]);
+    let raw = vector.info();
+    let info = EchGreaseInfo(&raw);
+    // Each triple straddles a 32-byte boundary, including the aligned case
+    // where legacy padding is 31 bytes longer, rather than one byte shorter.
+    for (max_name, expected) in [
+        (68, [207, 208]),
+        (69, [239, 208]),
+        (70, [239, 240]),
+        (100, [239, 240]),
+        (101, [271, 240]),
+        (102, [271, 272]),
+        (132, [271, 272]),
+        (133, [303, 272]),
+        (134, [303, 304]),
+    ] {
+        assert_eq!(
+            [
+                legacy_nss_payload_length(&info, max_name, 19),
+                info.nss_payload_length(max_name, 19)
+            ],
+            expected,
+            "max_name_len={max_name}",
+        );
+    }
+}
+
+#[test]
+fn ech_historical_firefox_policy_handshakes() {
+    // Compiled release defaults: 117/118 disable GREASE, 119 enables it,
+    // 155 fixes padding. Overrides can enable the legacy policy in 117/118.
+    // These rows select policies on BoringSSL, not complete browser profiles.
+    // https://github.com/mozilla-firefox/firefox/blob/FIREFOX_119_0_RELEASE/modules/libpref/init/StaticPrefList.yaml
+    for (release, enabled, legacy) in [
+        (117, false, true),
+        (118, false, true),
+        (117, true, true),
+        (119, true, true),
+        (130, true, true),
+        (140, true, true),
+        (154, true, true),
+        (155, true, false),
+        (156, true, false),
+        (158, true, false),
+    ] {
+        for hrr in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let expected = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&calls);
+            let length = Arc::clone(&expected);
+            let messages = handshake(
+                |ssl| {
+                    ssl.set_hostname("localhost").unwrap();
+                    ssl.set_enable_ech_grease(enabled);
+                    ssl.set_ech_grease_callback(move |_, info| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        assert!(enabled, "Firefox {release}: disabled policy called");
+                        let size = if legacy {
+                            legacy_nss_payload_length(info, 100, 9)
+                        } else {
+                            info.nss_payload_length(100, 9)
+                        };
+                        assert_eq!(
+                            (size - info.aead_overhead()) % 32,
+                            if legacy { 31 } else { 0 }
+                        );
+                        length.store(size, Ordering::SeqCst);
+                        Ok(EchGreaseParameters {
+                            random_enc: true,
+                            ..parameters(info, size)
+                        })
+                    })
+                    .unwrap();
+                },
+                hrr,
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(enabled),
+                "Firefox {release}"
+            );
+            for message in &messages {
+                if !enabled {
+                    assert!(!extensions(message)
+                        .iter()
+                        .any(|(id, _)| *id == ffi::TLSEXT_TYPE_encrypted_client_hello as u16));
+                    continue;
+                }
+                let extension = ech(message);
+                let size = usize::from(u16::from_be_bytes([
+                    extension[ECH_PAYLOAD_LENGTH_OFFSET],
+                    extension[ECH_PAYLOAD_LENGTH_OFFSET + 1],
+                ]));
+                assert_eq!(size, expected.load(Ordering::SeqCst), "Firefox {release}");
+                assert_eq!(extension.len(), ECH_BODY_FRAMING_LEN + size);
+                assert_eq!(extension, ech(&messages[0]));
+            }
+        }
+    }
+}
+
 // Synthetic reference vectors derived from NSS's inner encoding and padding,
 // not independent browser captures. The fixed source defines their arithmetic:
 // https://github.com/nss-dev/nss/blob/42dc6cfddbcee57f391dd1b4550604e68437986d/lib/ssl/tls13ech.c#L1351-L1653
@@ -902,47 +1087,55 @@ fn ech_context_policy_and_connection_override() {
 
 #[test]
 fn ech_policy_resumption_preserves_psk_binder() {
-    let mut server = Server::builder();
-    server.expected_connections_count(2);
-    server
-        .ctx()
-        .set_min_proto_version(Some(SslVersion::TLS1_3))
-        .unwrap();
-    let server = server.build();
-    let sessions = Arc::new(Mutex::new(Vec::new()));
-    let saved = Arc::clone(&sessions);
-    let mut client = server.client_with_root_ca();
-    client
-        .ctx()
-        .set_session_cache_mode(crate::ssl::SslSessionCacheMode::CLIENT);
-    client
-        .ctx()
-        .set_new_session_callback(move |_, session| saved.lock().unwrap().push(session));
-    let client = client.build();
-    let mut first = client.builder();
-    first.ssl().set_hostname("localhost").unwrap();
-    first.ssl().set_enable_ech_grease(true);
-    first
-        .ssl()
-        .set_ech_grease_callback(|_, info| Ok(parameters(info, 239)))
-        .unwrap();
-    assert!(!first.connect().ssl().session_reused());
-    let session = sessions.lock().unwrap().pop().unwrap();
-    let called = Arc::new(AtomicUsize::new(0));
-    let count = Arc::clone(&called);
-    let mut second = client.builder();
-    // The session came from the same context, before this handshake starts.
-    unsafe { second.ssl().set_session(&session).unwrap() };
-    second.ssl().set_enable_ech_grease(true);
-    second.ssl().set_hostname("localhost").unwrap();
-    second
-        .ssl()
-        .set_ech_grease_callback(move |_, info| {
-            assert!(info.psk_extension_length() > 4);
-            count.fetch_add(1, Ordering::SeqCst);
-            Ok(parameters(info, info.nss_payload_length(100, 9)))
-        })
-        .unwrap();
-    assert!(second.connect().ssl().session_reused());
-    assert_eq!(called.load(Ordering::SeqCst), 1);
+    for legacy in [false, true] {
+        let mut server = Server::builder();
+        server.expected_connections_count(2);
+        server
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        let server = server.build();
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let saved = Arc::clone(&sessions);
+        let mut client = server.client_with_root_ca();
+        client
+            .ctx()
+            .set_session_cache_mode(crate::ssl::SslSessionCacheMode::CLIENT);
+        client
+            .ctx()
+            .set_new_session_callback(move |_, session| saved.lock().unwrap().push(session));
+        let called = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&called);
+        client.ctx().set_ech_grease_callback(move |_, info| {
+            let resumed = count.fetch_add(1, Ordering::SeqCst) != 0;
+            assert_eq!(info.psk_extension_length() != 0, resumed);
+            let length = if legacy {
+                legacy_nss_payload_length(info, 100, 9)
+            } else {
+                info.nss_payload_length(100, 9)
+            };
+            assert_eq!(
+                (length - info.aead_overhead()) % 32,
+                if legacy { 31 } else { 0 }
+            );
+            Ok(EchGreaseParameters {
+                random_enc: true,
+                ..parameters(info, length)
+            })
+        });
+        let client = client.build();
+        let mut first = client.builder();
+        first.ssl().set_hostname("localhost").unwrap();
+        first.ssl().set_enable_ech_grease(true);
+        assert!(!first.connect().ssl().session_reused());
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        let session = sessions.lock().unwrap().pop().unwrap();
+        let mut second = client.builder();
+        // The session came from the same context, before this handshake starts.
+        unsafe { second.ssl().set_session(&session).unwrap() };
+        second.ssl().set_enable_ech_grease(true);
+        second.ssl().set_hostname("localhost").unwrap();
+        assert!(second.connect().ssl().session_reused());
+        assert_eq!(called.load(Ordering::SeqCst), 2);
+    }
 }
