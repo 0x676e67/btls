@@ -1,6 +1,6 @@
-From 2ae63b43e304e4243e7c3e6b0496fa6bee5927f1 Mon Sep 17 00:00:00 2001
+From df8616647087e0daff5554cc7e5a238339f5b600 Mon Sep 17 00:00:00 2001
 From: gngpp <gngppz@gmail.com>
-Date: Fri, 16 Oct 2026 13:17:01 +0800
+Date: Mon, 19 Oct 2026 12:17:42 +0800
 Subject: [PATCH 14/14] boringssl: add ECH GREASE parameter callback
 
 Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
@@ -34,79 +34,79 @@ limitations under the License.
  create mode 100644 ssl/ech_grease_policy_test.cc
 
 diff --git a/build.json b/build.json
-index f9e3a7e..ea09c19 100644
+index 4691fe469..f73008648 100644
 --- a/build.json
 +++ b/build.json
-@@ -1027,6 +1027,7 @@
+@@ -1028,6 +1028,7 @@
      "ssl_test": {
          "srcs": [
              "crypto/test/gtest_main.cc",
 +            "ssl/ech_grease_policy_test.cc",
+             "ssl/record_size_limit_test.cc",
              "ssl/span_test.cc",
              "ssl/ssl_c_test.c",
-             "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.bzl b/gen/sources.bzl
-index e85d7a7..4ea4d44 100644
+index 9328c40d9..c751e2be8 100644
 --- a/gen/sources.bzl
 +++ b/gen/sources.bzl
-@@ -2980,6 +2980,7 @@ ssl_internal_headers = [
+@@ -2981,6 +2981,7 @@ ssl_internal_headers = [
  
  ssl_test_sources = [
      "crypto/test/gtest_main.cc",
 +    "ssl/ech_grease_policy_test.cc",
+     "ssl/record_size_limit_test.cc",
      "ssl/span_test.cc",
      "ssl/ssl_c_test.c",
-     "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.cmake b/gen/sources.cmake
-index 117ba3f..c186947 100644
+index 10808e0e4..243792c20 100644
 --- a/gen/sources.cmake
 +++ b/gen/sources.cmake
-@@ -3054,6 +3054,7 @@ set(
+@@ -3055,6 +3055,7 @@ set(
    SSL_TEST_SOURCES
  
    crypto/test/gtest_main.cc
 +  ssl/ech_grease_policy_test.cc
+   ssl/record_size_limit_test.cc
    ssl/span_test.cc
    ssl/ssl_c_test.c
-   ssl/ssl_internal_test.cc
 diff --git a/gen/sources.gni b/gen/sources.gni
-index 5777c09..5dbea4d 100644
+index 9994be8d1..dba8bb3e4 100644
 --- a/gen/sources.gni
 +++ b/gen/sources.gni
-@@ -2980,6 +2980,7 @@ ssl_internal_headers = [
+@@ -2981,6 +2981,7 @@ ssl_internal_headers = [
  
  ssl_test_sources = [
    "crypto/test/gtest_main.cc",
 +  "ssl/ech_grease_policy_test.cc",
+   "ssl/record_size_limit_test.cc",
    "ssl/span_test.cc",
    "ssl/ssl_c_test.c",
-   "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.json b/gen/sources.json
-index 97b70e5..4f19850 100644
+index e639ca7cd..fd57a146f 100644
 --- a/gen/sources.json
 +++ b/gen/sources.json
-@@ -2964,6 +2964,7 @@
+@@ -2965,6 +2965,7 @@
    "ssl_test": {
      "srcs": [
        "crypto/test/gtest_main.cc",
 +      "ssl/ech_grease_policy_test.cc",
+       "ssl/record_size_limit_test.cc",
        "ssl/span_test.cc",
        "ssl/ssl_c_test.c",
-       "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.mk b/gen/sources.mk
-index b7cb8ad..bbe8ad3 100644
+index fc45de625..0308aba09 100644
 --- a/gen/sources.mk
 +++ b/gen/sources.mk
-@@ -2944,6 +2944,7 @@ boringssl_ssl_internal_headers := \
+@@ -2945,6 +2945,7 @@ boringssl_ssl_internal_headers := \
  
  boringssl_ssl_test_sources := \
    crypto/test/gtest_main.cc \
 +  ssl/ech_grease_policy_test.cc \
+   ssl/record_size_limit_test.cc \
    ssl/span_test.cc \
    ssl/ssl_c_test.c \
-   ssl/ssl_internal_test.cc \
 diff --git a/include/openssl/base.h b/include/openssl/base.h
-index 79be7c8..4572819 100644
+index 79be7c8da..4572819ef 100644
 --- a/include/openssl/base.h
 +++ b/include/openssl/base.h
 @@ -339,6 +339,9 @@ typedef struct ssl_cipher_st SSL_CIPHER;
@@ -120,10 +120,10 @@ index 79be7c8..4572819 100644
  typedef struct ssl_method_st SSL_METHOD;
  typedef struct ssl_private_key_method_st SSL_PRIVATE_KEY_METHOD;
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 07fda30..f5c06eb 100644
+index 66450b3ba..6698c6711 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -4700,6 +4700,111 @@ OPENSSL_EXPORT const char *SSL_early_data_reason_string(
+@@ -4755,6 +4755,111 @@ OPENSSL_EXPORT const char *SSL_early_data_reason_string(
  // ECH extension when no supported ECHConfig is available.
  OPENSSL_EXPORT void SSL_set_enable_ech_grease(SSL *ssl, int enable);
  
@@ -237,7 +237,7 @@ index 07fda30..f5c06eb 100644
  // ECHConfigList structure. It returns one on success and zero on error.
 diff --git a/ssl/ech_grease_policy_test.cc b/ssl/ech_grease_policy_test.cc
 new file mode 100644
-index 0000000..cbceac5
+index 000000000..cbceac57f
 --- /dev/null
 +++ b/ssl/ech_grease_policy_test.cc
 @@ -0,0 +1,883 @@
@@ -1125,7 +1125,7 @@ index 0000000..cbceac5
 +}  // namespace
 +BSSL_NAMESPACE_END
 diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
-index 46ba196..5a07ebd 100644
+index 46ba196f1..5a07ebdf5 100644
 --- a/ssl/encrypted_client_hello.cc
 +++ b/ssl/encrypted_client_hello.cc
 @@ -729,7 +729,12 @@ static size_t random_size(size_t min, size_t max) {
@@ -1344,10 +1344,10 @@ index 46ba196..5a07ebd 100644
                               size_t ech_config_list_len) {
    auto *ssl_impl = FromOpaque(ssl);
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index f862741..f26c804 100644
+index 23ca35115..fa9ff641b 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
-@@ -4693,6 +4693,13 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4665,6 +4665,13 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    size_t msg_len = SSL3_HM_HEADER_LENGTH + CBB_len(out);
    assert(out_encoded == nullptr);  // Only ClientHelloInner needs two outputs.
    SSLImpl *const ssl = hs->ssl;
@@ -1361,7 +1361,7 @@ index f862741..f26c804 100644
    CBB extensions;
    if (!CBB_add_u16_length_prefixed(out, &extensions)) {
      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
-@@ -4712,11 +4719,21 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4684,6 +4691,8 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    }
  
    bool last_was_empty = false;
@@ -1370,7 +1370,9 @@ index f862741..f26c804 100644
    for (size_t unpermuted = 0; unpermuted < kNumExtensions; unpermuted++) {
      size_t i = hs->extension_permutation.empty()
                     ? unpermuted
-                    : hs->extension_permutation[unpermuted];
+@@ -4695,6 +4704,14 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+       continue;
+     }
      const size_t len_before = CBB_len(&extensions);
 +    if (custom_ech &&
 +        kExtensions[i].value == TLSEXT_TYPE_encrypted_client_hello) {
@@ -1383,7 +1385,7 @@ index f862741..f26c804 100644
      if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
        OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
        ERR_add_error_dataf("extension %u", (unsigned)kExtensions[i].value);
-@@ -4745,6 +4762,37 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4723,6 +4740,37 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
    // images aligned.
    size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
@@ -1422,7 +1424,7 @@ index f862741..f26c804 100644
        !ssl->s3->used_hello_retry_request) {
      msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
 diff --git a/ssl/handshake.cc b/ssl/handshake.cc
-index 5103fe9..999db03 100644
+index 5103fe9b1..999db037e 100644
 --- a/ssl/handshake.cc
 +++ b/ssl/handshake.cc
 @@ -35,6 +35,7 @@ SSL_HANDSHAKE::SSL_HANDSHAKE(SSLImpl *ssl_arg)
@@ -1434,10 +1436,10 @@ index 5103fe9..999db03 100644
        ech_authenticated_reject(false),
        scts_requested(false),
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 72da692..ba28023 100644
+index 05dd949fb..2618ab75f 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -1436,6 +1436,13 @@ size_t ssl_ech_extension_body_length(const EVP_HPKE_AEAD *aead, size_t enc_len,
+@@ -1462,6 +1462,13 @@ size_t ssl_ech_extension_body_length(const EVP_HPKE_AEAD *aead, size_t enc_len,
  // must already be computed.
  bool ssl_encrypt_client_hello(SSL_HANDSHAKE *hs, Span<const uint8_t> enc);
  
@@ -1451,7 +1453,7 @@ index 72da692..ba28023 100644
  
  // Credentials.
  
-@@ -2030,6 +2037,9 @@ struct SSL_HANDSHAKE {
+@@ -2065,6 +2072,9 @@ struct SSL_HANDSHAKE {
    // and will influence the (real or predicted) handshake on match.
    UniquePtr<SSL_HANDSHAKE_HINTS> provided_hints;
  
@@ -1461,7 +1463,7 @@ index 72da692..ba28023 100644
    // ech_is_inner, on the server, indicates whether the ClientHello contained an
    // inner ECH extension.
    bool ech_is_inner : 1;
-@@ -3532,6 +3542,11 @@ struct SSL_CONFIG {
+@@ -3585,6 +3595,11 @@ struct SSL_CONFIG {
    // types from the configured credential list.
    InplaceVector<uint8_t, kNumCertTypes> available_client_cert_types;
  
@@ -1473,7 +1475,7 @@ index 72da692..ba28023 100644
    // ech_grease_enabled controls whether ECH GREASE may be sent in the
    // ClientHello.
    bool ech_grease_enabled : 1;
-@@ -4110,6 +4125,12 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4175,6 +4190,12 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
  
    // Default values used when no per-SSL value is defined follow
  
