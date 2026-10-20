@@ -349,21 +349,23 @@ fn application_settings() {
     const SETTINGS: &[u8] = b"\x00\x03\x00\x00\x00\x64";
 
     /// Returns the ALPS values the client and the server received; `server` is `None` when the
-    /// server does not enable ALPS.
+    /// server does not enable ALPS, which it does from its ALPN select callback.
+    /// `new_codepoint` selects the client's and the server's ALPS codepoint.
     fn handshake(
+        new_codepoint: [bool; 2],
         client: Option<&'static [u8]>,
         server: Option<Option<&'static [u8]>>,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut builder = Server::builder();
-        builder.ctx().set_alpn_select_callback(|_, client| {
-            ssl::select_next_proto(b"\x02h2", client).ok_or(ssl::AlpnError::NOACK)
-        });
-        builder.ssl_cb(move |ssl| {
+        builder.ctx().set_alpn_select_callback(move |ssl, client| {
+            let proto = ssl::select_next_proto(b"\x02h2", client).ok_or(ssl::AlpnError::NOACK)?;
             if let Some(settings) = server {
-                ssl.add_application_settings(b"h2", settings).unwrap();
+                ssl.add_application_settings(proto, settings).unwrap();
             }
+            Ok(proto)
         });
+        builder.ssl_cb(move |ssl| ssl.set_alps_use_new_codepoint(new_codepoint[1]));
         builder.io_cb(move |s| {
             let received = s.ssl().peer_application_settings().map(ToOwned::to_owned);
             tx.send(received).unwrap();
@@ -372,6 +374,7 @@ fn application_settings() {
 
         let mut builder = server.client().build().builder();
         builder.ssl().set_alpn_protos(b"\x02h2").unwrap();
+        builder.ssl().set_alps_use_new_codepoint(new_codepoint[0]);
         builder
             .ssl()
             .add_application_settings(b"h2", client)
@@ -383,13 +386,26 @@ fn application_settings() {
 
     let some = Some(SETTINGS.to_vec());
     let empty = Some(Vec::new());
+    for codepoint in [true, false] {
+        assert_eq!(
+            handshake([codepoint; 2], Some(SETTINGS), Some(Some(SETTINGS))),
+            (some.clone(), some.clone())
+        );
+    }
+    // ALPS is not negotiated when the codepoints differ.
     assert_eq!(
-        handshake(Some(SETTINGS), Some(Some(SETTINGS))),
-        (some.clone(), some.clone())
+        handshake([true, false], Some(SETTINGS), Some(Some(SETTINGS))),
+        (None, None)
     );
-    assert_eq!(handshake(None, Some(Some(SETTINGS))), (some, empty.clone()));
-    assert_eq!(handshake(Some(b""), Some(None)), (empty.clone(), empty));
-    assert_eq!(handshake(Some(SETTINGS), None), (None, None));
+    assert_eq!(
+        handshake([true; 2], None, Some(Some(SETTINGS))),
+        (some, empty.clone())
+    );
+    assert_eq!(
+        handshake([true; 2], Some(b""), Some(None)),
+        (empty.clone(), empty)
+    );
+    assert_eq!(handshake([true; 2], Some(SETTINGS), None), (None, None));
 }
 
 #[test]

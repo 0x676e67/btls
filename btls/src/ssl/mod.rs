@@ -4410,7 +4410,9 @@ impl SslRef {
     /// Enables ALPS (application-layer protocol settings) for the ALPN protocol `proto`, sending
     /// `settings` to the peer, or an empty value if `None`.
     ///
-    /// The peer's value is available with [`Self::peer_application_settings`].
+    /// `proto` must also be configured for ALPN. A server may instead call this from its ALPN
+    /// select callback, for the selected protocol only. The peer's value is available with
+    /// [`Self::peer_application_settings`].
     #[corresponds(SSL_add_application_settings)]
     pub fn add_application_settings(
         &mut self,
@@ -4430,7 +4432,10 @@ impl SslRef {
         }
     }
 
-    /// Sets the ALPS use new codepoint flag.
+    /// Selects the ALPS extension codepoint: `true` for the new one (17613), `false` for the old
+    /// one (17513). Defaults to the new codepoint.
+    ///
+    /// Both peers must use the same codepoint for ALPS to be negotiated.
     #[corresponds(SSL_set_alps_use_new_codepoint)]
     pub fn set_alps_use_new_codepoint(&mut self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
