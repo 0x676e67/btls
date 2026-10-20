@@ -628,6 +628,20 @@ impl ExtensionType {
     #[cfg(not(feature = "fips"))]
     pub const RECORD_SIZE_LIMIT: Self = Self(ffi::TLSEXT_TYPE_record_size_limit as u16);
     pub const SERVER_PADDING: Self = Self(ffi::TLSEXT_TYPE_server_padding as u16);
+
+    /// Returns the wire extension type.
+    #[must_use]
+    pub const fn as_raw(self) -> u16 {
+        self.0
+    }
+
+    /// Whether this is an [RFC 8701] GREASE value.
+    ///
+    /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
+    #[must_use]
+    pub const fn is_grease(self) -> bool {
+        self.0 & 0x0f0f == 0x0a0a && self.0 >> 8 == self.0 & 0xff
+    }
 }
 
 impl From<u16> for ExtensionType {

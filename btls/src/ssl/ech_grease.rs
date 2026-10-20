@@ -5,14 +5,14 @@ use std::{ptr, slice};
 use foreign_types::ForeignTypeRef;
 use openssl_macros::corresponds;
 
-use super::{Ssl, SslContext, SslContextBuilder, SslRef};
+use super::{ExtensionType, Ssl, SslContext, SslContextBuilder, SslRef};
 use crate::error::ErrorStack;
 use crate::rand::rand_bytes;
 use crate::{cvt_0i, ffi};
 
 const TLS_EXTENSION_HEADER_LEN: usize = 4;
 // NSS's deprecated ticket_early_data_info, dropped from the inner hello.
-const NSS_TICKET_EARLY_DATA_INFO: u16 = 46;
+const NSS_TICKET_EARLY_DATA_INFO: ExtensionType = ExtensionType(46);
 
 /// An AEAD identifier advertised in an ECH GREASE extension.
 /// This does not select the cipher used to protect the TLS connection.
@@ -49,7 +49,9 @@ pub enum EchGreaseRounding {
 }
 
 /// Parameters for one ECH GREASE extension, reused unchanged after HRR.
+/// Build with [`new`](Self::new), then set `random_enc` by assignment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct EchGreaseParameters {
     /// AEAD identifier to advertise; the payload remains random bytes.
     pub aead: EchGreaseAead,
@@ -62,9 +64,21 @@ pub struct EchGreaseParameters {
     pub random_enc: bool,
 }
 
+impl EchGreaseParameters {
+    /// Parameters with an X25519 `enc`, as BoringSSL sends by default.
+    pub const fn new(aead: EchGreaseAead, payload_length: NonZeroU16) -> Self {
+        Self {
+            aead,
+            payload_length,
+            random_enc: false,
+        }
+    }
+}
+
 /// A read-only view of the first ClientHello, valid only during the callback.
 ///
 /// Extension sizes exclude their headers; PSK is reported separately.
+#[derive(Clone, Copy)]
 pub struct EchGreaseInfo<'a>(pub(crate) &'a ffi::SSL_ECH_GREASE_SIZE_INFO);
 
 impl EchGreaseInfo<'_> {
@@ -82,14 +96,16 @@ impl EchGreaseInfo<'_> {
     /// Size policies must account for these GREASE entries too.
     ///
     /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
-    pub fn extensions(&self) -> impl ExactSizeIterator<Item = (u16, usize)> + '_ {
+    pub fn extensions(&self) -> impl ExactSizeIterator<Item = (ExtensionType, usize)> + '_ {
         let extensions = if self.0.num_extensions == 0 {
             &[]
         } else {
             // Metadata is owned by the synchronous native callback invocation.
             unsafe { slice::from_raw_parts(self.0.extensions, self.0.num_extensions) }
         };
-        extensions.iter().map(|ext| (ext.type_, ext.length))
+        extensions
+            .iter()
+            .map(|ext| (ExtensionType(ext.type_), ext.length))
     }
 
     /// Wire preamble length, including the session ID and DTLS cookie, excluding
@@ -157,8 +173,8 @@ impl EchGreaseInfo<'_> {
     /// [`EchGreaseRounding::NssPre3127`] for Firefox 119-154 or
     /// [`EchGreaseRounding::Rfc9849`] for the [NSS 3.127] fix.
     /// `max_name_len` is Firefox's `security.tls.ech.grease_size`, 100 by
-    /// default. `host_len` is the URL host length, which NSS narrows to `u8`
-    /// and applies even without SNI, as for IP literals. A GREASE version is
+    /// default. `host_len` is the URL host length; NSS passes it to a `uint8_t`
+    /// and applies it even without SNI, as for IP literals. A GREASE version is
     /// assumed exactly when [RFC 8701] GREASE extensions are present, since
     /// BoringSSL emits both under the same flag. NSS never GREASEs DTLS; the
     /// rule is still evaluated there. Wire order follows the configured
@@ -171,7 +187,7 @@ impl EchGreaseInfo<'_> {
     pub fn nss_payload_length(
         &self,
         max_name_len: u8,
-        host_len: u8,
+        host_len: usize,
         rounding: EchGreaseRounding,
     ) -> usize {
         // EncodedClientHelloInner uses an empty session ID and the outer ciphers.
@@ -183,18 +199,18 @@ impl EchGreaseInfo<'_> {
         let mut compressed = 0;
         let mut grease_version = false;
         for (kind, _) in self.extensions() {
-            if is_grease_type(kind) {
+            if kind.is_grease() {
                 grease_version = true;
             }
             // Omit the TLS 1.2-only extensions and ticket_early_data_info.
             if ![
-                ffi::TLSEXT_TYPE_server_name as u16,
-                ffi::TLSEXT_TYPE_supported_versions as u16,
-                ffi::TLSEXT_TYPE_ec_point_formats as u16,
-                ffi::TLSEXT_TYPE_extended_master_secret as u16,
-                ffi::TLSEXT_TYPE_session_ticket as u16,
+                ExtensionType::SERVER_NAME,
+                ExtensionType::SUPPORTED_VERSIONS,
+                ExtensionType::EC_POINT_FORMATS,
+                ExtensionType::EXTENDED_MASTER_SECRET,
+                ExtensionType::SESSION_TICKET,
                 NSS_TICKET_EARLY_DATA_INFO,
-                ffi::TLSEXT_TYPE_renegotiate as u16,
+                ExtensionType::RENEGOTIATE,
             ]
             .contains(&kind)
             {
@@ -208,7 +224,8 @@ impl EchGreaseInfo<'_> {
         if compressed != 0 {
             len += TLS_EXTENSION_HEADER_LEN + 1 + 2 * compressed;
         }
-        len += usize::from(max_name_len.saturating_sub(host_len));
+        // NSS passes strlen(url) to a uint8_t parameter, so long hosts wrap.
+        len += usize::from(max_name_len.saturating_sub(host_len as u8));
         let remainder = match rounding {
             EchGreaseRounding::NssPre3127 => len % 32,
             EchGreaseRounding::Rfc9849 => (len - 1) % 32,
@@ -231,7 +248,7 @@ impl EchGreaseInfo<'_> {
     /// use btls::ssl::{EchGreaseRounding, SslConnector, SslMethod};
     /// # fn connect() -> Result<(), Box<dyn std::error::Error>> {
     /// let host = "127.0.0.1";
-    /// let host_length = u8::try_from(host.len())?;
+    /// let host_length = host.len();
     /// let connector = SslConnector::builder(SslMethod::tls())?.build();
     /// let mut connection = connector.configure()?;
     /// connection.set_enable_ech_grease(true);
@@ -246,7 +263,7 @@ impl EchGreaseInfo<'_> {
     pub fn nss_parameters(
         &self,
         max_name_len: u8,
-        host_len: u8,
+        host_len: usize,
         rounding: EchGreaseRounding,
     ) -> Result<EchGreaseParameters, ErrorStack> {
         let payload_length = self.nss_payload_length(max_name_len, host_len, rounding);
@@ -269,11 +286,6 @@ impl EchGreaseInfo<'_> {
     }
 }
 
-/// Whether `kind` is an RFC 8701 GREASE extension type.
-fn is_grease_type(kind: u16) -> bool {
-    kind & 0x0f0f == 0x0a0a && kind >> 8 == kind & 0xff
-}
-
 struct Callback<F>(F);
 
 unsafe extern "C" fn parameter_callback<F, const CONTEXT: bool>(
@@ -282,7 +294,7 @@ unsafe extern "C" fn parameter_callback<F, const CONTEXT: bool>(
     _: *mut c_void,
 ) -> libc::c_int
 where
-    F: Fn(&SslRef, &EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+    F: Fn(&SslRef, EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
         + Send
         + Sync
         + 'static,
@@ -302,7 +314,7 @@ where
         return 0;
     };
     // Like the other SSL callbacks, a panic aborts at this extern "C" boundary.
-    match (callback.0)(ssl, &EchGreaseInfo(info)) {
+    match (callback.0)(ssl, EchGreaseInfo(info)) {
         Ok(parameters) => {
             unsafe {
                 *out = ffi::SSL_ECH_GREASE_PARAMETERS {
@@ -341,7 +353,7 @@ impl SslContextBuilder {
     #[corresponds(SSL_CTX_set_ech_grease_callback)]
     pub fn set_ech_grease_callback<F>(&mut self, callback: F)
     where
-        F: Fn(&SslRef, &EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+        F: Fn(&SslRef, EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
             + Send
             + Sync
             + 'static,
@@ -380,7 +392,7 @@ impl SslRef {
     #[corresponds(SSL_set_ech_grease_callback)]
     pub fn set_ech_grease_callback<F>(&mut self, callback: F) -> Result<(), ErrorStack>
     where
-        F: Fn(&SslRef, &EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+        F: Fn(&SslRef, EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
             + Send
             + Sync
             + 'static,
