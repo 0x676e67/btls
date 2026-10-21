@@ -61,12 +61,17 @@ unsafe extern "C" fn capture_message(
     }
 }
 
-fn extensions(hello: &[u8]) -> Vec<(u16, Vec<u8>)> {
+// ClientHello body length before the extensions length prefix.
+fn preamble_length(hello: &[u8]) -> usize {
     let mut offset = 4 + 2 + 32;
     offset += 1 + usize::from(hello[offset]);
-    let cipher_len = usize::from(u16::from_be_bytes([hello[offset], hello[offset + 1]]));
-    offset += 2 + cipher_len;
+    offset += 2 + usize::from(u16::from_be_bytes([hello[offset], hello[offset + 1]]));
     offset += 1 + usize::from(hello[offset]);
+    offset - 4
+}
+
+fn extensions(hello: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let mut offset = 4 + preamble_length(hello);
     let ext_len = usize::from(u16::from_be_bytes([hello[offset], hello[offset + 1]]));
     offset += 2;
     assert_eq!(offset + ext_len, hello.len());
@@ -228,12 +233,15 @@ fn ech_callback_fixed_lengths_and_order() {
 fn ech_policy_callback_metadata_and_hrr_reuse() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&calls);
+    let preamble = Arc::new(AtomicUsize::new(0));
+    let reported = Arc::clone(&preamble);
     let messages = handshake(
         move |ssl| {
             ssl.set_hostname("localhost").unwrap();
             ssl.set_alpn_protos(b"\x02h2").unwrap();
             ssl.set_ech_grease_callback(move |_, info| {
                 count.fetch_add(1, Ordering::SeqCst);
+                reported.store(info.preamble_length(), Ordering::SeqCst);
                 assert_eq!(info.server_name_length(), Some(9));
                 assert!(!info.is_dtls());
                 assert!(!info.is_quic());
@@ -277,6 +285,11 @@ fn ech_policy_callback_metadata_and_hrr_reuse() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(messages.len(), 2);
+    // The TCP preamble carries the 32-byte compatibility session ID.
+    assert_eq!(
+        preamble.load(Ordering::SeqCst),
+        preamble_length(&messages[0])
+    );
     // Reuse enc and the payload: https://www.rfc-editor.org/rfc/rfc9849#section-6.2.1
     assert_eq!(ech(&messages[0]), ech(&messages[1]));
     assert_eq!(
@@ -1156,10 +1169,18 @@ fn ech_policy_resumption_preserves_psk_binder() {
         .set_new_session_callback(move |_, session| saved.lock().unwrap().push(session));
     let called = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&called);
+    let sizes = Arc::new(Mutex::new(None));
+    let reported = Arc::clone(&sizes);
     client.ctx().set_ech_grease_callback(move |_, info| {
         let resumed = count.fetch_add(1, Ordering::SeqCst) != 0;
         assert_eq!(info.psk_extension_length() != 0, resumed);
-        info.nss_parameters(100, 9, Rfc9849)
+        let parameters = info.nss_parameters(100, 9, Rfc9849)?;
+        *reported.lock().unwrap() = Some((
+            info.psk_extension_length(),
+            info.message_length(),
+            usize::from(parameters.payload_length.get()),
+        ));
+        Ok(parameters)
     });
     let client = client.build();
     let mut first = client.builder();
@@ -1173,6 +1194,26 @@ fn ech_policy_resumption_preserves_psk_binder() {
     unsafe { second.ssl().set_session(&session).unwrap() };
     second.ssl().set_enable_ech_grease(true);
     second.ssl().set_hostname("localhost").unwrap();
-    assert!(second.connect().ssl().session_reused());
+    let mut capture = Capture::default();
+    unsafe {
+        ffi::SSL_set_msg_callback(second.ssl().as_ptr(), Some(capture_message));
+        ffi::SSL_set_msg_callback_arg(
+            second.ssl().as_ptr(),
+            std::ptr::from_mut(&mut capture).cast(),
+        );
+    }
+    let stream = second.connect();
+    unsafe { ffi::SSL_set_msg_callback(stream.ssl().as_ptr(), None) };
+    assert!(stream.ssl().session_reused());
     assert_eq!(called.load(Ordering::SeqCst), 2);
+    // The report excludes the PSK header from psk_extension_length and counts
+    // the whole PSK in message_length; the wire adds the handshake header.
+    let (psk_length, message_length, payload_length) = sizes.lock().unwrap().take().unwrap();
+    let hello = &capture.messages[0];
+    let (_, psk) = extensions(hello)
+        .into_iter()
+        .find(|(id, _)| *id == ffi::TLSEXT_TYPE_pre_shared_key as u16)
+        .unwrap();
+    assert_eq!(psk.len(), psk_length);
+    assert_eq!(hello.len(), message_length + payload_length + 4);
 }
