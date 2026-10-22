@@ -114,7 +114,9 @@ pub use self::connector::{
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
 pub use self::ech::SslEchKeysRef;
 #[cfg(not(feature = "fips"))]
-pub use self::ech_grease::{EchGreaseAead, EchGreaseInfo, EchGreaseParameters, EchGreaseRounding};
+pub use self::ech_grease::{
+    EchGreaseAead, EchGreaseParameters, EchGreaseRounding, EchGreaseSizeInfo,
+};
 pub use self::error::{Error, ErrorCode, HandshakeError};
 
 mod async_callbacks;
