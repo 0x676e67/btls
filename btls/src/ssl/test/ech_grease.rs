@@ -13,7 +13,7 @@ use crate::error::ErrorStack;
 use crate::ffi;
 use crate::ssl::EchGreaseRounding::{NssPre3127, Rfc9849};
 use crate::ssl::{
-    EchGreaseAead, EchGreaseInfo, EchGreaseParameters, ExtensionType, Ssl, SslConnector,
+    EchGreaseAead, EchGreaseParameters, EchGreaseSizeInfo, ExtensionType, Ssl, SslConnector,
     SslContext, SslMethod, SslRef, SslVerifyMode, SslVersion,
 };
 
@@ -27,7 +27,7 @@ const ECH_PAYLOAD_LENGTH_OFFSET: usize = 1 + 2 + 2 + 1 + 2 + 32;
 const ECH_BODY_FRAMING_LEN: usize = ECH_PAYLOAD_LENGTH_OFFSET + 2;
 const DEFAULT_PAYLOAD_LENGTHS: [usize; 4] = [144, 176, 208, 240];
 
-fn parameters(info: EchGreaseInfo<'_>, payload_length: usize) -> EchGreaseParameters {
+fn parameters(info: EchGreaseSizeInfo<'_>, payload_length: usize) -> EchGreaseParameters {
     let payload_length = NonZeroU16::new(u16::try_from(payload_length).unwrap()).unwrap();
     EchGreaseParameters::new(info.default_aead(), payload_length)
 }
@@ -457,7 +457,7 @@ fn ech_policy_clear_restores_context_or_default() {
             let calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
             let policy = |index: usize, length| {
                 let calls = Arc::clone(&calls);
-                move |_: &SslRef, info: EchGreaseInfo<'_>| {
+                move |_: &SslRef, info: EchGreaseSizeInfo<'_>| {
                     calls[index].fetch_add(1, Ordering::SeqCst);
                     Ok(parameters(info, length))
                 }
@@ -859,7 +859,7 @@ fn ech_nss_historical_payload_lengths() {
         ("QUIC without SNI", quic_literal, 100, 9, [207, 208]),
     ] {
         let raw = vector.info();
-        let info = EchGreaseInfo(&raw);
+        let info = EchGreaseSizeInfo(&raw);
         assert_eq!(
             [
                 info.nss_payload_length(max_name, host, NssPre3127),
@@ -876,7 +876,7 @@ fn ech_nss_historical_rounding_boundaries() {
     let mut vector = firefox_tcp(19);
     vector.extensions.extend([ext(0x0a0a, 0), ext(0x1a1a, 1)]);
     let raw = vector.info();
-    let info = EchGreaseInfo(&raw);
+    let info = EchGreaseSizeInfo(&raw);
     // Each triple straddles a 32-byte boundary, including the aligned case
     // where legacy padding is 31 bytes longer, rather than one byte shorter.
     for (max_name, expected) in [
@@ -1014,7 +1014,7 @@ fn ech_nss_ip_host_length_without_sni() {
     vector.extensions.remove(0);
     vector.server_name_length = None;
     let raw = vector.info();
-    let info = EchGreaseInfo(&raw);
+    let info = EchGreaseSizeInfo(&raw);
     for (host_len, below, above) in [(9, 93, 94), (3, 87, 88), (265, 93, 94)] {
         for (rounding, lower, upper) in [(NssPre3127, 239, 239), (Rfc9849, 208, 240)] {
             assert_eq!(info.nss_payload_length(below, host_len, rounding), lower);
@@ -1055,7 +1055,7 @@ fn ech_nss_sizing_ablation() {
         if factor == "AEAD tag" {
             raw.aead_overhead = 0;
         }
-        let info = EchGreaseInfo(&raw);
+        let info = EchGreaseSizeInfo(&raw);
         assert_eq!(
             [
                 info.nss_payload_length(max_name, 19, NssPre3127),
@@ -1074,7 +1074,7 @@ fn ech_nss_parameters_enforce_budget_and_draw_aead() {
         for budget in [0, length - 1, length, length + 1] {
             let mut raw = vector.info();
             raw.max_payload_length = budget;
-            let result = EchGreaseInfo(&raw).nss_parameters(100, 19, rounding);
+            let result = EchGreaseSizeInfo(&raw).nss_parameters(100, 19, rounding);
             if budget < length {
                 assert!(result.is_err());
             } else {
@@ -1089,7 +1089,7 @@ fn ech_nss_parameters_enforce_budget_and_draw_aead() {
     for default_aead in [EchGreaseAead::AES_128_GCM, EchGreaseAead::CHACHA20_POLY1305] {
         let mut raw = vector.info();
         raw.default_aead_id = default_aead.id();
-        let info = EchGreaseInfo(&raw);
+        let info = EchGreaseSizeInfo(&raw);
         let aes = (0..64)
             .filter(|_| {
                 info.nss_parameters(100, 19, Rfc9849).unwrap().aead == EchGreaseAead::AES_128_GCM
@@ -1112,7 +1112,7 @@ fn ech_context_policy_and_connection_override() {
     let index = Ssl::new_ex_index::<usize>().unwrap();
     let policy = |counter: usize| {
         let counts = Arc::clone(&counts);
-        move |ssl: &SslRef, info: EchGreaseInfo<'_>| {
+        move |ssl: &SslRef, info: EchGreaseSizeInfo<'_>| {
             assert_eq!(ssl.ex_data(index), Some(&counter));
             assert_eq!(info.server_name_length(), Some(9));
             counts[counter].fetch_add(1, Ordering::SeqCst);

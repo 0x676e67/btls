@@ -56,7 +56,7 @@ pub struct EchGreaseParameters {
     /// AEAD identifier to advertise; the payload remains random bytes.
     pub aead: EchGreaseAead,
     /// Final payload length, including the simulated tag but not ECH framing.
-    /// Must not exceed [`EchGreaseInfo::max_payload_length`].
+    /// Must not exceed [`EchGreaseSizeInfo::max_payload_length`].
     pub payload_length: NonZeroU16,
     /// Send uniformly random bytes as `enc`, as NSS does, instead of an X25519
     /// public key. A canonical key always has bit 255 clear, so the choice is
@@ -79,9 +79,9 @@ impl EchGreaseParameters {
 ///
 /// Extension sizes exclude their headers; PSK is reported separately.
 #[derive(Clone, Copy)]
-pub struct EchGreaseInfo<'a>(pub(crate) &'a ffi::SSL_ECH_GREASE_SIZE_INFO);
+pub struct EchGreaseSizeInfo<'a>(pub(crate) &'a ffi::SSL_ECH_GREASE_SIZE_INFO);
 
-impl EchGreaseInfo<'_> {
+impl EchGreaseSizeInfo<'_> {
     /// Cipher suite IDs in wire order, each encoded as two big-endian bytes.
     pub fn cipher_suites(&self) -> &[u8] {
         if self.0.cipher_suites_length == 0 {
@@ -294,7 +294,7 @@ unsafe extern "C" fn parameter_callback<F, const CONTEXT: bool>(
     _: *mut c_void,
 ) -> libc::c_int
 where
-    F: Fn(&SslRef, EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+    F: Fn(&SslRef, EchGreaseSizeInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
         + Send
         + Sync
         + 'static,
@@ -314,7 +314,7 @@ where
         return 0;
     };
     // Like the other SSL callbacks, a panic aborts at this extern "C" boundary.
-    match (callback.0)(ssl, EchGreaseInfo(info)) {
+    match (callback.0)(ssl, EchGreaseSizeInfo(info)) {
         Ok(parameters) => {
             unsafe {
                 *out = ffi::SSL_ECH_GREASE_PARAMETERS {
@@ -342,9 +342,9 @@ impl SslContextBuilder {
     /// can neither skip one nor defer to BoringSSL's random draw. Errors or
     /// oversized output fail the handshake; panics abort, as with other SSL
     /// callbacks.
-    /// See [`EchGreaseInfo::max_payload_length`] for sizing limits. Arbitrary
+    /// See [`EchGreaseSizeInfo::max_payload_length`] for sizing limits. Arbitrary
     /// lengths need not follow [RFC 9849]'s recommended distribution;
-    /// [`EchGreaseInfo::nss_parameters`] provides NSS-shaped parameters.
+    /// [`EchGreaseSizeInfo::nss_parameters`] provides NSS-shaped parameters.
     /// Unlike NSS, this also applies to DTLS when ECH GREASE is enabled.
     /// Callbacks of other closure types may remain stored until this context
     /// is freed, even after replacement.
@@ -353,7 +353,7 @@ impl SslContextBuilder {
     #[corresponds(SSL_CTX_set_ech_grease_callback)]
     pub fn set_ech_grease_callback<F>(&mut self, callback: F)
     where
-        F: Fn(&SslRef, EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+        F: Fn(&SslRef, EchGreaseSizeInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
             + Send
             + Sync
             + 'static,
@@ -392,7 +392,7 @@ impl SslRef {
     #[corresponds(SSL_set_ech_grease_callback)]
     pub fn set_ech_grease_callback<F>(&mut self, callback: F) -> Result<(), ErrorStack>
     where
-        F: Fn(&SslRef, EchGreaseInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
+        F: Fn(&SslRef, EchGreaseSizeInfo<'_>) -> Result<EchGreaseParameters, ErrorStack>
             + Send
             + Sync
             + 'static,
