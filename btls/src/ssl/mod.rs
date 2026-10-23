@@ -113,6 +113,10 @@ pub use self::connector::{
 #[cfg(feature = "credential")]
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
 pub use self::ech::SslEchKeysRef;
+#[cfg(not(feature = "fips"))]
+pub use self::ech_grease::{
+    EchGreaseAead, EchGreaseParameters, EchGreaseRounding, EchGreaseSizeInfo,
+};
 pub use self::error::{Error, ErrorCode, HandshakeError};
 
 mod async_callbacks;
@@ -122,6 +126,8 @@ mod connector;
 #[cfg(feature = "credential")]
 mod credential;
 mod ech;
+#[cfg(not(feature = "fips"))]
+mod ech_grease;
 mod error;
 mod mut_only;
 #[cfg(test)]
@@ -624,6 +630,20 @@ impl ExtensionType {
     #[cfg(not(feature = "fips"))]
     pub const RECORD_SIZE_LIMIT: Self = Self(ffi::TLSEXT_TYPE_record_size_limit as u16);
     pub const SERVER_PADDING: Self = Self(ffi::TLSEXT_TYPE_server_padding as u16);
+
+    /// Returns the wire extension type.
+    #[must_use]
+    pub const fn as_raw(self) -> u16 {
+        self.0
+    }
+
+    /// Whether this is an [RFC 8701] GREASE value.
+    ///
+    /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
+    #[must_use]
+    pub const fn is_grease(self) -> bool {
+        self.0 & 0x0f0f == 0x0a0a && self.0 >> 8 == self.0 & 0xff
+    }
 }
 
 impl From<u16> for ExtensionType {
@@ -4260,14 +4280,15 @@ impl SslRef {
         }
     }
 
-    // Whether or not `SSL` negotiated ECH.
+    /// Whether or not `SSL` negotiated ECH.
     #[corresponds(SSL_ech_accepted)]
     #[must_use]
     pub fn ech_accepted(&self) -> bool {
         unsafe { ffi::SSL_ech_accepted(self.as_ptr()) != 0 }
     }
 
-    // Whether or not to enable ECH grease on `SSL`.
+    /// Enables ECH GREASE when no supported ECH configuration is available.
+    /// Set before the first ClientHello. This does not enable real ECH.
     #[corresponds(SSL_set_enable_ech_grease)]
     pub fn set_enable_ech_grease(&self, enable: bool) {
         let enable = if enable { 1 } else { 0 };

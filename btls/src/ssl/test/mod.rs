@@ -5,6 +5,7 @@ use std::mem;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::error::ErrorStack;
@@ -13,9 +14,9 @@ use crate::pkey::PKey;
 use crate::srtp::SrtpProfileId;
 use crate::ssl::test::server::Server;
 use crate::ssl::{
-    self, ExtensionType, ShutdownResult, ShutdownState, Ssl, SslAcceptor, SslAcceptorBuilder,
-    SslConnector, SslContext, SslFiletype, SslInfoCallbackMode, SslMethod, SslOptions,
-    SslSignatureAlgorithm, SslStream, SslVerifyMode,
+    self, ExtensionType, NameType, ShutdownResult, ShutdownState, Ssl, SslAcceptor,
+    SslAcceptorBuilder, SslConnector, SslContext, SslFiletype, SslInfoCallbackMode, SslMethod,
+    SslOptions, SslSignatureAlgorithm, SslStream, SslVerifyMode,
 };
 use crate::ssl::{HandshakeError, SslVersion};
 use crate::x509::store::X509StoreBuilder;
@@ -28,6 +29,7 @@ mod cert_compressor;
 mod cert_verify;
 mod custom_verify;
 mod ech;
+mod ech_grease;
 mod grease_sigalgs;
 mod patch_ciphers;
 mod patches;
@@ -893,6 +895,55 @@ fn connector_invalid_no_hostname_verification() {
         .connect("bogus.com", s)
         .unwrap();
     s.read_exact(&mut [0]).unwrap();
+}
+
+// SNI is omitted for IP literals and when disabled; a domain name carries it.
+#[test]
+fn connector_sends_sni_only_for_domain_names() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut server = Server::builder();
+    server.expected_connections_count(3);
+    server.ctx().set_select_certificate_callback({
+        let observed = Arc::clone(&observed);
+        move |client_hello| {
+            observed.lock().unwrap().push((
+                client_hello
+                    .get_extension(ExtensionType::SERVER_NAME)
+                    .is_some(),
+                client_hello
+                    .servername(NameType::HOST_NAME)
+                    .map(ToOwned::to_owned),
+            ));
+            Ok(())
+        }
+    });
+    let server = server.build();
+
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_ca_file("test/root-ca.pem").unwrap();
+    let connector = connector.build();
+    for (domain, use_sni) in [
+        ("127.0.0.1", true),
+        ("foobar.com", false),
+        ("foobar.com", true),
+    ] {
+        let mut s = connector
+            .configure()
+            .unwrap()
+            .use_server_name_indication(use_sni)
+            .verify_hostname(false)
+            .connect(domain, server.connect_tcp())
+            .unwrap();
+        s.read_exact(&mut [0]).unwrap();
+    }
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            (false, None),
+            (false, None),
+            (true, Some("foobar.com".to_owned()))
+        ]
+    );
 }
 
 #[test]
