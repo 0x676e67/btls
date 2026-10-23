@@ -28,6 +28,7 @@ use super::CompliancePolicy;
 mod cert_compressor;
 mod cert_verify;
 mod custom_verify;
+mod delegated_credentials;
 mod ech;
 mod ech_grease;
 mod grease_sigalgs;
