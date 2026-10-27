@@ -40,17 +40,33 @@
 use crate::ffi;
 use libc::c_int;
 use openssl_macros::corresponds;
-use std::mem::MaybeUninit;
-use std::ptr;
+use std::{fmt, mem, ptr};
 
 /// Provides Error handling for parsing keys.
 #[derive(Debug)]
 pub struct KeyError(());
 
-/// The key used to encrypt or decrypt cipher blocks.
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid AES key or key wrap input")
+    }
+}
+
+impl std::error::Error for KeyError {}
+
+/// The key used to encrypt or decrypt cipher blocks. Its key schedule is zeroed on drop.
 pub struct AesKey(ffi::AES_KEY);
 
 impl AesKey {
+    /// A zeroed key. AES-128 and AES-192 schedules fill only part of it, and the rest must still
+    /// be initialized.
+    fn zeroed() -> Self {
+        AesKey(ffi::AES_KEY {
+            rd_key: [0; 60],
+            rounds: 0,
+        })
+    }
+
     /// Prepares a key for encryption.
     ///
     /// # Failure
@@ -61,14 +77,14 @@ impl AesKey {
         unsafe {
             assert!(key.len() <= c_int::MAX as usize / 8);
 
-            let mut aes_key = MaybeUninit::uninit();
+            let mut aes_key = AesKey::zeroed();
             let r = ffi::AES_set_encrypt_key(
                 key.as_ptr(),
                 (key.len() * 8).try_into().map_err(|_| KeyError(()))?,
-                aes_key.as_mut_ptr(),
+                &mut aes_key.0,
             );
             if r == 0 {
-                Ok(AesKey(aes_key.assume_init()))
+                Ok(aes_key)
             } else {
                 Err(KeyError(()))
             }
@@ -85,20 +101,44 @@ impl AesKey {
         unsafe {
             assert!(key.len() <= c_int::MAX as usize / 8);
 
-            let mut aes_key = MaybeUninit::uninit();
+            let mut aes_key = AesKey::zeroed();
             let r = ffi::AES_set_decrypt_key(
                 key.as_ptr(),
                 (key.len() * 8).try_into().map_err(|_| KeyError(()))?,
-                aes_key.as_mut_ptr(),
+                &mut aes_key.0,
             );
 
             if r == 0 {
-                Ok(AesKey(aes_key.assume_init()))
+                Ok(aes_key)
             } else {
                 Err(KeyError(()))
             }
         }
     }
+}
+
+impl Drop for AesKey {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::OPENSSL_cleanse(
+                ptr::from_mut(&mut self.0).cast(),
+                mem::size_of::<ffi::AES_KEY>(),
+            );
+        }
+    }
+}
+
+/// Encrypts a single block with a key from [`AesKey::new_encrypt`], as the building block of
+/// other modes such as QUIC header protection.
+#[corresponds(AES_encrypt)]
+pub fn encrypt_block(key: &AesKey, in_: &[u8; 16], out: &mut [u8; 16]) {
+    unsafe { ffi::AES_encrypt(in_.as_ptr(), out.as_mut_ptr(), &key.0) }
+}
+
+/// Decrypts a single block with a key from [`AesKey::new_decrypt`].
+#[corresponds(AES_decrypt)]
+pub fn decrypt_block(key: &AesKey, in_: &[u8; 16], out: &mut [u8; 16]) {
+    unsafe { ffi::AES_decrypt(in_.as_ptr(), out.as_mut_ptr(), &key.0) }
 }
 
 /// Wrap a key, according to [RFC 3394](https://tools.ietf.org/html/rfc3394)
@@ -183,6 +223,31 @@ mod test {
     use hex::FromHex;
 
     use super::*;
+
+    /// The AES-128 example of FIPS-197, Appendix C.1.
+    #[test]
+    fn test_block() {
+        let key = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let plaintext: [u8; 16] = hex::decode("00112233445566778899aabbccddeeff")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut ciphertext = [0; 16];
+        encrypt_block(
+            &AesKey::new_encrypt(&key).unwrap(),
+            &plaintext,
+            &mut ciphertext,
+        );
+        assert_eq!(hex::encode(ciphertext), "69c4e0d86a7b0430d8cdb78070b4c55a");
+
+        let mut decrypted = [0; 16];
+        decrypt_block(
+            &AesKey::new_decrypt(&key).unwrap(),
+            &ciphertext,
+            &mut decrypted,
+        );
+        assert_eq!(decrypted, plaintext);
+    }
 
     // from the RFC https://tools.ietf.org/html/rfc3394#section-2.2.3
     #[test]

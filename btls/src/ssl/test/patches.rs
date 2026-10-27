@@ -621,6 +621,80 @@ fn record_size_limit_patch_requires_negotiation() {
     );
 }
 
+// Extension types in wire order, parsed from the ClientHello body.
+fn client_hello_extension_types(hello: &[u8]) -> Vec<ExtensionType> {
+    let u16_at =
+        |offset: usize| usize::from(u16::from_be_bytes([hello[offset], hello[offset + 1]]));
+    let mut offset = 2 + 32;
+    offset += 1 + usize::from(hello[offset]);
+    offset += 2 + u16_at(offset);
+    offset += 1 + usize::from(hello[offset]);
+    let end = offset + 2 + u16_at(offset);
+    offset += 2;
+    assert_eq!(end, hello.len());
+    let mut types = Vec::new();
+    while offset < end {
+        types.push(ExtensionType::from(u16::from_be_bytes([
+            hello[offset],
+            hello[offset + 1],
+        ])));
+        offset += 4 + u16_at(offset + 2);
+    }
+    types
+}
+
+#[test]
+fn record_size_limit_patch_keeps_configured_extension_position() {
+    // 0004-boringssl-extension-order.patch sends the listed extensions first.
+    // 0005-record-size-limit.patch must keep its slot in that prefix when the
+    // limit is set and drop out without disturbing its neighbours when it is
+    // not.
+    let order = [
+        ExtensionType::SUPPORTED_VERSIONS,
+        ExtensionType::RECORD_SIZE_LIMIT,
+        ExtensionType::KEY_SHARE,
+        ExtensionType::SUPPORTED_GROUPS,
+        ExtensionType::SIGNATURE_ALGORITHMS,
+    ];
+    for limit in [16_385, 0] {
+        let types = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::builder();
+        server.ctx().set_select_certificate_callback({
+            let types = Arc::clone(&types);
+            move |client_hello| {
+                *types.lock().unwrap() = client_hello_extension_types(client_hello.as_bytes());
+                Ok(())
+            }
+        });
+        let server = server.build();
+        let mut client = server.client_with_root_ca();
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client
+            .ctx()
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client.ctx().set_extension_permutation(&order).unwrap();
+        client.ctx().set_record_size_limit(limit);
+        client.connect();
+
+        let expected: Vec<_> = order
+            .iter()
+            .copied()
+            .filter(|ext| limit != 0 || *ext != ExtensionType::RECORD_SIZE_LIMIT)
+            .collect();
+        let types = types.lock().unwrap();
+        assert_eq!(types[..expected.len()], expected[..], "limit {limit}");
+        assert_eq!(
+            types.contains(&ExtensionType::RECORD_SIZE_LIMIT),
+            limit != 0,
+            "limit {limit}"
+        );
+    }
+}
+
 #[test]
 fn boringssl_patch_partial_extension_order_can_handshake() {
     // 0004-boringssl-extension-order.patch adds explicit ClientHello extension
