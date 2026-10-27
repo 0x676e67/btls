@@ -1,7 +1,7 @@
-use crate::cvt;
 use crate::error::ErrorStack;
 use crate::foreign_types::ForeignTypeRef;
 use crate::hash::MessageDigest;
+use crate::{cvt, cvt_p};
 use openssl_macros::corresponds;
 
 foreign_type_and_impl_send_sync! {
@@ -39,20 +39,21 @@ impl Hmac {
     pub fn init(key: &[u8], md: &MessageDigest) -> Result<Hmac, ErrorStack> {
         ffi::init();
 
-        let ctx = unsafe {
-            let ctx = ffi::HMAC_CTX_new();
+        let ctx = unsafe { cvt_p(ffi::HMAC_CTX_new())? };
+        // Owned first, so that the context is freed if the initialization fails.
+        let hmac = Hmac(ctx);
+        unsafe {
             cvt(ffi::HMAC_Init_ex(
-                ctx,
+                hmac.0,
                 key.as_ptr().cast(),
                 key.len(),
                 md.as_ptr(),
                 // ENGINE api is deprecated
                 core::ptr::null_mut(),
             ))?;
-            ctx
-        };
+        }
 
-        Ok(Hmac(ctx))
+        Ok(hmac)
     }
 
     /// Updates the HMAC input.

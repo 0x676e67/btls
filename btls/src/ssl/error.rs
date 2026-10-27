@@ -48,6 +48,11 @@ impl ErrorCode {
 
     pub const PENDING_TICKET: ErrorCode = ErrorCode(ffi::SSL_ERROR_PENDING_TICKET);
 
+    /// The server rejected the early data of this client. Call
+    /// [`SslRef::reset_early_data_reject`](super::SslRef::reset_early_data_reject) to continue
+    /// the handshake without it.
+    pub const EARLY_DATA_REJECTED: ErrorCode = ErrorCode(ffi::SSL_ERROR_EARLY_DATA_REJECTED);
+
     /// A non-recoverable IO error occurred.
     pub const SYSCALL: ErrorCode = ErrorCode(ffi::SSL_ERROR_SYSCALL);
 

@@ -34,6 +34,8 @@ mod grease_sigalgs;
 mod patch_ciphers;
 mod patches;
 mod private_key_method;
+mod quic;
+mod reverify;
 mod server;
 mod server_padding;
 mod session;

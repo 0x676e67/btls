@@ -62,7 +62,7 @@ use openssl_macros::corresponds;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::ffi::{c_char, c_int, c_uchar, c_uint};
+use std::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_void};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::io::prelude::*;
@@ -97,7 +97,8 @@ use crate::try_int;
 use crate::x509::store::{X509Store, X509StoreBuilder, X509StoreBuilderRef, X509StoreRef};
 use crate::x509::verify::X509VerifyParamRef;
 use crate::x509::{
-    X509Name, X509Ref, X509StoreContextRef, X509VerifyError, X509VerifyResult, X509,
+    X509Name, X509Ref, X509StoreContext, X509StoreContextRef, X509VerifyError, X509VerifyResult,
+    X509,
 };
 use crate::{cvt, cvt_0i, cvt_n, cvt_p, init};
 use crate::{ffi, free_data_box};
@@ -108,16 +109,21 @@ pub use self::async_callbacks::{
     BoxPrivateKeyMethodFuture, BoxSelectCertFinish, BoxSelectCertFuture, ExDataFuture,
 };
 pub use self::connector::{
-    ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
+    ClientSession, ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector,
+    SslConnectorBuilder,
 };
 #[cfg(feature = "credential")]
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
+pub use self::early_data::EarlyDataReason;
 pub use self::ech::SslEchKeysRef;
 #[cfg(not(feature = "fips"))]
 pub use self::ech_grease::{
     EchGreaseAead, EchGreaseParameters, EchGreaseRounding, EchGreaseSizeInfo,
 };
 pub use self::error::{Error, ErrorCode, HandshakeError};
+pub use self::quic::{QuicEncryptionLevel, QuicMethod, QuicMethodError};
+
+use self::connector::earliest_not_after;
 
 mod async_callbacks;
 mod bio;
@@ -125,11 +131,13 @@ mod callbacks;
 mod connector;
 #[cfg(feature = "credential")]
 mod credential;
+mod early_data;
 mod ech;
 #[cfg(not(feature = "fips"))]
 mod ech_grease;
 mod error;
 mod mut_only;
+mod quic;
 #[cfg(test)]
 mod test;
 
@@ -383,6 +391,15 @@ pub enum SslVerifyError {
     Retry,
 }
 
+// Sends the alert BoringSSL's built-in verifier sends for the same result.
+impl From<X509VerifyError> for SslVerifyError {
+    fn from(err: X509VerifyError) -> Self {
+        // SAFETY: only maps an integer.
+        let alert = unsafe { ffi::SSL_alert_from_verify_result(c_long::from(err.as_raw())) };
+        SslVerifyError::Invalid(SslAlert(alert))
+    }
+}
+
 bitflags! {
     /// Options controlling the behavior of session caching.
     #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord, Hash)]
@@ -393,9 +410,8 @@ bitflags! {
         /// Enable session caching on the client side.
         ///
         /// OpenSSL has no way of identifying the proper session to reuse automatically, so the
-        /// application is responsible for setting it explicitly via [`SslRef::set_session`].
-        ///
-        /// [`SslRef::set_session`]: struct.SslRef.html#method.set_session
+        /// application is responsible for setting it explicitly via
+        /// [`ConnectConfiguration::set_client_session`] or [`SslRef::set_session`].
         const CLIENT = ffi::SSL_SESS_CACHE_CLIENT;
 
         /// Enable session caching on the server side.
@@ -502,6 +518,16 @@ static SESSION_CTX_INDEX: LazyLock<Index<Ssl, SslContext>> =
 static X509_FLAG_INDEX: LazyLock<Index<SslContext, bool>> =
     LazyLock::new(|| SslContext::new_ex_index().unwrap());
 
+type CertVerifyFn = unsafe extern "C" fn(*mut ffi::X509_STORE_CTX, *mut c_void) -> c_int;
+
+// Verify stores and the cert verify trampoline, which BoringSSL cannot return.
+static VERIFY_STORE_INDEX: LazyLock<Index<SslContext, X509Store>> =
+    LazyLock::new(|| SslContext::new_ex_index().unwrap());
+static SSL_VERIFY_STORE_INDEX: LazyLock<Index<Ssl, Option<X509Store>>> =
+    LazyLock::new(|| Ssl::new_ex_index().unwrap());
+static CERT_VERIFY_INDEX: LazyLock<Index<SslContext, CertVerifyFn>> =
+    LazyLock::new(|| SslContext::new_ex_index().unwrap());
+
 /// An error returned from the SNI callback.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct SniError(c_int);
@@ -556,6 +582,23 @@ impl SslAlert {
     pub const UNKNOWN_PSK_IDENTITY: Self = Self(ffi::SSL_AD_UNKNOWN_PSK_IDENTITY);
     pub const CERTIFICATE_REQUIRED: Self = Self(ffi::SSL_AD_CERTIFICATE_REQUIRED);
     pub const NO_APPLICATION_PROTOCOL: Self = Self(ffi::SSL_AD_NO_APPLICATION_PROTOCOL);
+
+    /// Returns the alert's description code.
+    #[must_use]
+    pub fn as_raw(&self) -> c_int {
+        self.0
+    }
+
+    /// Returns a readable name of the alert, or "unknown".
+    #[corresponds(SSL_alert_desc_string_long)]
+    #[must_use]
+    pub fn description(&self) -> &'static str {
+        unsafe {
+            CStr::from_ptr(ffi::SSL_alert_desc_string_long(self.0))
+                .to_str()
+                .unwrap_or("unknown")
+        }
+    }
 }
 
 /// An error returned from an ALPN selection callback.
@@ -945,6 +988,9 @@ impl SslInfoCallbackMode {
     /// Signaled when a handshake progresses to a new state.
     pub const ACCEPT_LOOP: Self = Self(ffi::SSL_CB_ACCEPT_LOOP);
 
+    /// Signaled when a client-side handshake progresses to a new state.
+    pub const CONNECT_LOOP: Self = Self(ffi::SSL_CB_CONNECT_LOOP);
+
     /// Signaled when the current iteration of the server-side handshake state machine completes.
     pub const ACCEPT_EXIT: Self = Self(ffi::SSL_CB_ACCEPT_EXIT);
 
@@ -1134,6 +1180,7 @@ impl SslContextBuilder {
         // is what you need to register a new callback.
         // See the NOTE in `ssl_raw_verify` for confirmation.
         self.replace_ex_data(SslContext::cached_ex_index::<F>(), callback);
+        self.replace_ex_data(*CERT_VERIFY_INDEX, raw_cert_verify::<F> as CertVerifyFn);
         unsafe {
             ffi::SSL_CTX_set_cert_verify_callback(
                 self.as_ptr(),
@@ -1151,6 +1198,16 @@ impl SslContextBuilder {
         unsafe {
             ffi::SSL_CTX_set_verify(self.as_ptr(), c_int::from(mode.bits()), None);
         }
+    }
+
+    /// Returns the verify mode set by [`Self::set_verify`] or one of the verify callbacks.
+    ///
+    /// An explicit [`SslVerifyMode::NONE`] reads the same as the default. Panics if the context
+    /// is not configured for X.509 certificates.
+    #[corresponds(SSL_CTX_get_verify_mode)]
+    #[must_use]
+    pub fn verify_mode(&self) -> SslVerifyMode {
+        self.ctx.verify_mode()
     }
 
     /// Configures the certificate verification method for new connections and
@@ -1217,8 +1274,9 @@ impl SslContextBuilder {
 
     /// Configures whether resumed client sessions use the custom verification callback.
     ///
-    /// This only applies to [`Self::set_custom_verify_callback`] and is incompatible with
-    /// [`SslVerifyMode::NONE`].
+    /// Without [`Self::set_custom_verify_callback`] every resumption fails verification; call
+    /// [`SslRef::verify_peer_cert_chain`] from it to keep the built-in X.509 checks. Incompatible
+    /// with [`SslVerifyMode::NONE`], including a mode set on one connection.
     #[corresponds(SSL_CTX_set_reverify_on_resume)]
     pub fn set_reverify_on_resume(&mut self, enabled: bool) {
         unsafe { ffi::SSL_CTX_set_reverify_on_resume(self.as_ptr(), enabled as _) }
@@ -1314,16 +1372,18 @@ impl SslContextBuilder {
     }
 
     /// Sets a custom certificate store for verifying peer certificates.
-    #[corresponds(SSL_CTX_set0_verify_cert_store)]
+    #[corresponds(SSL_CTX_set1_verify_cert_store)]
     pub fn set_verify_cert_store(&mut self, cert_store: X509Store) -> Result<(), ErrorStack> {
         self.ctx.check_x509();
 
         unsafe {
-            cvt(ffi::SSL_CTX_set0_verify_cert_store(
+            cvt(ffi::SSL_CTX_set1_verify_cert_store(
                 self.as_ptr(),
-                cert_store.into_ptr(),
-            ))
+                cert_store.as_ptr(),
+            ))?;
         }
+        self.replace_ex_data(*VERIFY_STORE_INDEX, cert_store);
+        Ok(())
     }
 
     /// Replaces the context's certificate store, and keeps it immutable.
@@ -1460,7 +1520,9 @@ impl SslContextBuilder {
     ///
     /// A session is only used by a connection with the same identifier. Clients can use it to
     /// isolate compatible contexts in an external cache; servers must set it when peer
-    /// verification is enabled.
+    /// verification is enabled. A [`ClientSession`] is offered to any context sharing a non-empty
+    /// identifier, so share one only between contexts with the same trust, verification, client
+    /// identity, protocol, and cipher configuration.
     #[corresponds(SSL_CTX_set_session_id_context)]
     pub fn set_session_id_context(&mut self, sid_ctx: &[u8]) -> Result<(), ErrorStack> {
         unsafe {
@@ -1965,7 +2027,8 @@ impl SslContextBuilder {
     /// session callback is a portable way to deal with both cases.
     ///
     /// Note that session caching must be enabled for the callback to be invoked, and it defaults
-    /// off for clients. [`set_session_cache_mode`] controls that behavior.
+    /// off for clients. [`set_session_cache_mode`] controls that behavior. This replaces
+    /// [`SslConnectorBuilder::set_client_session_callback`], which uses the same BoringSSL callback.
     ///
     /// [`SslRef::session`]: struct.SslRef.html#method.session
     /// [`set_session_cache_mode`]: #method.set_session_cache_mode
@@ -2282,6 +2345,24 @@ impl SslContextBuilder {
         // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
         unsafe {
             cvt_0i(ffi::SSL_CTX_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Configures servers to send `ids` as the trust anchors they have certificates for, which
+    /// lets a client whose requested anchors did not match retry with others.
+    ///
+    /// `ids` is a non-empty sequence of non-empty, one-byte length-prefixed trust anchor IDs, in
+    /// decreasing preference. See [`set_requested_trust_anchors`](Self::set_requested_trust_anchors).
+    #[corresponds(SSL_CTX_set1_available_trust_anchors)]
+    pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set1_available_trust_anchors(
                 self.as_ptr(),
                 ids.as_ptr(),
                 ids.len(),
@@ -2868,6 +2949,20 @@ impl SslCipherRef {
         unsafe { ffi::SSL_CIPHER_is_aead(self.as_ptr()) != 0 }
     }
 
+    /// Returns the NID corresponding to the cipher's key exchange.
+    ///
+    /// TLS 1.3 ciphers report [`Nid::KX_ANY`].
+    #[corresponds(SSL_CIPHER_get_kx_nid)]
+    #[must_use]
+    pub fn cipher_kx_nid(&self) -> Option<Nid> {
+        let n = unsafe { ffi::SSL_CIPHER_get_kx_nid(self.as_ptr()) };
+        if n == 0 {
+            None
+        } else {
+            Some(Nid::from_raw(n))
+        }
+    }
+
     /// Returns the NID corresponding to the cipher's authentication type.
     #[corresponds(SSL_CIPHER_get_auth_nid)]
     #[must_use]
@@ -2998,6 +3093,44 @@ impl SslSessionRef {
         }
     }
 
+    /// Returns the earliest expiry in the peer certificate chain, as seconds since the Unix epoch.
+    ///
+    /// Returns `None` when the session holds no peer certificates.
+    #[corresponds(SSL_SESSION_get0_peer_certificates)]
+    #[must_use]
+    pub fn peer_chain_not_after(&self) -> Option<i64> {
+        // SAFETY: the session owns the stack and its buffers for the duration of this call, and
+        // each parsed certificate holds its own reference to its buffer.
+        unsafe {
+            let certs =
+                ffi::SSL_SESSION_get0_peer_certificates(self.as_ptr()).cast::<ffi::OPENSSL_STACK>();
+            if certs.is_null() {
+                return None;
+            }
+            earliest_not_after((0..ffi::OPENSSL_sk_num(certs)).filter_map(|index| {
+                let buffer = ffi::OPENSSL_sk_value(certs, index).cast::<ffi::CRYPTO_BUFFER>();
+                let cert = ffi::X509_parse_from_buffer(buffer);
+                (!cert.is_null()).then(|| X509::from_ptr(cert))
+            }))
+        }
+    }
+
+    /// Returns the cipher negotiated by the connection that established the session.
+    ///
+    /// TLS 1.3 resumptions may use a different cipher.
+    #[corresponds(SSL_SESSION_get0_cipher)]
+    #[must_use]
+    pub fn cipher(&self) -> Option<&SslCipherRef> {
+        unsafe {
+            let ptr = ffi::SSL_SESSION_get0_cipher(self.as_ptr());
+            if ptr.is_null() {
+                None
+            } else {
+                Some(SslCipherRef::from_ptr(ptr.cast_mut()))
+            }
+        }
+    }
+
     /// Returns the session's TLS protocol version.
     #[corresponds(SSL_SESSION_get_protocol_version)]
     #[must_use]
@@ -3005,6 +3138,20 @@ impl SslSessionRef {
         unsafe {
             let version = ffi::SSL_SESSION_get_protocol_version(self.as_ptr());
             SslVersion(version)
+        }
+    }
+
+    /// Returns the session ID context recorded when the session was created.
+    #[corresponds(SSL_SESSION_get0_id_context)]
+    fn id_context(&self) -> &[u8] {
+        unsafe {
+            let mut len = 0;
+            let p = ffi::SSL_SESSION_get0_id_context(self.as_ptr(), &mut len);
+            if p.is_null() {
+                &[]
+            } else {
+                slice::from_raw_parts(p, len as usize)
+            }
         }
     }
 
@@ -3317,16 +3464,18 @@ impl SslRef {
     }
 
     /// Sets a custom certificate store for verifying peer certificates.
-    #[corresponds(SSL_set0_verify_cert_store)]
+    #[corresponds(SSL_set1_verify_cert_store)]
     pub fn set_verify_cert_store(&mut self, cert_store: X509Store) -> Result<(), ErrorStack> {
         self.ssl_context().check_x509();
 
         unsafe {
-            cvt(ffi::SSL_set0_verify_cert_store(
+            cvt(ffi::SSL_set1_verify_cert_store(
                 self.as_ptr(),
-                cert_store.into_ptr(),
-            ))
+                cert_store.as_ptr(),
+            ))?;
         }
+        self.set_ex_data(*SSL_VERIFY_STORE_INDEX, Some(cert_store));
+        Ok(())
     }
 
     /// Like [`SslContextBuilder::set_custom_verify_callback`].
@@ -3803,7 +3952,15 @@ impl SslRef {
             "X.509 certificate support in old and new contexts doesn't match",
         );
 
-        unsafe { cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr())).map(|_| ()) }
+        let changed = self.ssl_context().as_ptr() != ctx.as_ptr();
+        unsafe { cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr()))? };
+        // BoringSSL copied the new context's certificate settings, dropping a per-connection store.
+        if changed {
+            if let Some(store) = self.ex_data_mut(*SSL_VERIFY_STORE_INDEX) {
+                *store = None;
+            }
+        }
+        Ok(())
     }
 
     /// Returns the context corresponding to the current connection.
@@ -3835,6 +3992,98 @@ impl SslRef {
         self.ssl_context().check_x509();
 
         unsafe { X509VerifyError::from_raw(ffi::SSL_get_verify_result(self.as_ptr()) as c_int) }
+    }
+
+    /// Verifies the peer certificate chain as BoringSSL's built-in X.509 verifier does.
+    ///
+    /// Call it from [`SslContextBuilder::set_custom_verify_callback`] to keep the built-in checks,
+    /// which lets [`SslContextBuilder::set_reverify_on_resume`] apply them to resumed sessions. It
+    /// uses the same verify store, this connection's [verify parameters](Self::verify_param_mut)
+    /// including the hostname, the ECH public name, and the verify and cert verify callbacks.
+    ///
+    /// On a full handshake BoringSSL reports a rejection through [`Self::verify_result`] as
+    /// [`X509VerifyError::APPLICATION_VERIFICATION`]; a rejected resumption fails with
+    /// `CERTIFICATE_VERIFY_FAILED` and keeps the resumed session's result.
+    #[corresponds(X509_verify_cert)]
+    pub fn verify_peer_cert_chain(&self) -> X509VerifyResult {
+        let context = self.ssl_context();
+        if !context.has_x509_support() {
+            return Err(X509VerifyError::INVALID_CALL);
+        }
+
+        // SAFETY: the context uses the X.509 method, and the session under verification owns the
+        // chain while this connection is borrowed.
+        let chain = unsafe { ffi::SSL_get_peer_full_cert_chain(self.as_ptr()) };
+        if chain.is_null() {
+            return Err(X509VerifyError::INVALID_CALL);
+        }
+        let chain = unsafe { StackRef::<X509>::from_ptr(chain) };
+        let Some(leaf) = chain.get(0) else {
+            return Err(X509VerifyError::INVALID_CALL);
+        };
+
+        let store: &X509StoreRef = match (
+            self.ex_data(*SSL_VERIFY_STORE_INDEX),
+            context.ex_data(*VERIFY_STORE_INDEX),
+        ) {
+            (Some(Some(store)), _) | (_, Some(store)) => store,
+            _ => context.cert_store(),
+        };
+
+        let Ok(mut store_ctx) = X509StoreContext::new() else {
+            return Err(X509VerifyError::OUT_OF_MEM);
+        };
+        store_ctx
+            .init(store, leaf, chain, |store_ctx| {
+                let purpose = if self.is_server() {
+                    c"ssl_client"
+                } else {
+                    c"ssl_server"
+                };
+                // SAFETY: mirrors BoringSSL's built-in verifier; `self` outlives `store_ctx`,
+                // which `init` cleans up before returning.
+                let ret = unsafe {
+                    let ctx = store_ctx.as_ptr();
+                    let param = ffi::X509_STORE_CTX_get0_param(ctx);
+                    cvt(ffi::X509_STORE_CTX_set_ex_data(
+                        ctx,
+                        ffi::SSL_get_ex_data_X509_STORE_CTX_idx(),
+                        self.as_ptr().cast(),
+                    ))?;
+                    cvt(ffi::X509_STORE_CTX_set_default(ctx, purpose.as_ptr()))?;
+                    cvt(ffi::X509_VERIFY_PARAM_set1(
+                        param,
+                        ffi::SSL_get0_param(self.as_ptr()),
+                    ))?;
+                    if let Some(name) = self.get_ech_name_override().filter(|name| !name.is_empty())
+                    {
+                        cvt(ffi::X509_VERIFY_PARAM_set1_host(
+                            param,
+                            name.as_ptr().cast(),
+                            name.len(),
+                        ))?;
+                    }
+                    if let Some(callback) = ffi::SSL_get_verify_callback(self.as_ptr()) {
+                        ffi::X509_STORE_CTX_set_verify_cb(ctx, Some(callback));
+                    }
+                    match context.ex_data(*CERT_VERIFY_INDEX) {
+                        Some(&callback) => callback(ctx, ptr::null_mut()),
+                        None => ffi::X509_verify_cert(ctx),
+                    }
+                };
+
+                // A verify callback may accept a chain with a recorded error; the return decides.
+                Ok(if ret > 0 {
+                    unsafe { ffi::ERR_clear_error() };
+                    Ok(())
+                } else {
+                    Err(store_ctx
+                        .verify_result()
+                        .err()
+                        .unwrap_or(X509VerifyError::UNSPECIFIED))
+                })
+            })
+            .unwrap_or(Err(X509VerifyError::UNSPECIFIED))
     }
 
     /// Returns a shared reference to the SSL session.
@@ -3909,9 +4158,22 @@ impl SslRef {
     /// - the session authenticates the intended peer under the current verification and client
     ///   authentication policies; and
     /// - the session ID context, protocol, and cipher configuration are compatible.
+    ///
+    /// [`ConnectConfiguration::set_client_session`] is a checked alternative for sessions from
+    /// [`SslConnectorBuilder::set_client_session_callback`].
     #[corresponds(SSL_set_session)]
     pub unsafe fn set_session(&mut self, session: &SslSessionRef) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::SSL_set_session(self.as_ptr(), session.as_ptr())) }
+    }
+
+    /// Returns the session ID context new sessions on this connection will record.
+    #[corresponds(SSL_get0_session_id_context)]
+    fn session_id_context(&self) -> Option<&[u8]> {
+        unsafe {
+            let mut len = 0;
+            let p = ffi::SSL_get0_session_id_context(self.as_ptr(), &mut len);
+            (!p.is_null()).then(|| slice::from_raw_parts(p, len))
+        }
     }
 
     /// Determines if the session provided to `set_session` was successfully reused.
@@ -4425,6 +4687,52 @@ impl SslRef {
                 ids.len(),
             ))
             .map(|_| ())
+        }
+    }
+
+    /// Overrides [`SslContextBuilder::set_available_trust_anchors`] for this connection.
+    #[corresponds(SSL_set1_available_trust_anchors)]
+    pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is valid and BoringSSL validates and copies `ids` before returning.
+        unsafe {
+            cvt_0i(ffi::SSL_set1_available_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Returns whether the server reported that its certificate chain matched one of the trust
+    /// anchors this client requested, so verification may treat the chain as a built path.
+    ///
+    /// Only known during the handshake, such as in a certificate verification callback.
+    #[corresponds(SSL_peer_matched_trust_anchor)]
+    #[must_use]
+    pub fn peer_matched_trust_anchor(&self) -> bool {
+        unsafe { ffi::SSL_peer_matched_trust_anchor(self.as_ptr()) == 1 }
+    }
+
+    /// Returns the trust anchor IDs the server has certificates for, in the format of
+    /// [`SslContextBuilder::set_requested_trust_anchors`], or an empty slice if it sent none.
+    ///
+    /// Only known during the handshake, such as in a certificate verification callback, where a
+    /// client that rejects the certificate can choose anchors to request when it retries.
+    #[corresponds(SSL_get0_peer_available_trust_anchors)]
+    #[must_use]
+    pub fn peer_available_trust_anchors(&self) -> &[u8] {
+        let mut data = ptr::null();
+        let mut len = 0;
+        // SAFETY: `self` is valid. BoringSSL keeps the list until the handshake moves on, which
+        // the shared borrow of `self` prevents.
+        unsafe {
+            ffi::SSL_get0_peer_available_trust_anchors(self.as_ptr(), &mut data, &mut len);
+            if data.is_null() {
+                &[]
+            } else {
+                slice::from_raw_parts(data, len)
+            }
         }
     }
 

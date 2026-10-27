@@ -1,6 +1,8 @@
 use std::sync::mpsc;
 
-use crate::ssl::{ExtensionType, Ssl, SslContext, SslContextBuilder, SslMethod, SslVersion};
+use crate::ssl::{
+    ExtensionType, Ssl, SslContext, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion,
+};
 
 use super::Server;
 
@@ -137,4 +139,35 @@ fn malformed_requested_trust_anchors_are_rejected() {
             "SSL setter accepted {name}: {ids:?}"
         );
     }
+}
+
+/// A client whose requested trust anchors the server cannot match learns which ones it can,
+/// during verification, to retry with them.
+#[test]
+fn peer_available_trust_anchors_for_retry() {
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut server = Server::builder();
+    require_tls13(server.ctx());
+    server
+        .ctx()
+        .set_available_trust_anchors(CONTEXT_IDS)
+        .unwrap();
+    let server = server.build();
+
+    let mut client = server.client();
+    require_tls13(client.ctx());
+    client.ctx().set_requested_trust_anchors(b"\x01z").unwrap();
+    client
+        .ctx()
+        .set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
+            let seen = (
+                ssl.peer_matched_trust_anchor(),
+                ssl.peer_available_trust_anchors().to_vec(),
+            );
+            seen_tx.send(seen).unwrap();
+            Ok(())
+        });
+    client.connect();
+
+    assert_eq!(seen_rx.recv().unwrap(), (false, CONTEXT_IDS.to_vec()));
 }
