@@ -5,6 +5,7 @@ use std::mem;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::error::ErrorStack;
@@ -13,9 +14,9 @@ use crate::pkey::PKey;
 use crate::srtp::SrtpProfileId;
 use crate::ssl::test::server::Server;
 use crate::ssl::{
-    self, ExtensionType, ShutdownResult, ShutdownState, Ssl, SslAcceptor, SslAcceptorBuilder,
-    SslConnector, SslContext, SslFiletype, SslInfoCallbackMode, SslMethod, SslOptions,
-    SslSignatureAlgorithm, SslStream, SslVerifyMode,
+    self, ExtensionType, NameType, ShutdownResult, ShutdownState, Ssl, SslAcceptor,
+    SslAcceptorBuilder, SslConnector, SslContext, SslFiletype, SslInfoCallbackMode, SslMethod,
+    SslOptions, SslSignatureAlgorithm, SslStream, SslVerifyMode,
 };
 use crate::ssl::{HandshakeError, SslVersion};
 use crate::x509::store::X509StoreBuilder;
@@ -28,6 +29,7 @@ mod cert_compressor;
 mod cert_verify;
 mod custom_verify;
 mod ech;
+mod ech_grease;
 mod grease_sigalgs;
 mod patch_ciphers;
 mod patches;
@@ -351,21 +353,23 @@ fn application_settings() {
     const SETTINGS: &[u8] = b"\x00\x03\x00\x00\x00\x64";
 
     /// Returns the ALPS values the client and the server received; `server` is `None` when the
-    /// server does not enable ALPS.
+    /// server does not enable ALPS, which it does from its ALPN select callback.
+    /// `new_codepoint` selects the client's and the server's ALPS codepoint.
     fn handshake(
+        new_codepoint: [bool; 2],
         client: Option<&'static [u8]>,
         server: Option<Option<&'static [u8]>>,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut builder = Server::builder();
-        builder.ctx().set_alpn_select_callback(|_, client| {
-            ssl::select_next_proto(b"\x02h2", client).ok_or(ssl::AlpnError::NOACK)
-        });
-        builder.ssl_cb(move |ssl| {
+        builder.ctx().set_alpn_select_callback(move |ssl, client| {
+            let proto = ssl::select_next_proto(b"\x02h2", client).ok_or(ssl::AlpnError::NOACK)?;
             if let Some(settings) = server {
-                ssl.add_application_settings(b"h2", settings).unwrap();
+                ssl.add_application_settings(proto, settings).unwrap();
             }
+            Ok(proto)
         });
+        builder.ssl_cb(move |ssl| ssl.set_alps_use_new_codepoint(new_codepoint[1]));
         builder.io_cb(move |s| {
             let received = s.ssl().peer_application_settings().map(ToOwned::to_owned);
             tx.send(received).unwrap();
@@ -374,6 +378,7 @@ fn application_settings() {
 
         let mut builder = server.client().build().builder();
         builder.ssl().set_alpn_protos(b"\x02h2").unwrap();
+        builder.ssl().set_alps_use_new_codepoint(new_codepoint[0]);
         builder
             .ssl()
             .add_application_settings(b"h2", client)
@@ -385,13 +390,26 @@ fn application_settings() {
 
     let some = Some(SETTINGS.to_vec());
     let empty = Some(Vec::new());
+    for codepoint in [true, false] {
+        assert_eq!(
+            handshake([codepoint; 2], Some(SETTINGS), Some(Some(SETTINGS))),
+            (some.clone(), some.clone())
+        );
+    }
+    // ALPS is not negotiated when the codepoints differ.
     assert_eq!(
-        handshake(Some(SETTINGS), Some(Some(SETTINGS))),
-        (some.clone(), some.clone())
+        handshake([true, false], Some(SETTINGS), Some(Some(SETTINGS))),
+        (None, None)
     );
-    assert_eq!(handshake(None, Some(Some(SETTINGS))), (some, empty.clone()));
-    assert_eq!(handshake(Some(b""), Some(None)), (empty.clone(), empty));
-    assert_eq!(handshake(Some(SETTINGS), None), (None, None));
+    assert_eq!(
+        handshake([true; 2], None, Some(Some(SETTINGS))),
+        (some, empty.clone())
+    );
+    assert_eq!(
+        handshake([true; 2], Some(b""), Some(None)),
+        (empty.clone(), empty)
+    );
+    assert_eq!(handshake([true; 2], Some(SETTINGS), None), (None, None));
 }
 
 #[test]
@@ -879,6 +897,55 @@ fn connector_invalid_no_hostname_verification() {
         .connect("bogus.com", s)
         .unwrap();
     s.read_exact(&mut [0]).unwrap();
+}
+
+// SNI is omitted for IP literals and when disabled; a domain name carries it.
+#[test]
+fn connector_sends_sni_only_for_domain_names() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut server = Server::builder();
+    server.expected_connections_count(3);
+    server.ctx().set_select_certificate_callback({
+        let observed = Arc::clone(&observed);
+        move |client_hello| {
+            observed.lock().unwrap().push((
+                client_hello
+                    .get_extension(ExtensionType::SERVER_NAME)
+                    .is_some(),
+                client_hello
+                    .servername(NameType::HOST_NAME)
+                    .map(ToOwned::to_owned),
+            ));
+            Ok(())
+        }
+    });
+    let server = server.build();
+
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_ca_file("test/root-ca.pem").unwrap();
+    let connector = connector.build();
+    for (domain, use_sni) in [
+        ("127.0.0.1", true),
+        ("foobar.com", false),
+        ("foobar.com", true),
+    ] {
+        let mut s = connector
+            .configure()
+            .unwrap()
+            .use_server_name_indication(use_sni)
+            .verify_hostname(false)
+            .connect(domain, server.connect_tcp())
+            .unwrap();
+        s.read_exact(&mut [0]).unwrap();
+    }
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            (false, None),
+            (false, None),
+            (true, Some("foobar.com".to_owned()))
+        ]
+    );
 }
 
 #[test]

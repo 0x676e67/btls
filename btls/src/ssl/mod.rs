@@ -116,6 +116,10 @@ pub use self::connector::{
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
 pub use self::early_data::EarlyDataReason;
 pub use self::ech::SslEchKeysRef;
+#[cfg(not(feature = "fips"))]
+pub use self::ech_grease::{
+    EchGreaseAead, EchGreaseParameters, EchGreaseRounding, EchGreaseSizeInfo,
+};
 pub use self::error::{Error, ErrorCode, HandshakeError};
 pub use self::quic::{QuicEncryptionLevel, QuicMethod, QuicMethodError};
 
@@ -129,6 +133,8 @@ mod connector;
 mod credential;
 mod early_data;
 mod ech;
+#[cfg(not(feature = "fips"))]
+mod ech_grease;
 mod error;
 mod mut_only;
 mod quic;
@@ -667,6 +673,20 @@ impl ExtensionType {
     #[cfg(not(feature = "fips"))]
     pub const RECORD_SIZE_LIMIT: Self = Self(ffi::TLSEXT_TYPE_record_size_limit as u16);
     pub const SERVER_PADDING: Self = Self(ffi::TLSEXT_TYPE_server_padding as u16);
+
+    /// Returns the wire extension type.
+    #[must_use]
+    pub const fn as_raw(self) -> u16 {
+        self.0
+    }
+
+    /// Whether this is an [RFC 8701] GREASE value.
+    ///
+    /// [RFC 8701]: https://www.rfc-editor.org/rfc/rfc8701.html
+    #[must_use]
+    pub const fn is_grease(self) -> bool {
+        self.0 & 0x0f0f == 0x0a0a && self.0 >> 8 == self.0 & 0xff
+    }
 }
 
 impl From<u16> for ExtensionType {
@@ -2166,7 +2186,21 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_sigalgs_enabled(self.as_ptr(), enabled as _) }
     }
 
-    /// Sets whether the context should enable record size limit.
+    /// Advertises, with the [RFC 8449] `record_size_limit` extension, the largest
+    /// protected-record plaintext this endpoint accepts. The limit applies only
+    /// when the peer negotiates the extension.
+    ///
+    /// Zero, the default, disables the extension. Other values are clamped to
+    /// 64..=16385 in TLS 1.3, where the limit counts the content type, and to
+    /// 64..=16384 in TLS 1.2 and earlier, so 16385 advertises no restriction.
+    /// GnuTLS peers reject values below 512 by default. The peer's value bounds
+    /// the records this endpoint sends. DTLS ignores the setting.
+    ///
+    /// 0-RTT records may use the protocol maximum, because they precede the
+    /// server's limit. When the client offers the extension, a server whose
+    /// limit is below the maximum declines 0-RTT.
+    ///
+    /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_record_size_limit)]
     pub fn set_record_size_limit(&mut self, limit: u16) {
@@ -3489,6 +3523,20 @@ impl SslRef {
         unsafe { ffi::SSL_set_permute_extensions(self.as_ptr(), enabled as _) }
     }
 
+    /// Sets the [RFC 8449] record size limit for this connection only.
+    ///
+    /// See [`SslContextBuilder::set_record_size_limit`]. A server may still call
+    /// this from [`SslContextBuilder::set_select_certificate_callback`]. The
+    /// servername callback is too late, and [`SslRef::set_ssl_context`] does not
+    /// change the limit.
+    ///
+    /// [RFC 8449]: https://www.rfc-editor.org/rfc/rfc8449
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_set_record_size_limit)]
+    pub fn set_record_size_limit(&mut self, limit: u16) {
+        unsafe { ffi::SSL_set_record_size_limit(self.as_ptr(), limit as _) }
+    }
+
     /// Like [`SslContextBuilder::set_alpn_protos`].
     ///
     /// [`SslContextBuilder::set_alpn_protos`]: struct.SslContextBuilder.html#method.set_alpn_protos
@@ -4494,14 +4542,15 @@ impl SslRef {
         }
     }
 
-    // Whether or not `SSL` negotiated ECH.
+    /// Whether or not `SSL` negotiated ECH.
     #[corresponds(SSL_ech_accepted)]
     #[must_use]
     pub fn ech_accepted(&self) -> bool {
         unsafe { ffi::SSL_ech_accepted(self.as_ptr()) != 0 }
     }
 
-    // Whether or not to enable ECH grease on `SSL`.
+    /// Enables ECH GREASE when no supported ECH configuration is available.
+    /// Set before the first ClientHello. This does not enable real ECH.
     #[corresponds(SSL_set_enable_ech_grease)]
     pub fn set_enable_ech_grease(&self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
@@ -4690,7 +4739,9 @@ impl SslRef {
     /// Enables ALPS (application-layer protocol settings) for the ALPN protocol `proto`, sending
     /// `settings` to the peer, or an empty value if `None`.
     ///
-    /// The peer's value is available with [`Self::peer_application_settings`].
+    /// `proto` must also be configured for ALPN. A server may instead call this from its ALPN
+    /// select callback, for the selected protocol only. The peer's value is available with
+    /// [`Self::peer_application_settings`].
     #[corresponds(SSL_add_application_settings)]
     pub fn add_application_settings(
         &mut self,
@@ -4710,7 +4761,10 @@ impl SslRef {
         }
     }
 
-    /// Sets the ALPS use new codepoint flag.
+    /// Selects the ALPS extension codepoint: `true` for the new one (17613), `false` for the old
+    /// one (17513). Defaults to the new codepoint.
+    ///
+    /// Both peers must use the same codepoint for ALPS to be negotiated.
     #[corresponds(SSL_set_alps_use_new_codepoint)]
     pub fn set_alps_use_new_codepoint(&mut self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
