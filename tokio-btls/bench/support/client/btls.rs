@@ -2,7 +2,7 @@
 
 use std::pin::Pin;
 
-use ::btls::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+use ::btls::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion, Tls13Cipher};
 use ::tokio_btls::SslStream;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -27,9 +27,7 @@ impl ClientAdapter for Adapter {
         builder.set_verify(SslVerifyMode::NONE);
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-        // Must come first: with it, "AES128" leaves TLS_AES_128_GCM_SHA256 as the only TLS 1.3 suite.
-        builder.set_preserve_tls13_cipher_list(true);
-        builder.set_cipher_list("AES128")?;
+        builder.set_tls13_ciphers(&[Tls13Cipher::AES_128_GCM_SHA256])?;
         Ok(builder.build())
     }
 

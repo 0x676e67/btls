@@ -1061,6 +1061,15 @@ impl Nid {
     pub const KX_ECDHE: Nid = Nid(ffi::NID_kx_ecdhe);
     pub const KX_PSK: Nid = Nid(ffi::NID_kx_psk);
     pub const KX_ANY: Nid = Nid(ffi::NID_kx_any);
+    pub const BRAINPOOL_P256R1: Nid = Nid(ffi::NID_brainpoolP256r1);
+    pub const BRAINPOOL_P256T1: Nid = Nid(ffi::NID_brainpoolP256t1);
+    pub const BRAINPOOL_P320R1: Nid = Nid(ffi::NID_brainpoolP320r1);
+    pub const BRAINPOOL_P320T1: Nid = Nid(ffi::NID_brainpoolP320t1);
+    pub const BRAINPOOL_P384R1: Nid = Nid(ffi::NID_brainpoolP384r1);
+    pub const BRAINPOOL_P384T1: Nid = Nid(ffi::NID_brainpoolP384t1);
+    pub const BRAINPOOL_P512R1: Nid = Nid(ffi::NID_brainpoolP512r1);
+    pub const BRAINPOOL_P512T1: Nid = Nid(ffi::NID_brainpoolP512t1);
+    pub const CHACHA20_POLY1305: Nid = Nid(ffi::NID_chacha20_poly1305);
 }
 
 #[cfg(test)]

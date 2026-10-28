@@ -1,5 +1,5 @@
 diff --git a/include/openssl/target.h b/include/openssl/target.h
-index 147ab31..bc03e54 100644
+index 2372a055d..f8790c3b2 100644
 --- a/include/openssl/target.h
 +++ b/include/openssl/target.h
 @@ -45,6 +45,9 @@

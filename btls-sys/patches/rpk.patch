@@ -13,17 +13,20 @@ The new methods match the Rust bindings present in boring <= 5:
 
 3. Add a method for fetching the peer's public key that for all
    certificate types (X.509 and RPK).
+
+Upgrade to BoringSSL 0.20260929.0: taken from cloudflare/boring's
+rebased patch.
 ---
- include/openssl/ssl.h | 55 +++++++++++++++++++++++++++++++++++++++++++
- ssl/ssl_credential.cc | 48 +++++++++++++++++++++++++++++++++++++
- ssl/ssl_lib.cc        | 30 ++++++++++++++++++++++++
- 3 files changed, 133 insertions(+)
+ include/openssl/ssl.h | 55 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ ssl/ssl_credential.cc | 48 ++++++++++++++++++++++++++++++++++++++++++++
+ ssl/ssl_lib.cc        | 31 +++++++++++++++++++++++++++++
+ 3 files changed, 134 insertions(+)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 055b3e025..9bfb82215 100644
+index a13db1400..4911149f0 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -4027,6 +4027,61 @@ OPENSSL_EXPORT int SSL_get_peer_cert_type(const SSL *ssl);
+@@ -4200,6 +4200,61 @@ OPENSSL_EXPORT int SSL_get_peer_cert_type(const SSL *ssl);
  OPENSSL_EXPORT EVP_PKEY *SSL_get0_peer_rpk(const SSL *ssl);
  
  
@@ -86,10 +89,10 @@ index 055b3e025..9bfb82215 100644
  //
  // Password Authenticated Key Exchange protocols allow client and server to
 diff --git a/ssl/ssl_credential.cc b/ssl/ssl_credential.cc
-index b1090a212..5e2b2e17a 100644
+index bf97fbe1d..921d0de3f 100644
 --- a/ssl/ssl_credential.cc
 +++ b/ssl/ssl_credential.cc
-@@ -403,6 +403,54 @@ SSL_CREDENTIAL *SSL_CREDENTIAL_new_raw_public_key_custom(
+@@ -479,6 +479,54 @@ SSL_CREDENTIAL *SSL_CREDENTIAL_new_raw_public_key_custom(
    return cred.release();
  }
  
@@ -145,10 +148,10 @@ index b1090a212..5e2b2e17a 100644
    FromOpaque(cred)->UpRefInternal();
  }
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index 07e6ff069..3d3ab28ec 100644
+index 5d233ae65..f9019300d 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -3958,3 +3958,33 @@ void SSL_set_server_padding_enabled(SSL *ssl, int enabled) {
+@@ -4169,3 +4169,34 @@ void SSL_set_server_padding_enabled(SSL *ssl, int enabled) {
  int SSL_server_sent_requested_padding(const SSL *ssl) {
    return FromOpaque(ssl)->s3->server_sent_requested_padding;
  }
@@ -167,8 +170,9 @@ index 07e6ff069..3d3ab28ec 100644
 +void SSL_CTX_get0_accepted_peer_cert_types(const SSL_CTX *ctx,
 +                                           const uint8_t **types,
 +                                           size_t *types_len) {
-+  *types = FromOpaque(ctx)->accepted_peer_cert_types.data();
-+  *types_len = FromOpaque(ctx)->accepted_peer_cert_types.size();
++  const auto *ctx_impl = FromOpaque(ctx);
++  *types = ctx_impl->accepted_peer_cert_types.data();
++  *types_len = ctx_impl->accepted_peer_cert_types.size();
 +}
 +
 +void SSL_get0_accepted_peer_cert_types(const SSL *ssl, const uint8_t **types,
@@ -182,5 +186,3 @@ index 07e6ff069..3d3ab28ec 100644
 +  *types = ssl_impl->config->accepted_peer_cert_types.data();
 +  *types_len = ssl_impl->config->accepted_peer_cert_types.size();
 +}
--- 
-2.50.1 (Apple Git-155)

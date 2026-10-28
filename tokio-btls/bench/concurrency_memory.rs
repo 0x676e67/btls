@@ -16,7 +16,10 @@ use std::{
 
 use btls::{
     pkey::PKey,
-    ssl::{Ssl, SslAcceptor, SslConnector, SslMethod, SslOptions, SslVerifyMode, SslVersion},
+    ssl::{
+        Ssl, SslAcceptor, SslConnector, SslMethod, SslOptions, SslVerifyMode, SslVersion,
+        Tls13Cipher,
+    },
     x509::X509,
 };
 use tokio::{
@@ -467,8 +470,7 @@ fn btls_connector() -> Result<SslConnector, BoxError> {
     builder.set_verify(SslVerifyMode::NONE);
     builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-    builder.set_preserve_tls13_cipher_list(true);
-    builder.set_cipher_list("AES128")?;
+    builder.set_tls13_ciphers(&[Tls13Cipher::AES_128_GCM_SHA256])?;
     Ok(builder.build())
 }
 

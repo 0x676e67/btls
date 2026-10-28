@@ -22,9 +22,10 @@ limitations under the License.
  1 file changed, 5 insertions(+)
 
 diff --git a/include/openssl/base.h b/include/openssl/base.h
+index 83cc91b72..53aa88dbd 100644
 --- a/include/openssl/base.h
 +++ b/include/openssl/base.h
-@@ -343,6 +343,11 @@
+@@ -343,6 +343,11 @@ typedef struct ssl_ech_keys_st SSL_ECH_KEYS;
  typedef struct ssl_method_st SSL_METHOD;
  typedef struct ssl_private_key_method_st SSL_PRIVATE_KEY_METHOD;
  typedef struct ssl_quic_method_st SSL_QUIC_METHOD;

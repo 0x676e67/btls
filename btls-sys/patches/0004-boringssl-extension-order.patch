@@ -17,19 +17,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ---
- include/openssl/ssl.h   |  7 +++
- ssl/extensions.cc       | 99 +++++++++++++++++++++++++++++++++++++++++
+ include/openssl/ssl.h   |  7 ++++
+ ssl/extensions.cc       | 99 +++++++++++++++++++++++++++++++++++++++++++++++++
  ssl/handshake_client.cc |  2 +-
- ssl/internal.h          |  9 ++++
- ssl/ssl_lib.cc          | 14 ++++++
- ssl/ssl_test.cc         | 49 ++++++++++++++++++++
+ ssl/internal.h          |  9 +++++
+ ssl/ssl_lib.cc          | 14 +++++++
+ ssl/ssl_test.cc         | 49 ++++++++++++++++++++++++
  6 files changed, 179 insertions(+), 1 deletion(-)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index f962a4d0b..b5c5993e7 100644
+index dc249d03e..4e25c9f09 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5593,6 +5593,13 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
+@@ -5718,6 +5718,13 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  
@@ -44,10 +44,10 @@ index f962a4d0b..b5c5993e7 100644
  // record with `ssl`.
  OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index e44af9b12..9ad7527ec 100644
+index b0d020784..1f75b8481 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
-@@ -4359,6 +4359,105 @@ static_assert(kNumExtensions <=
+@@ -4340,6 +4340,105 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
@@ -154,10 +154,10 @@ index e44af9b12..9ad7527ec 100644
    if (!hs->config->permute_extensions) {
      return true;
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index 46e16cb8b..298f04f9c 100644
+index b7e85fc9d..28a51e365 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -453,7 +453,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+@@ -418,7 +418,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
    ssl_setup_client_certificate_type(hs);
    if (!ssl_setup_pre_shared_keys(hs) ||  //
        !ssl_setup_key_shares(hs, /*override_group_id=*/0) ||
@@ -167,12 +167,12 @@ index 46e16cb8b..298f04f9c 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index bb7cdfeca..506775b90 100644
+index 4b7a7a168..39c07d807 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -2242,6 +2242,11 @@ bool tls13_process_new_session_ticket(SSLImpl *ssl, const SSLMessage &msg);
- UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSLImpl *ssl,
-                                                         CBS *body);
+@@ -2276,6 +2276,11 @@ bool tls13_add_finished(SSL_HANDSHAKE *hs);
+ bool tls13_process_new_session_ticket(SSLImpl *ssl, const SSLMessage &msg);
+ UniquePtr<SSLSession> tls13_create_session_with_ticket(SSLImpl *ssl, CBS *body);
  
 +// ssl_setup_extension_order builds the configured extension prefix and
 +// shuffles the remaining extensions. With no configured order, it uses the
@@ -182,7 +182,7 @@ index bb7cdfeca..506775b90 100644
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -4239,6 +4244,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4301,6 +4306,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // signal its sessions may be resumed across names in the server certificate.
    bool resumption_across_names_enabled : 1;
  
@@ -194,10 +194,10 @@ index bb7cdfeca..506775b90 100644
    friend RefCounted;
    ~SSLContext();
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index d78bd4dda..7a1a0cf2d 100644
+index 5d233ae65..62b9cb162 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -3292,6 +3292,20 @@ void SSL_set_permute_extensions(SSL *ssl, int enabled) {
+@@ -3343,6 +3343,20 @@ void SSL_set_permute_extensions(SSL *ssl, int enabled) {
    ssl_impl->config->permute_extensions = !!enabled;
  }
  
@@ -219,10 +219,10 @@ index d78bd4dda..7a1a0cf2d 100644
    return FromOpaque(ssl)->s3->ticket_age_skew;
  }
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
-index dd350d6b5..7f35da040 100644
+index 67a48e9e3..e0548aed3 100644
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
-@@ -10201,6 +10201,55 @@ TEST(SSLTest, PermuteExtensions) {
+@@ -10413,6 +10413,55 @@ TEST(SSLTest, PermuteExtensions) {
    }
  }
  

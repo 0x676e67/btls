@@ -16,10 +16,15 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Upgrade to BoringSSL 0.20260929.0: upstream's InvalidSignatureAlgorithm
+test now also expects SSL_R_DUPLICATE_SIGNATURE_ALGORITHM through
+ErrorsAreAndClear; those checks are dropped because duplicates are
+accepted.
 ---
  ssl/ssl_privkey.cc | 21 +++------------------
- ssl/ssl_test.cc    | 19 +++++++++++++------
- 2 files changed, 16 insertions(+), 24 deletions(-)
+ ssl/ssl_test.cc    | 23 +++++++++++++----------
+ 2 files changed, 16 insertions(+), 28 deletions(-)
 
 diff --git a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
 index 2e04fa4a5..af40dd514 100644
@@ -54,10 +59,10 @@ index 2e04fa4a5..af40dd514 100644
  }
  
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
-index 7f35da040..4d0f3252c 100644
+index 97fe4f54d..aee4cd7b9 100644
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
-@@ -7063,7 +7063,9 @@ TEST(SSLTest, SigAlgs) {
+@@ -7397,7 +7397,9 @@ TEST(SSLTest, SigAlgs) {
        {{1}, false, {}},
        {{1, 2, 3}, false, {}},
        {{NID_sha256, EVP_PKEY_ED25519}, false, {}},
@@ -68,7 +73,7 @@ index 7f35da040..4d0f3252c 100644
        {{NID_sha256, EVP_PKEY_ML_DSA_44}, false, {}},
  
        {{NID_sha256, EVP_PKEY_RSA}, true, {SSL_SIGN_RSA_PKCS1_SHA256}},
-@@ -7118,8 +7120,13 @@ TEST(SSLTest, SigAlgsList) {
+@@ -7452,8 +7454,13 @@ TEST(SSLTest, SigAlgsList) {
        {":RSA+SHA256+:", false, {}},
        {"!", false, {}},
        {"\x01", false, {}},
@@ -84,15 +89,19 @@ index 7f35da040..4d0f3252c 100644
  
        {"RSA+SHA256", true, {SSL_SIGN_RSA_PKCS1_SHA256}},
        {"RSA+SHA256:ed25519",
-@@ -10951,10 +10958,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
+@@ -11293,14 +11300,10 @@ TEST(SSLTest, InvalidSignatureAlgorithm) {
  
    static const uint16_t kDuplicatePrefs[] = {SSL_SIGN_RSA_PKCS1_SHA256,
                                               SSL_SIGN_RSA_PKCS1_SHA256};
 -  EXPECT_FALSE(SSL_CTX_set_signing_algorithm_prefs(ctx.get(), kDuplicatePrefs,
 -                                                   std::size(kDuplicatePrefs)));
+-  EXPECT_TRUE(
+-      ErrorsAreAndClear({{ERR_LIB_SSL, SSL_R_DUPLICATE_SIGNATURE_ALGORITHM}}));
 -  EXPECT_FALSE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
 +  EXPECT_TRUE(SSL_CTX_set_signing_algorithm_prefs(ctx.get(), kDuplicatePrefs,
                                                    std::size(kDuplicatePrefs)));
+-  EXPECT_TRUE(
+-      ErrorsAreAndClear({{ERR_LIB_SSL, SSL_R_DUPLICATE_SIGNATURE_ALGORITHM}}));
 +  EXPECT_TRUE(SSL_CTX_set_verify_algorithm_prefs(ctx.get(), kDuplicatePrefs,
 +                                                 std::size(kDuplicatePrefs)));
  }

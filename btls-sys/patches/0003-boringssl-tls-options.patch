@@ -23,10 +23,10 @@ limitations under the License.
  3 files changed, 23 insertions(+), 4 deletions(-)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index c7c596ddf..f962a4d0b 100644
+index bcd735e6a..dc249d03e 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -631,6 +631,12 @@ OPENSSL_EXPORT int SSL_version(const SSL *ssl);
+@@ -655,6 +655,12 @@ OPENSSL_EXPORT int SSL_version(const SSL *ssl);
  #define SSL_OP_NO_DTLSv1 SSL_OP_NO_TLSv1
  #define SSL_OP_NO_DTLSv1_2 SSL_OP_NO_TLSv1_2
  
@@ -39,7 +39,7 @@ index c7c596ddf..f962a4d0b 100644
  // SSL_CTX_set_options enables all options set in `options` (which should be one
  // or more of the `SSL_OP_*` values, ORed together) in `ctx`. It returns a
  // bitmask representing the resulting enabled options.
-@@ -5964,7 +5970,7 @@ DEFINE_STACK_OF(SSL_COMP)
+@@ -6092,7 +6098,7 @@ DEFINE_STACK_OF(SSL_COMP)
  #define SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG 0
  #define SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG 0
  #define SSL_OP_NO_COMPRESSION 0
@@ -49,7 +49,7 @@ index c7c596ddf..f962a4d0b 100644
  #define SSL_OP_NO_SSLv2 0
  #define SSL_OP_NO_SSLv3 0
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 56de76e37..e44af9b12 100644
+index 2677314d0..b0d020784 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -706,7 +706,8 @@ static bool ext_ri_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
@@ -75,7 +75,7 @@ index 56de76e37..e44af9b12 100644
           type != ssl_client_hello_outer;
  }
  
-@@ -2269,7 +2274,8 @@ bool ssl_ext_pre_shared_key_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+@@ -2250,7 +2255,8 @@ bool ssl_ext_pre_shared_key_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
  static bool ext_psk_key_exchange_modes_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -86,10 +86,10 @@ index 56de76e37..e44af9b12 100644
    }
    // We do not support resumption with PAKEs, so do not offer any PSK key
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index 3b95a869c..46e16cb8b 100644
+index 1112fa5ec..b7e85fc9d 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -290,6 +290,13 @@ static ssl_early_data_reason_t should_offer_early_data(
+@@ -255,6 +255,13 @@ static ssl_early_data_reason_t should_offer_early_data(
      return ssl_early_data_protocol_version;
    }
  

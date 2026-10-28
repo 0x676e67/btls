@@ -16,14 +16,21 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Upgrade to BoringSSL 0.20260929.0: upstream removed CRYPTO_IOVEC_MAX
+(19c562ed7e), and EVP_AEAD_CTX_sealv now takes any number of entries.
+kSealMaxIovecs keeps the former 16-entry budget for the stack iovec
+arrays that build each sealed record. The seal tests pick TLS 1.3 suites
+with SSL_CTX_set1_tls13_ciphers, since upstream removed
+SSL_CTX_set_aes_hw_override_for_testing (c5cbc0f91).
 ---
  include/openssl/ssl.h    |  62 ++++
- ssl/internal.h           |  84 +++++
+ ssl/internal.h           |  89 ++++++
  ssl/s3_pkt.cc            | 148 ++++++++-
  ssl/ssl_aead_ctx.cc      |  84 +++--
  ssl/ssl_internal_test.cc | 253 +++++++++++++++
  ssl/ssl_lib.cc           |  24 ++
- ssl/ssl_test.cc          | 818 +++++++++++++++++++++++++++++++++++++++++++++++
+ ssl/ssl_test.cc          | 813 +++++++++++++++++++++++++++++++++++++++++++++++
  ssl/test/bssl_shim.cc    |  81 +++++
  ssl/test/test_config.cc  |   1 +
  ssl/test/test_config.h   |   1 +
@@ -31,10 +38,11 @@ limitations under the License.
  11 files changed, 1713 insertions(+), 32 deletions(-)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 3a0cabd3f..437083604 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -306,6 +306,68 @@ OPENSSL_EXPORT int SSL_has_pending(const SSL *ssl);
- // https://crbug.com/466303.
+@@ -330,6 +330,68 @@ OPENSSL_EXPORT int SSL_has_pending(const SSL *ssl);
+ // `SSL3_RT_MAX_PLAIN_LENGTH`.
  OPENSSL_EXPORT int SSL_write(SSL *ssl, const void *buf, int num);
  
 +// Sealing application data into caller memory.
@@ -103,16 +111,17 @@ diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
  // message with its own, thus updating traffic secrets for both directions on
  // the connection.
 diff --git a/ssl/internal.h b/ssl/internal.h
+index 8f85d70f8..61f57f57f 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -567,6 +567,15 @@ class SSLAEADContext {
+@@ -595,6 +595,15 @@ class SSLAEADContext {
                     Span<const uint8_t> header, const uint8_t *in, size_t in_len,
                     const uint8_t *extra_in, size_t extra_in_len);
  
 +  // SealScatterv is `SealScatter` with the record body given as `body`. The
 +  // entries' `out` ranges tile one contiguous region in order. Each entry's
 +  // `in` equals its `out` or overlaps no output. `body.size()`, plus one if
-+  // `extra_in_len` is non-zero, is at most `CRYPTO_IOVEC_MAX`.
++  // `extra_in_len` is non-zero, is at most `kSealMaxIovecs`.
 +  bool SealScatterv(uint8_t *out_prefix, Span<const CRYPTO_IOVEC> body,
 +                    uint8_t *out_suffix, uint8_t type, uint16_t record_version,
 +                    uint64_t seqnum, Span<const uint8_t> header,
@@ -121,7 +130,7 @@ diff --git a/ssl/internal.h b/ssl/internal.h
    bool GetIV(const uint8_t **out_iv, size_t *out_iv_len) const;
  
   private:
-@@ -3814,6 +3823,81 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
+@@ -3893,6 +3902,86 @@ ssl_open_record_t tls_open_change_cipher_spec(SSLImpl *ssl,
  int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
                         size_t *out_bytes_written, Span<const uint8_t> in);
  
@@ -179,6 +188,11 @@ diff --git a/ssl/internal.h b/ssl/internal.h
 +// better.
 +inline constexpr size_t kSealGatherMin = 4096;
 +
++// kSealMaxIovecs bounds the stack iovec arrays that `SealScatterv` and
++// `tls_seal_app_data_record` build. It keeps the 16-entry budget of the removed
++// `CRYPTO_IOVEC_MAX`.
++inline constexpr size_t kSealMaxIovecs = 16;
++
 +// tls_plan_seal_body lays out the next record body of at most `want` bytes at
 +// `body` and writes its pieces to `out_iovecs`, at most `budget` of them, in
 +// order. Pieces it does not gather are copied to `body`. On failure it zeroes
@@ -204,6 +218,7 @@ diff --git a/ssl/internal.h b/ssl/internal.h
  void tls_free(SSLImpl *ssl);
  
 diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
+index 8b4043b7b..1a6a3556d 100644
 --- a/ssl/s3_pkt.cc
 +++ b/ssl/s3_pkt.cc
 @@ -64,7 +64,7 @@ int tls_write_app_data(SSLImpl *ssl, bool *out_needs_handshake,
@@ -369,6 +384,7 @@ diff --git a/ssl/s3_pkt.cc b/ssl/s3_pkt.cc
  // of the bulk of the ciphertext when sealing a record with `ssl`. Callers may
  // use this to align buffers.
 diff --git a/ssl/ssl_aead_ctx.cc b/ssl/ssl_aead_ctx.cc
+index cca550edf..f8e9957a9 100644
 --- a/ssl/ssl_aead_ctx.cc
 +++ b/ssl/ssl_aead_ctx.cc
 @@ -296,28 +296,45 @@ bool SSLAEADContext::Open(Span<uint8_t> *out, uint8_t type,
@@ -388,7 +404,7 @@ diff --git a/ssl/ssl_aead_ctx.cc b/ssl/ssl_aead_ctx.cc
 +                                  Span<const uint8_t> header,
 +                                  const uint8_t *extra_in,
 +                                  size_t extra_in_len) {
-+  if (body.size() + (extra_in_len != 0 ? 1 : 0) > CRYPTO_IOVEC_MAX) {
++  if (body.size() + (extra_in_len != 0 ? 1 : 0) > kSealMaxIovecs) {
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
 +    return false;
 +  }
@@ -453,7 +469,7 @@ diff --git a/ssl/ssl_aead_ctx.cc b/ssl/ssl_aead_ctx.cc
 -  return result;
 +  // This is `EVP_AEAD_CTX_seal_scatter` with the body split into entries:
 +  // `extra_in` is encrypted to the start of the suffix and the tag follows.
-+  CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++  CRYPTO_IOVEC iovecs[kSealMaxIovecs];
 +  size_t num_iovecs = 0;
 +  for (const CRYPTO_IOVEC &v : body) {
 +    iovecs[num_iovecs++] = v;
@@ -487,6 +503,7 @@ diff --git a/ssl/ssl_aead_ctx.cc b/ssl/ssl_aead_ctx.cc
  
  bool SSLAEADContext::Seal(uint8_t *out, size_t *out_len, size_t max_out_len,
 diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
+index 102afb5bf..c56d86de0 100644
 --- a/ssl/ssl_internal_test.cc
 +++ b/ssl/ssl_internal_test.cc
 @@ -12,9 +12,15 @@
@@ -505,8 +522,8 @@ diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
  #include <openssl/ssl.h>
  
  #include "../crypto/test/test_util.h"
-@@ -612,6 +618,253 @@ TEST(SSLTest, ECHPublicName) {
-   EXPECT_FALSE(ssl_is_valid_ech_public_name(StringAsBytes("0X01.")));
+@@ -726,6 +732,253 @@ TEST(SSLTest, TrustAnchorIDPattern) {
+   }
  }
  
 +TEST(SealPlanTest, Properties) {
@@ -567,7 +584,7 @@ diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
 +      ASSERT_EQ(input.Available(want), expected_len);
 +      ASSERT_EQ(input.Available(1), std::min(size_t{1}, expected_len));
 +
-+      CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++      CRYPTO_IOVEC iovecs[kSealMaxIovecs];
 +      size_t num, len;
 +      ASSERT_TRUE(tls_plan_seal_body(&input, want, body.data(), budget, iovecs,
 +                                     &num, &len));
@@ -596,7 +613,7 @@ diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
 +      offset += len;
 +    }
 +    if (offset == n) {
-+      CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++      CRYPTO_IOVEC iovecs[kSealMaxIovecs];
 +      size_t num, len;
 +      ASSERT_TRUE(tls_plan_seal_body(&input, want, body.data(), budget, iovecs,
 +                                     &num, &len));
@@ -618,10 +635,10 @@ diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
 +    SCOPED_TRACE(reason);
 +    OPENSSL_memset(body.data(), 0xaa, body.size());
 +    SealInput input(slices, SIZE_MAX, body);
-+    CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++    CRYPTO_IOVEC iovecs[kSealMaxIovecs];
 +    size_t num, len;
 +    EXPECT_FALSE(tls_plan_seal_body(&input, body.size(), body.data(),
-+                                    CRYPTO_IOVEC_MAX, iovecs, &num, &len));
++                                    kSealMaxIovecs, iovecs, &num, &len));
 +    EXPECT_TRUE(ErrorEquals(ERR_get_error(), ERR_LIB_SSL, reason));
 +    std::vector<uint8_t> expected(body.size(), 0xaa);
 +    OPENSSL_memset(expected.data(), 0, sizeof(data));
@@ -742,10 +759,10 @@ diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
 +      }
 +    }
 +
-+    // One entry more than `CRYPTO_IOVEC_MAX` allows is rejected.
++    // One entry more than `kSealMaxIovecs` allows is rejected.
 +    std::vector<uint8_t> out(record_len);
 +    std::vector<CRYPTO_IOVEC> too_many;
-+    for (size_t i = 0; i < CRYPTO_IOVEC_MAX + 1 - extra_in_len; i++) {
++    for (size_t i = 0; i < kSealMaxIovecs + 1 - extra_in_len; i++) {
 +      too_many.push_back({out.data() + prefix_len + i, plaintext.data() + i, 1});
 +    }
 +    EXPECT_FALSE(gathered->SealScatterv(
@@ -760,9 +777,10 @@ diff --git a/ssl/ssl_internal_test.cc b/ssl/ssl_internal_test.cc
  BSSL_NAMESPACE_END
  #endif  // !BORINGSSL_SHARED_LIBRARY
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 79ee77402..399c2a3b9 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -1022,6 +1022,30 @@ int SSL_write(SSL *ssl, const void *buf, int num) {
+@@ -1001,6 +1001,30 @@ int SSL_write(SSL *ssl, const void *buf, int num) {
    return ret <= 0 ? ret : static_cast<int>(bytes_written);
  }
  
@@ -794,24 +812,23 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
    auto *ssl_impl = FromOpaque(ssl);
    ssl_reset_error_state(ssl_impl);
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index aee4cd7b9..6c3e42ab5 100644
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
-@@ -5275,6 +5275,800 @@ TEST_P(SSLVersionTest, SSLWriteRetry) {
+@@ -5391,6 +5391,795 @@ TEST_P(SSLVersionTest, SSLWriteRetry) {
    }
  }
  
 +// SealCipher is a cipher suite `SSL_seal_app_data` is tested with. TLS 1.3
-+// suites are selected through the server's AES hardware override and policy.
++// suites are selected through the server's TLS 1.3 cipher list.
 +struct SealCipher {
 +  uint16_t id;
-+  bool aes_hw = true;
-+  bool cnsa = false;
 +};
 +
 +static const SealCipher kSealCiphers[] = {
 +    {SSL_CIPHER_AES_128_GCM_SHA256},
-+    {SSL_CIPHER_AES_256_GCM_SHA384, /*aes_hw=*/true, /*cnsa=*/true},
-+    {SSL_CIPHER_CHACHA20_POLY1305_SHA256, /*aes_hw=*/false},
++    {SSL_CIPHER_AES_256_GCM_SHA384},
++    {SSL_CIPHER_CHACHA20_POLY1305_SHA256},
 +    {SSL_CIPHER_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
 +    {SSL_CIPHER_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
 +    {SSL_CIPHER_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256},
@@ -830,10 +847,7 @@ diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
 +static bool ConfigureSealCipher(SSL_CTX *client_ctx, SSL_CTX *server_ctx,
 +                                const SealCipher &cipher, uint16_t version) {
 +  if (version >= TLS1_3_VERSION) {
-+    SSL_CTX_set_aes_hw_override_for_testing(server_ctx, cipher.aes_hw);
-+    return !cipher.cnsa ||
-+           SSL_CTX_set_compliance_policy(server_ctx,
-+                                         ssl_compliance_policy_cnsa_202407);
++    return SSL_CTX_set1_tls13_ciphers(server_ctx, &cipher.id, nullptr, 1);
 +  }
 +  const char *name =
 +      SSL_CIPHER_standard_name(SSL_get_cipher_by_value(cipher.id));
@@ -1597,7 +1611,7 @@ diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
  TEST_P(SSLVersionTest, RecordCallback) {
    if (version() == DTLS1_3_VERSION) {
      // The DTLS 1.3 record header is vastly different than the TLS or DTLS < 1.3
-@@ -8156,6 +8950,30 @@ TEST_F(QUICMethodTest, Basic) {
+@@ -8494,6 +9283,30 @@ TEST_F(QUICMethodTest, Basic) {
    EXPECT_TRUE(SSL_session_reused(server_.get()));
  }
  
@@ -1629,6 +1643,7 @@ diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
  TEST_F(QUICMethodTest, HelloRetryRequest) {
    const SSL_QUIC_METHOD quic_method = DefaultQUICMethod();
 diff --git a/ssl/test/bssl_shim.cc b/ssl/test/bssl_shim.cc
+index 36bec7595..6c813d455 100644
 --- a/ssl/test/bssl_shim.cc
 +++ b/ssl/test/bssl_shim.cc
 @@ -253,6 +253,84 @@ static int DoRead(SSL *ssl, uint8_t *out, size_t max_out) {
@@ -1727,9 +1742,10 @@ diff --git a/ssl/test/bssl_shim.cc b/ssl/test/bssl_shim.cc
    do {
      ret = SSL_write(ssl, in, in_len);
 diff --git a/ssl/test/test_config.cc b/ssl/test/test_config.cc
+index 354501a10..bd547a8a5 100644
 --- a/ssl/test/test_config.cc
 +++ b/ssl/test/test_config.cc
-@@ -381,6 +381,7 @@ const Flag<TestConfig> *FindFlag(const char *name) {
+@@ -386,6 +386,7 @@ const Flag<TestConfig> *FindFlag(const char *name) {
                   &TestConfig::write_different_record_sizes),
          BoolFlag("-cbc-record-splitting", &TestConfig::cbc_record_splitting),
          BoolFlag("-partial-write", &TestConfig::partial_write),
@@ -1738,9 +1754,10 @@ diff --git a/ssl/test/test_config.cc b/ssl/test/test_config.cc
          BoolFlag("-no-tls12", &TestConfig::no_tls12),
          BoolFlag("-no-tls11", &TestConfig::no_tls11),
 diff --git a/ssl/test/test_config.h b/ssl/test/test_config.h
+index 795249b87..e854e7c56 100644
 --- a/ssl/test/test_config.h
 +++ b/ssl/test/test_config.h
-@@ -101,6 +101,7 @@ struct TestConfig {
+@@ -106,6 +106,7 @@ struct TestConfig {
    bool write_different_record_sizes = false;
    bool cbc_record_splitting = false;
    bool partial_write = false;
@@ -1749,6 +1766,7 @@ diff --git a/ssl/test/test_config.h b/ssl/test/test_config.h
    bool no_tls12 = false;
    bool no_tls11 = false;
 diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
+index 2c0da1147..30826128f 100644
 --- a/ssl/tls_record.cc
 +++ b/ssl/tls_record.cc
 @@ -271,9 +271,14 @@ ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
@@ -1847,7 +1865,7 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
 +  if ((cipher->algorithm_enc & (SSL_AES128GCM | SSL_AES256GCM)) == 0) {
 +    return 1;
 +  }
-+  return size_t{CRYPTO_IOVEC_MAX} -
++  return kSealMaxIovecs -
 +         (ssl_protocol_version(ssl) >= TLS1_3_VERSION ? 1 : 0);
 +}
 +
@@ -1949,7 +1967,7 @@ diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
 +    return false;
 +  }
 +  uint8_t *body = out.data() + prefix_len;
-+  CRYPTO_IOVEC iovecs[CRYPTO_IOVEC_MAX];
++  CRYPTO_IOVEC iovecs[kSealMaxIovecs];
 +  size_t num, body_len;
 +  if (!tls_plan_seal_body(input, want, body, budget, iovecs, &num,
 +                          &body_len)) {

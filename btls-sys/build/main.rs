@@ -516,8 +516,8 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
 
     if config.features.allow_crl_extensions_bad_version {
         println!(
-            "cargo:warning=applying the patch for disabling cert version \
-            validation for extensions"
+            "cargo:warning=applying the patch for disabling certificate and \
+            CRL version validation for extensions"
         );
         apply_patch(config, "bad-cert-verification.patch")?;
     }
@@ -538,7 +538,7 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
             "0004-boringssl-extension-order.patch",
             "0005-record-size-limit.patch",
             "0006-delegated-credentials.patch",
-            "0007-boringssl-cipher-preferences.patch",
+            "0007-boringssl-f5-padding.patch",
             "0008-boringssl-sigalgs.patch",
             "0009-boringssl-zstd-cert-compression.patch",
             "0010-boringssl-build-compat.patch",
@@ -887,6 +887,10 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         // Rust 1.99 flags such declarations of runtime symbols
         // (`suspicious_runtime_symbol_definitions`). Use `libc` for these.
         .blocklist_function("malloc|calloc|realloc|free")
+        // Only BoringSSL's own declarations, not transitive system headers. Match any
+        // `openssl/` directory, as `BORING_BSSL_INCLUDE_PATH` need not end in `include`.
+        .allowlist_file(r".*[/\\]openssl[/\\].*")
+        .opaque_type("FILE")
         .clang_args(get_extra_clang_args_for_bindgen(config))
         .clang_arg("-I")
         .clang_arg(include_path.display().to_string());
