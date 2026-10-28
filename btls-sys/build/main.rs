@@ -542,9 +542,9 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
             "0008-boringssl-sigalgs.patch",
             "0009-boringssl-zstd-cert-compression.patch",
             "0010-boringssl-build-compat.patch",
-            "0012-boringssl-seal-app-data.patch",
-            "0013-boringssl-cheap-error-reset.patch",
-            "0014-ech-grease-payload-policy.patch",
+            "0011-boringssl-seal-app-data.patch",
+            "0012-boringssl-cheap-error-reset.patch",
+            "0013-ech-grease-payload-policy.patch",
         ] {
             println!("cargo:warning=applying {patch_name} to boringssl");
             apply_patch(config, patch_name)?;

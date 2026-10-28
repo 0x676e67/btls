@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: gngpp <gngppz@gmail.com>
 Date: Thu, 1 Oct 2026 00:00:00 +0800
-Subject: [PATCH 13/13] boringssl: skip clearing an empty error queue
+Subject: [PATCH 12/13] boringssl: skip clearing an empty error queue
 
 Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
 

@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: gngpp <gngppz@gmail.com>
 Date: Wed, 28 Oct 2026 00:00:00 +0800
-Subject: [PATCH 07/14] boringssl: restore the F5 ClientHello padding
+Subject: [PATCH 07/13] boringssl: restore the F5 ClientHello padding
 
 Reverts upstream eae46df1e ("Remove the old F5 padding workaround"), first
 released in 0.20260903.0. Upstream dropped it because X25519MLKEM768 makes
 every default ClientHello larger than 512 bytes. Emulated profiles without
 ML-KEM still produce 256 to 511 byte ClientHellos, which BoringSSL padded to
 512 bytes (RFC 7685) until then. Keep that wire image and the F5 workaround.
-0014-ech-grease-payload-policy.patch builds on the restored code.
+0013-ech-grease-payload-policy.patch builds on the restored code.
 ---
  ssl/extensions.cc                  |  79 ++++++++++++++++++++---
  ssl/ssl_test.cc                    | 126 +++++++++++++++++++++++++++++++++++++

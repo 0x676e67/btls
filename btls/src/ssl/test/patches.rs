@@ -1033,7 +1033,7 @@ fn seal_app_data_round_trip() {
 
 #[test]
 fn seal_app_data_honors_peer_record_size_limit() {
-    // 0012 seals records itself, so it must take the fragment that 0005 derives
+    // 0011 seals records itself, so it must take the fragment that 0005 derives
     // from the peer's record_size_limit. The TLS 1.3 limit counts the content type.
     let data = payload(5000, 3);
     for (version, fragment) in [(SslVersion::TLS1_2, 1000), (SslVersion::TLS1_3, 999)] {
