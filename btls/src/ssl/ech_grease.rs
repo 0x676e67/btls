@@ -164,11 +164,14 @@ impl EchGreaseSizeInfo<'_> {
         self.0.is_quic != 0
     }
 
-    /// BoringSSL's [default draw] advertising `aead`: a payload of 128 to 224
-    /// bytes in steps of 32, chosen uniformly, plus the tag, and an X25519 `enc`.
-    /// Pass [`default_aead`](Self::default_aead) to follow the AES hardware as
-    /// BoringSSL does, or a fixed AEAD to keep the extension the same on every host.
-    /// Fails if the length exceeds [`max_payload_length`](Self::max_payload_length).
+    /// Parameters drawn as BoringSSL does without a callback, advertising `aead`.
+    ///
+    /// The payload is 128, 160, 192 or 224 bytes plus the AEAD tag, chosen
+    /// uniformly, and `enc` is an X25519 public key. Pass
+    /// [`default_aead`](Self::default_aead) to keep BoringSSL's choice, which
+    /// depends on AES hardware, or a fixed AEAD to advertise the same one on
+    /// every host. Fails if the length exceeds
+    /// [`max_payload_length`](Self::max_payload_length).
     ///
     /// ```
     /// use btls::ssl::{EchGreaseAead, SslConnector, SslMethod};
@@ -180,8 +183,6 @@ impl EchGreaseSizeInfo<'_> {
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// [default draw]: https://github.com/google/boringssl/blob/427ec40cc8edc545253289232e885708c409e5ea/ssl/encrypted_client_hello.cc#L770-L771
     pub fn boringssl_parameters(
         &self,
         aead: EchGreaseAead,
