@@ -1332,8 +1332,26 @@ fn test_get_ciphers() {
     }
 }
 
+/// Whether BoringSSL sees AES hardware. CI masks AES-NI with `OPENSSL_ia32cap`
+/// and sets `BTLS_TEST_NO_AES` to also cover the defaults chosen without it.
+fn has_aes_hardware() -> bool {
+    // SAFETY: `EVP_has_aes_hardware` only reads CPU capabilities.
+    let has_aes = unsafe { crate::ffi::EVP_has_aes_hardware() } == 1;
+    assert!(
+        !(has_aes && std::env::var_os("BTLS_TEST_NO_AES").is_some()),
+        "OPENSSL_ia32cap did not mask AES hardware"
+    );
+    has_aes
+}
+
 #[test]
 fn set_tls13_ciphers_orders_offer_and_selection() {
+    // BoringSSL's default client order depends on AES hardware.
+    let default_order = if has_aes_hardware() {
+        vec![0x1301, 0x1302, 0x1303]
+    } else {
+        vec![0x1303, 0x1301, 0x1302]
+    };
     let offered = Arc::new(Mutex::new(Vec::new()));
     let tls13_offer = |hello: &ssl::ClientHello<'_>| {
         hello
@@ -1345,7 +1363,7 @@ fn set_tls13_ciphers_orders_offer_and_selection() {
     };
 
     let mut server = Server::builder();
-    server.expected_connections_count(2);
+    server.expected_connections_count(3);
     // Never first in BoringSSL's default server order, with or without AES hardware.
     server
         .ctx()
@@ -1392,9 +1410,18 @@ fn set_tls13_ciphers_orders_offer_and_selection() {
         .unwrap();
     connection.connect();
 
+    // An empty list restores BoringSSL's default, not the context's list.
+    let mut connection = client.builder();
+    connection.ssl().set_tls13_ciphers(&[]).unwrap();
+    connection.connect();
+
     assert_eq!(
         *offered.lock().unwrap(),
-        [vec![0x1301, 0x1303, 0x1302], vec![0x1303, 0x1302]]
+        [
+            vec![0x1301, 0x1303, 0x1302],
+            vec![0x1303, 0x1302],
+            default_order
+        ]
     );
     // Only TLS 1.3 suites are accepted.
     let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();

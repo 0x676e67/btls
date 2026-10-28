@@ -306,8 +306,7 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
         let len = usize::from(u16::from_be_bytes([hello[offset], hello[offset + 1]]));
         hello[offset + 2..offset + 2 + len].to_vec()
     };
-    // SAFETY: `EVP_has_aes_hardware` only reads CPU capabilities.
-    let default_aead = if unsafe { ffi::EVP_has_aes_hardware() } == 1 {
+    let default_aead = if super::has_aes_hardware() {
         EchGreaseAead::AES_128_GCM
     } else {
         EchGreaseAead::CHACHA20_POLY1305

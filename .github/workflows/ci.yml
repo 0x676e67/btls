@@ -535,6 +535,13 @@ jobs:
         run: cargo test -p btls-sys --features allow-crl-extensions-bad-version
       - name: Run `mldsa` tests
         run: cargo test -p btls --features mldsa
+      # BoringSSL's TLS 1.3 and ECH GREASE defaults depend on AES hardware.
+      # Masking AES-NI (CPUID.1:ECX bit 25) covers the ChaCha20-first defaults.
+      - name: Run library tests without AES hardware
+        env:
+          OPENSSL_ia32cap: "~0x200000000000000"
+          BTLS_TEST_NO_AES: "1"
+        run: cargo test -p btls --lib --features mldsa
       - name: Run `relax-cert-validation` tests
         run: cargo test -p btls --features relax-cert-validation
       - name: Check `fips` and `prefix-symbols` are rejected
