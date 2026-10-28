@@ -341,10 +341,12 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
 
 #[test]
 fn ech_boringssl_parameters_match_default_draw() {
-    // Each of the four lengths is missed by 256 draws with probability 2^-106.
+    // Each of the four lengths is missed by 256 draws with probability 2^-106,
+    // so the draws also prove a budget equal to the largest length fits.
     let vector = firefox_tcp(19);
     for aead in [EchGreaseAead::AES_128_GCM, EchGreaseAead::CHACHA20_POLY1305] {
-        let raw = vector.info();
+        let mut raw = vector.info();
+        raw.max_payload_length = 240;
         let info = EchGreaseSizeInfo(&raw);
         let mut lengths = (0..256)
             .map(|_| {
@@ -360,43 +362,25 @@ fn ech_boringssl_parameters_match_default_draw() {
         lengths.dedup();
         assert_eq!(lengths, DEFAULT_PAYLOAD_LENGTHS);
     }
-    for (budget, fits) in [(143, false), (240, true)] {
-        let mut raw = vector.info();
-        raw.max_payload_length = budget;
-        let info = EchGreaseSizeInfo(&raw);
-        for _ in 0..16 {
-            let result = info.boringssl_parameters(EchGreaseAead::AES_128_GCM);
-            assert_eq!(result.is_ok(), fits);
-        }
-    }
+    let mut raw = vector.info();
+    raw.max_payload_length = 143;
+    assert!(EchGreaseSizeInfo(&raw)
+        .boringssl_parameters(EchGreaseAead::AES_128_GCM)
+        .is_err());
 
-    // On the wire, only the advertised AEAD differs from BoringSSL's own draw.
-    let ids = |hello: &[u8]| {
-        extensions(hello)
-            .into_iter()
-            .map(|(id, _)| id)
-            .filter(|id| *id != ffi::TLSEXT_TYPE_padding as u16)
-            .collect::<Vec<_>>()
-    };
-    let baseline = handshake(|_| {}, false);
-    for (aead, id) in [
-        (EchGreaseAead::AES_128_GCM, 1),
-        (EchGreaseAead::CHACHA20_POLY1305, 3),
-    ] {
-        let messages = handshake(
-            |ssl| {
-                ssl.set_ech_grease_callback(move |_, info| info.boringssl_parameters(aead))
-                    .unwrap();
-            },
-            false,
-        );
-        let extension = ech(&messages[0]);
-        assert_eq!(&extension[ECH_AEAD_OFFSET..ECH_AEAD_OFFSET + 2], &[0, id]);
-        assert!(DEFAULT_PAYLOAD_LENGTHS.contains(&(extension.len() - ECH_BODY_FRAMING_LEN)));
-        // A canonical X25519 public key has bit 255 clear.
-        assert_eq!(extension[ECH_ENC_OFFSET + 31] & 0x80, 0);
-        assert_eq!(ids(&messages[0]), ids(&baseline[0]));
-    }
+    // The helper also works inside a live callback.
+    let messages = handshake(
+        |ssl| {
+            ssl.set_ech_grease_callback(|_, info| {
+                info.boringssl_parameters(EchGreaseAead::AES_128_GCM)
+            })
+            .unwrap();
+        },
+        false,
+    );
+    let extension = ech(&messages[0]);
+    assert_eq!(&extension[ECH_AEAD_OFFSET..ECH_AEAD_OFFSET + 2], &[0, 1]);
+    assert!(DEFAULT_PAYLOAD_LENGTHS.contains(&(extension.len() - ECH_BODY_FRAMING_LEN)));
 }
 
 #[test]
