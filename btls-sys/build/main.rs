@@ -552,6 +552,10 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         }
     }
 
+    // FIPS builds compile the same module source, so they need this fix too.
+    println!("cargo:warning=applying rand double-free fix to boringssl");
+    apply_patch(config, "boringssl-rand-double-free.patch")?;
+
     // Only the symbol audit reads this tool, and only a prefixed build runs it.
     if config.features.prefix_symbols {
         println!("cargo:warning=applying symbol audit patch to boringssl");

@@ -439,6 +439,7 @@ jobs:
           0012-boringssl-seal-app-data.patch \
           0013-boringssl-cheap-error-reset.patch \
           0014-ech-grease-payload-policy.patch \
+          boringssl-rand-double-free.patch \
           boringssl-loongarch.patch \
           underscore-wildcards.patch \
           relax-cert-validation.patch; do
