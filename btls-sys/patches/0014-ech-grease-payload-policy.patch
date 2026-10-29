@@ -37,10 +37,11 @@ diff --git a/build.json b/build.json
 index 4691fe469..f73008648 100644
 --- a/build.json
 +++ b/build.json
-@@ -1028,6 +1028,7 @@
+@@ -1028,7 +1028,8 @@
      "ssl_test": {
          "srcs": [
              "crypto/test/gtest_main.cc",
+             "ssl/delegated_credentials_test.cc",
 +            "ssl/ech_grease_policy_test.cc",
              "ssl/record_size_limit_test.cc",
              "ssl/span_test.cc",
@@ -49,10 +50,11 @@ diff --git a/gen/sources.bzl b/gen/sources.bzl
 index 9328c40d9..c751e2be8 100644
 --- a/gen/sources.bzl
 +++ b/gen/sources.bzl
-@@ -2981,6 +2981,7 @@ ssl_internal_headers = [
+@@ -2981,7 +2981,8 @@ ssl_internal_headers = [
  
  ssl_test_sources = [
      "crypto/test/gtest_main.cc",
+     "ssl/delegated_credentials_test.cc",
 +    "ssl/ech_grease_policy_test.cc",
      "ssl/record_size_limit_test.cc",
      "ssl/span_test.cc",
@@ -61,10 +63,11 @@ diff --git a/gen/sources.cmake b/gen/sources.cmake
 index 10808e0e4..243792c20 100644
 --- a/gen/sources.cmake
 +++ b/gen/sources.cmake
-@@ -3055,6 +3055,7 @@ set(
+@@ -3055,7 +3055,8 @@ set(
    SSL_TEST_SOURCES
  
    crypto/test/gtest_main.cc
+   ssl/delegated_credentials_test.cc
 +  ssl/ech_grease_policy_test.cc
    ssl/record_size_limit_test.cc
    ssl/span_test.cc
@@ -73,10 +76,11 @@ diff --git a/gen/sources.gni b/gen/sources.gni
 index 9994be8d1..dba8bb3e4 100644
 --- a/gen/sources.gni
 +++ b/gen/sources.gni
-@@ -2981,6 +2981,7 @@ ssl_internal_headers = [
+@@ -2981,7 +2981,8 @@ ssl_internal_headers = [
  
  ssl_test_sources = [
    "crypto/test/gtest_main.cc",
+   "ssl/delegated_credentials_test.cc",
 +  "ssl/ech_grease_policy_test.cc",
    "ssl/record_size_limit_test.cc",
    "ssl/span_test.cc",
@@ -85,10 +89,11 @@ diff --git a/gen/sources.json b/gen/sources.json
 index e639ca7cd..fd57a146f 100644
 --- a/gen/sources.json
 +++ b/gen/sources.json
-@@ -2965,6 +2965,7 @@
+@@ -2965,7 +2965,8 @@
    "ssl_test": {
      "srcs": [
        "crypto/test/gtest_main.cc",
+       "ssl/delegated_credentials_test.cc",
 +      "ssl/ech_grease_policy_test.cc",
        "ssl/record_size_limit_test.cc",
        "ssl/span_test.cc",
@@ -97,10 +102,11 @@ diff --git a/gen/sources.mk b/gen/sources.mk
 index fc45de625..0308aba09 100644
 --- a/gen/sources.mk
 +++ b/gen/sources.mk
-@@ -2945,6 +2945,7 @@ boringssl_ssl_internal_headers := \
+@@ -2945,7 +2945,8 @@ boringssl_ssl_internal_headers := \
  
  boringssl_ssl_test_sources := \
    crypto/test/gtest_main.cc \
+   ssl/delegated_credentials_test.cc \
 +  ssl/ech_grease_policy_test.cc \
    ssl/record_size_limit_test.cc \
    ssl/span_test.cc \
