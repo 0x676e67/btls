@@ -68,6 +68,13 @@
 //! no library is specified, libc++ is used on macOS and iOS whereas libstdc++ is used on other Unix
 //! systems.
 //!
+//! It is possible to statically link STL by passing `static:-bundle=` with desired STL implementation.
+//! Below is an example for linking `libstdc++` statically:
+//!
+//! ```bash
+//! $ export BORING_BSSL_RUST_CPPLIB="static:-bundle=stdc++"
+//! ```
+//!
 //! # Optional patches
 //!
 //! ## Experimental post-quantum cryptography
