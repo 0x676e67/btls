@@ -2,4 +2,4 @@
 	path = btls-sys/deps/boringssl
 	url = https://github.com/google/boringssl.git
 	ignore = dirty
-    shallow = true
+	shallow = true
