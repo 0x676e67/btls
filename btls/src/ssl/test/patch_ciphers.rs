@@ -577,6 +577,7 @@ impl OpenSslServer {
             .arg(fixture_path("cert.pem"))
             .arg("-key")
             .arg(fixture_path("key.pem"))
+            // A 2048-bit group, the size public DHE servers commonly use.
             .arg("-dhparam")
             .arg(fixture_path("dhparams.pem"))
             .arg("-cipher")

@@ -411,20 +411,6 @@ fn boringssl_patch_3des_badssl_ciphers_negotiate() {
 }
 
 #[test]
-fn boringssl_patch_dh2048_badssl_ciphers_negotiate() {
-    connect_badssl_with_ciphers(
-        "dh2048.badssl.com",
-        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA:TLS_DHE_RSA_WITH_AES_256_CBC_SHA:TLS_DHE_RSA_WITH_AES_128_CBC_SHA256:TLS_DHE_RSA_WITH_AES_256_CBC_SHA256",
-        &[
-            "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
-            "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
-            "TLS_DHE_RSA_WITH_AES_128_CBC_SHA256",
-            "TLS_DHE_RSA_WITH_AES_256_CBC_SHA256",
-        ],
-    );
-}
-
-#[test]
 fn boringssl_patch_clienthello_extensions_are_sent() {
     let record_size_limit = Arc::new(Mutex::new(None));
     let delegated_credential = Arc::new(Mutex::new(None));
