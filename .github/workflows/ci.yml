@@ -521,7 +521,7 @@ jobs:
           go-version-file: btls-sys/deps/boringssl/go.mod
           cache-dependency-path: btls-sys/deps/boringssl/go.sum
       - name: Run `rpk` and `underscore-wildcards` tests
-        run: cargo test --features rpk,underscore-wildcards -- --skip badssl_ciphers_negotiate
+        run: cargo test --features rpk,underscore-wildcards
       # Symbols reached only through a non-default feature are invisible to the
       # per-target `prefix-symbols` jobs, which link `btls-sys` alone. Features are
       # listed explicitly rather than via `--all-features`, which would pull in
