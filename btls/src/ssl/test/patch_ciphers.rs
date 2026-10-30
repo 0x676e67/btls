@@ -6,7 +6,7 @@ use std::ptr::{self, NonNull};
 
 use foreign_types::ForeignTypeRef;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 use std::{
     net::{TcpListener, TcpStream},
     os::fd::AsRawFd,
@@ -115,7 +115,7 @@ const BORINGSSL_PATCH_ADDED_CIPHERS: &[AddedCipher] = &[
 const BORINGSSL_PATCH_DHE_ALIASES: &[&str] = &["kDHE", "kEDH", "DH", "DHE", "EDH"];
 
 // Ubuntu's OpenSSL 3 builds, which CI uses, ship without the 3DES suites.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 const OPENSSL_MISSING_CIPHERS: &[u16] = &[0xc008, 0xc012];
 
 // The 42/43-byte pair crosses SHA-256's 64-byte final-block boundary after
@@ -289,7 +289,7 @@ impl SslHandle {
         Ok(output)
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(target_os = "linux")]
     fn read_to_end(&self) -> Result<Vec<u8>, String> {
         let mut output = Vec::new();
         let mut buffer = [0; 4096];
@@ -564,12 +564,12 @@ fn boringssl_patch_dhe_ciphers_report_complete_metadata() {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 struct OpenSslServer {
     child: Option<Child>,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 impl OpenSslServer {
     fn spawn(addr: std::net::SocketAddr, cipher: &AddedCipher) -> Result<Self, String> {
         let cipher_list = format!("{}:@SECLEVEL=0", cipher.rule_name);
@@ -630,7 +630,7 @@ impl OpenSslServer {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 impl Drop for OpenSslServer {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -640,7 +640,7 @@ impl Drop for OpenSslServer {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 fn negotiate_with_openssl(addr: std::net::SocketAddr, cipher: &AddedCipher) -> Result<(), String> {
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
         .map_err(|error| format!("failed to connect to OpenSSL s_server: {error}"))?;
@@ -677,7 +677,7 @@ fn negotiate_with_openssl(addr: std::net::SocketAddr, cipher: &AddedCipher) -> R
 // OpenSSL is an independent implementation, so this catches mistakes that the
 // BoringSSL-to-BoringSSL tests would make on both ends. It is also the only
 // peer for the DHE suites, which BoringSSL cannot serve.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn boringssl_patch_ciphers_interoperate_with_openssl() {
     ffi::init();
