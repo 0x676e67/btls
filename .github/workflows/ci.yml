@@ -557,15 +557,13 @@ jobs:
 
   crates:
     name: crates
-    needs: [rustfmt, clippy, test, cross-build, test-features]
+    needs: [rustfmt, clippy, test, test-fips, test-boringssl, cross-build, test-features, prefix-symbols]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+      - name: Install Rust (rustup)
+        run: rustup update stable --no-self-update && rustup default stable
       - name: Prebuild btls-sys
         run: cargo build -p btls-sys
       - name: publish crates
