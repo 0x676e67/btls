@@ -516,8 +516,8 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
 
     if config.features.allow_crl_extensions_bad_version {
         println!(
-            "cargo:warning=applying the patch for disabling cert version \
-            validation for extensions"
+            "cargo:warning=applying the patch for disabling certificate and \
+            CRL version validation for extensions"
         );
         apply_patch(config, "bad-cert-verification.patch")?;
     }
@@ -538,19 +538,22 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
             "0004-boringssl-extension-order.patch",
             "0005-record-size-limit.patch",
             "0006-delegated-credentials.patch",
-            "0007-boringssl-cipher-preferences.patch",
+            "0007-boringssl-f5-padding.patch",
             "0008-boringssl-sigalgs.patch",
             "0009-boringssl-zstd-cert-compression.patch",
             "0010-boringssl-build-compat.patch",
-            "0011-boringssl-prefix-struct-tags.patch",
-            "0012-boringssl-seal-app-data.patch",
-            "0013-boringssl-cheap-error-reset.patch",
-            "0014-ech-grease-payload-policy.patch",
+            "0011-boringssl-seal-app-data.patch",
+            "0012-boringssl-cheap-error-reset.patch",
+            "0013-ech-grease-payload-policy.patch",
         ] {
             println!("cargo:warning=applying {patch_name} to boringssl");
             apply_patch(config, patch_name)?;
         }
     }
+
+    // FIPS builds compile the same module source, so they need this fix too.
+    println!("cargo:warning=applying rand double-free fix to boringssl");
+    apply_patch(config, "boringssl-rand-double-free.patch")?;
 
     // Only the symbol audit reads this tool, and only a prefixed build runs it.
     if config.features.prefix_symbols {
@@ -887,6 +890,10 @@ fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Err
         // Rust 1.99 flags such declarations of runtime symbols
         // (`suspicious_runtime_symbol_definitions`). Use `libc` for these.
         .blocklist_function("malloc|calloc|realloc|free")
+        // Only BoringSSL's own declarations, not transitive system headers. Match any
+        // `openssl/` directory, as `BORING_BSSL_INCLUDE_PATH` need not end in `include`.
+        .allowlist_file(r".*[/\\]openssl[/\\].*")
+        .opaque_type("FILE")
         .clang_args(get_extra_clang_args_for_bindgen(config))
         .clang_arg("-I")
         .clang_arg(include_path.display().to_string());

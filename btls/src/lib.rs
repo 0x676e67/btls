@@ -13,7 +13,8 @@
 //!
 //! ## BoringSSL version
 //!
-//! By default, the crate aims to statically link with the latest BoringSSL master branch.
+//! By default, the crate statically links against a pinned BoringSSL revision, vendored as a
+//! submodule at `btls-sys/deps/boringssl`. The current pin is upstream tag `0.20260929.0`.
 //! *Note*: any BoringSSL revision bumps will be released as a major version update of all crates.
 //!
 //! # Compilation and linking options
@@ -70,26 +71,20 @@
 //!
 //! # Optional patches
 //!
-//! ## Experimental post-quantum cryptography
+//! ## Raw Public Key
 //!
-//! The crate can be compiled with [post-quantum cryptography](https://blog.cloudflare.com/post-quantum-for-all/)
-//! support by turning on `post-quantum` compilation feature.
+//! The crate can be compiled with [RawPublicKey](https://datatracker.ietf.org/doc/html/rfc7250)
+//! support by turning on `rpk` compilation feature.
 //!
-//! Upstream BoringSSL support the post-quantum hybrid key agreement `X25519Kyber768Draft00`. Most
-//! users should stick to that one for now. Enabling this feature, adds a few other post-quantum key
-//! agreements:
+//! ## Post-quantum cryptography
 //!
-//! - `X25519MLKEM768` is the successor of `X25519Kyber768Draft00`. We expect servers to switch
-//!   before the end of 2024.
-//! - `X25519Kyber768Draft00Old` is the same as `X25519Kyber768Draft00`, but under its old codepoint.
-//! - `X25519Kyber512Draft00`. Similar to `X25519Kyber768Draft00`, but uses level 1 parameter set for
-//!   Kyber. Not recommended. It's useful to test whether the shorter ClientHello upsets fewer middle
-//!   boxes.
-//! - `P256Kyber768Draft00`. Similar again to `X25519Kyber768Draft00`, but uses P256 as classical
-//!   part. It uses a non-standard codepoint. Not recommended.
+//! Upstream BoringSSL supports and enables `X25519MLKEM768`, the post-quantum key agreement from
+//! RFC 10024, by default. btls patches BoringSSL to additionally support:
 //!
-//! Presently all these key agreements are deployed by Cloudflare, but we do not guarantee continued
-//! support for them.
+//! - `X25519Kyber768Draft00`, under codepoint `0x6399`. This is the pre-standard predecessor of
+//!   `X25519MLKEM768`. Not recommended; it's being phased out.
+//! - `P256Kyber768Draft00`, under codepoint `0xfe32`, which uses P-256 as the classical part.
+//!   Not recommended; it's being phased out.
 
 #[macro_use]
 extern crate bitflags;

@@ -17,35 +17,33 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ---
- build.json                       |    2 +
- gen/sources.bzl                  |    2 +
- gen/sources.cmake                |    2 +
- gen/sources.gni                  |    2 +
- gen/sources.json                 |    4 +-
- gen/sources.mk                   |    2 +
- include/openssl/ssl.h            |   27 +
- include/openssl/tls1.h           |    3 +
- ssl/extensions.cc                |   17 +
- ssl/handoff.cc                   |    6 +-
- ssl/handshake_client.cc          |    1 +
- ssl/internal.h                   |   71 ++
- ssl/record_size_limit.cc         |  374 ++++++++
- ssl/record_size_limit_test.cc    | 1458 ++++++++++++++++++++++++++++++
- ssl/s3_both.cc                   |    7 +-
- ssl/s3_pkt.cc                    |   12 +-
- ssl/ssl_lib.cc                   |    1 +
- ssl/tls13_server.cc              |   13 +-
- ssl/tls_method.cc                |    2 +
- ssl/tls_record.cc                |   17 +-
+ build.json                    |    2 +
+ gen/sources.bzl               |    2 +
+ gen/sources.cmake             |    2 +
+ gen/sources.gni               |    2 +
+ gen/sources.json              |    4 +-
+ gen/sources.mk                |    2 +
+ include/openssl/ssl.h         |   27 +
+ include/openssl/tls1.h        |    3 +
+ ssl/extensions.cc             |   17 +
+ ssl/handoff.cc                |    6 +-
+ ssl/handshake_client.cc       |    1 +
+ ssl/internal.h                |   71 ++
+ ssl/record_size_limit.cc      |  374 +++++++++++
+ ssl/record_size_limit_test.cc | 1458 +++++++++++++++++++++++++++++++++++++++++
+ ssl/s3_both.cc                |    7 +-
+ ssl/s3_pkt.cc                 |   12 +-
+ ssl/ssl_lib.cc                |    1 +
+ ssl/tls13_server.cc           |   13 +-
+ ssl/tls_method.cc             |    2 +
+ ssl/tls_record.cc             |   17 +-
  20 files changed, 2011 insertions(+), 12 deletions(-)
- create mode 100644 ssl/record_size_limit.cc
- create mode 100644 ssl/record_size_limit_test.cc
 
 diff --git a/build.json b/build.json
-index f9e3a7e09..4691fe469 100644
+index 36514984f..54e100374 100644
 --- a/build.json
 +++ b/build.json
-@@ -709,6 +709,7 @@
+@@ -710,6 +710,7 @@
              "ssl/handshake.cc",
              "ssl/handshake_client.cc",
              "ssl/handshake_server.cc",
@@ -53,7 +51,7 @@ index f9e3a7e09..4691fe469 100644
              "ssl/s3_both.cc",
              "ssl/s3_lib.cc",
              "ssl/s3_pkt.cc",
-@@ -1027,6 +1028,7 @@
+@@ -1031,6 +1032,7 @@
      "ssl_test": {
          "srcs": [
              "crypto/test/gtest_main.cc",
@@ -62,10 +60,10 @@ index f9e3a7e09..4691fe469 100644
              "ssl/ssl_c_test.c",
              "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.bzl b/gen/sources.bzl
-index e85d7a747..9328c40d9 100644
+index fc210c677..0022b49c9 100644
 --- a/gen/sources.bzl
 +++ b/gen/sources.bzl
-@@ -2939,6 +2939,7 @@ ssl_sources = [
+@@ -2971,6 +2971,7 @@ ssl_sources = [
      "ssl/handshake.cc",
      "ssl/handshake_client.cc",
      "ssl/handshake_server.cc",
@@ -73,7 +71,7 @@ index e85d7a747..9328c40d9 100644
      "ssl/s3_both.cc",
      "ssl/s3_lib.cc",
      "ssl/s3_pkt.cc",
-@@ -2980,6 +2981,7 @@ ssl_internal_headers = [
+@@ -3012,6 +3013,7 @@ ssl_internal_headers = [
  
  ssl_test_sources = [
      "crypto/test/gtest_main.cc",
@@ -82,10 +80,10 @@ index e85d7a747..9328c40d9 100644
      "ssl/ssl_c_test.c",
      "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.cmake b/gen/sources.cmake
-index 117ba3ffb..10808e0e4 100644
+index 779c96eff..7a48e42c9 100644
 --- a/gen/sources.cmake
 +++ b/gen/sources.cmake
-@@ -3007,6 +3007,7 @@ set(
+@@ -3041,6 +3041,7 @@ set(
    ssl/handshake.cc
    ssl/handshake_client.cc
    ssl/handshake_server.cc
@@ -93,7 +91,7 @@ index 117ba3ffb..10808e0e4 100644
    ssl/s3_both.cc
    ssl/s3_lib.cc
    ssl/s3_pkt.cc
-@@ -3054,6 +3055,7 @@ set(
+@@ -3088,6 +3089,7 @@ set(
    SSL_TEST_SOURCES
  
    crypto/test/gtest_main.cc
@@ -102,10 +100,10 @@ index 117ba3ffb..10808e0e4 100644
    ssl/ssl_c_test.c
    ssl/ssl_internal_test.cc
 diff --git a/gen/sources.gni b/gen/sources.gni
-index 5777c09a0..9994be8d1 100644
+index 776a14ca2..c6d2af614 100644
 --- a/gen/sources.gni
 +++ b/gen/sources.gni
-@@ -2939,6 +2939,7 @@ ssl_sources = [
+@@ -2971,6 +2971,7 @@ ssl_sources = [
    "ssl/handshake.cc",
    "ssl/handshake_client.cc",
    "ssl/handshake_server.cc",
@@ -113,7 +111,7 @@ index 5777c09a0..9994be8d1 100644
    "ssl/s3_both.cc",
    "ssl/s3_lib.cc",
    "ssl/s3_pkt.cc",
-@@ -2980,6 +2981,7 @@ ssl_internal_headers = [
+@@ -3012,6 +3013,7 @@ ssl_internal_headers = [
  
  ssl_test_sources = [
    "crypto/test/gtest_main.cc",
@@ -122,10 +120,10 @@ index 5777c09a0..9994be8d1 100644
    "ssl/ssl_c_test.c",
    "ssl/ssl_internal_test.cc",
 diff --git a/gen/sources.json b/gen/sources.json
-index 97b70e554..e639ca7cd 100644
+index 1f9cd5503..d6f6007df 100644
 --- a/gen/sources.json
 +++ b/gen/sources.json
-@@ -2924,6 +2924,7 @@
+@@ -2957,6 +2957,7 @@
        "ssl/handshake.cc",
        "ssl/handshake_client.cc",
        "ssl/handshake_server.cc",
@@ -133,7 +131,7 @@ index 97b70e554..e639ca7cd 100644
        "ssl/s3_both.cc",
        "ssl/s3_lib.cc",
        "ssl/s3_pkt.cc",
-@@ -2964,6 +2965,7 @@
+@@ -2997,6 +2998,7 @@
    "ssl_test": {
      "srcs": [
        "crypto/test/gtest_main.cc",
@@ -141,7 +139,7 @@ index 97b70e554..e639ca7cd 100644
        "ssl/span_test.cc",
        "ssl/ssl_c_test.c",
        "ssl/ssl_internal_test.cc",
-@@ -3020,4 +3022,4 @@
+@@ -3053,4 +3055,4 @@
        "crypto/rand/urandom_test.cc"
      ]
    }
@@ -149,10 +147,10 @@ index 97b70e554..e639ca7cd 100644
 \ No newline at end of file
 +}
 diff --git a/gen/sources.mk b/gen/sources.mk
-index b7cb8ad00..fc45de625 100644
+index 37d5b453a..f3a6f7ae8 100644
 --- a/gen/sources.mk
 +++ b/gen/sources.mk
-@@ -2906,6 +2906,7 @@ boringssl_ssl_sources := \
+@@ -2937,6 +2937,7 @@ boringssl_ssl_sources := \
    ssl/handshake.cc \
    ssl/handshake_client.cc \
    ssl/handshake_server.cc \
@@ -160,7 +158,7 @@ index b7cb8ad00..fc45de625 100644
    ssl/s3_both.cc \
    ssl/s3_lib.cc \
    ssl/s3_pkt.cc \
-@@ -2944,6 +2945,7 @@ boringssl_ssl_internal_headers := \
+@@ -2975,6 +2976,7 @@ boringssl_ssl_internal_headers := \
  
  boringssl_ssl_test_sources := \
    crypto/test/gtest_main.cc \
@@ -169,10 +167,10 @@ index b7cb8ad00..fc45de625 100644
    ssl/ssl_c_test.c \
    ssl/ssl_internal_test.cc \
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 56761fa33..656c7393f 100644
+index 4e25c9f09..8c97605bd 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5655,6 +5655,33 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+@@ -5725,6 +5725,33 @@ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  OPENSSL_EXPORT int SSL_CTX_set_extension_order(SSL_CTX *ctx,
                                                 const uint16_t *ids, int num);
  
@@ -221,10 +219,10 @@ index 0a01b2456..611b202e1 100644
  #define TLSEXT_TYPE_server_name 0
  #define TLSEXT_TYPE_status_request 5
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 9ad7527ec..503a128ad 100644
+index 1f75b8481..d4f6ff3a6 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
-@@ -4323,6 +4323,13 @@ static const struct tls_extension kExtensions[] = {
+@@ -4304,6 +4304,13 @@ static const struct tls_extension kExtensions[] = {
          ext_trust_anchors_parse_clienthello,
          ext_trust_anchors_add_serverhello,
      },
@@ -238,7 +236,7 @@ index 9ad7527ec..503a128ad 100644
      {
          TLSEXT_TYPE_client_cert_type,
          ext_client_cert_type_add_clienthello,
-@@ -4540,6 +4547,10 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4521,6 +4528,10 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
      size_t i = hs->extension_permutation.empty()
                     ? unpermuted
                     : hs->extension_permutation[unpermuted];
@@ -249,7 +247,7 @@ index 9ad7527ec..503a128ad 100644
      const size_t len_before = CBB_len(&extensions);
      const size_t len_compressed_before = CBB_len(compressed.get());
      if (!kExtensions[i].add_clienthello(hs, &extensions, compressed.get(),
-@@ -4653,6 +4664,12 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4631,6 +4642,12 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
      size_t i = hs->extension_permutation.empty()
                     ? unpermuted
                     : hs->extension_permutation[unpermuted];
@@ -263,7 +261,7 @@ index 9ad7527ec..503a128ad 100644
      if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
        OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
 diff --git a/ssl/handoff.cc b/ssl/handoff.cc
-index c8d989796..840258ef9 100644
+index 7b1fc1149..89318de98 100644
 --- a/ssl/handoff.cc
 +++ b/ssl/handoff.cc
 @@ -84,7 +84,8 @@ bool SSL_serialize_handoff(const SSL *ssl, CBB *out,
@@ -287,10 +285,10 @@ index c8d989796..840258ef9 100644
  
  bool SSL_apply_handoff(SSL *ssl, Span<const uint8_t> handoff) {
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index 298f04f9c..885444bb1 100644
+index 28a51e365..5a300f1ef 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -370,6 +370,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+@@ -335,6 +335,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
    if (!ssl_get_version_range(hs, &hs->min_version, &hs->max_version)) {
      return ssl_hs_error;
    }
@@ -299,10 +297,10 @@ index 298f04f9c..885444bb1 100644
    uint8_t ech_enc[EVP_HPKE_MAX_ENC_LENGTH];
    size_t ech_enc_len;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 506775b90..6bc78114c 100644
+index 39c07d807..1ca7253ab 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -757,6 +757,32 @@ enum ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
+@@ -791,6 +791,32 @@ enum ssl_open_record_t tls_open_record(SSLImpl *ssl, uint8_t *out_type,
                                         Span<uint8_t> *out, size_t *out_consumed,
                                         uint8_t *out_alert, Span<uint8_t> in);
  
@@ -335,7 +333,7 @@ index 506775b90..6bc78114c 100644
  // dtls_open_record implements `tls_open_record` for DTLS. It only returns
  // `ssl_open_record_partial` if `in` was empty and sets `*out_consumed` to
  // zero. The caller should read one packet and try again. On success,
-@@ -1815,6 +1841,15 @@ struct SSL_HANDSHAKE {
+@@ -1850,6 +1876,15 @@ struct SSL_HANDSHAKE {
    // `SSL_OP_NO_*` and `SSL_CTX_set_max_proto_version` APIs.
    uint16_t max_version = 0;
  
@@ -351,7 +349,7 @@ index 506775b90..6bc78114c 100644
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> secret;
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> early_traffic_secret;
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> client_handshake_secret;
-@@ -2837,6 +2872,24 @@ struct SSL3_STATE {
+@@ -2896,6 +2931,24 @@ struct SSL3_STATE {
    uint64_t read_sequence = 0;
    uint64_t write_sequence = 0;
  
@@ -376,7 +374,7 @@ index 506775b90..6bc78114c 100644
    uint8_t server_random[SSL3_RANDOM_SIZE] = {0};
    uint8_t client_random[SSL3_RANDOM_SIZE] = {0};
  
-@@ -3572,6 +3625,9 @@ struct SSL_CONFIG {
+@@ -3664,6 +3717,9 @@ struct SSL_CONFIG {
    // to negotiate and convey application settings.
    bool alps_use_new_codepoint : 1;
  
@@ -386,7 +384,7 @@ index 506775b90..6bc78114c 100644
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
-@@ -3833,6 +3889,18 @@ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
+@@ -3927,6 +3983,18 @@ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
                                    const SSL_CLIENT_HELLO *client_hello);
  bool ssl_parse_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *extensions);
  
@@ -405,7 +403,7 @@ index 506775b90..6bc78114c 100644
  #define tlsext_tick_md EVP_sha256
  
  // ssl_process_ticket processes a session ticket from the client. It returns
-@@ -4244,6 +4312,9 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4306,6 +4374,9 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // signal its sessions may be resumed across names in the server certificate.
    bool resumption_across_names_enabled : 1;
  
@@ -2260,7 +2258,7 @@ index 000000000..46120ef31
 +
 +BSSL_NAMESPACE_END
 diff --git a/ssl/s3_both.cc b/ssl/s3_both.cc
-index d885da981..e00c04309 100644
+index 10e0ad210..e67ae78fb 100644
 --- a/ssl/s3_both.cc
 +++ b/ssl/s3_both.cc
 @@ -99,10 +99,11 @@ bool tls_add_message(SSLImpl *ssl, Array<uint8_t> msg) {
@@ -2325,10 +2323,10 @@ index 2724e327e..8b4043b7b 100644
      int ret = do_tls_write(ssl, &bytes_written, SSL3_RT_APPLICATION_DATA,
                             in.subspan(0, to_write));
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index c559b61b9..fdc49eff6 100644
+index 62b9cb162..f2d199829 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -573,6 +573,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
+@@ -563,6 +563,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
    ssl->config->ocsp_stapling_enabled = ctx_impl->ocsp_stapling_enabled;
    ssl->config->handoff = ctx_impl->handoff;
    ssl->quic_method = ctx_impl->quic_method;
@@ -2337,10 +2335,10 @@ index c559b61b9..fdc49eff6 100644
    if (!ssl->method->ssl_new(ssl.get()) ||
        !ssl->ctx->x509_method->ssl_new(ssl->s3->hs.get())) {
 diff --git a/ssl/tls13_server.cc b/ssl/tls13_server.cc
-index 94de72d98..7e4e25869 100644
+index bb0d4c6fe..842858b99 100644
 --- a/ssl/tls13_server.cc
 +++ b/ssl/tls13_server.cc
-@@ -188,7 +188,7 @@ static bool add_new_session_tickets(SSL_HANDSHAKE *hs, bool *out_sent_tickets) {
+@@ -173,7 +173,7 @@ static bool add_new_session_tickets(SSL_HANDSHAKE *hs, bool *out_sent_tickets) {
      bool enable_early_data =
          ssl->enable_early_data &&
          (!SSL_is_quic(ssl) || !ssl->config->quic_early_data_context.empty()) &&
@@ -2349,7 +2347,7 @@ index 94de72d98..7e4e25869 100644
      if (enable_early_data) {
        // QUIC does not use the max_early_data_size parameter and always sets it
        // to a fixed value. See RFC 9001, section 4.6.1.
-@@ -720,6 +720,8 @@ static enum ssl_hs_wait_t do_select_session(SSL_HANDSHAKE *hs) {
+@@ -710,6 +710,8 @@ static enum ssl_hs_wait_t do_select_session(SSL_HANDSHAKE *hs) {
      ssl->s3->early_data_reason = ssl_early_data_quic_parameter_mismatch;
    } else if (need_hrr) {
      ssl->s3->early_data_reason = ssl_early_data_hello_retry_request;
@@ -2358,7 +2356,7 @@ index 94de72d98..7e4e25869 100644
    } else {
      // `ssl_session_is_resumable` forbids cross-cipher resumptions even if the
      // PRF hashes match.
-@@ -956,6 +958,15 @@ static enum ssl_hs_wait_t do_read_second_client_hello(SSL_HANDSHAKE *hs) {
+@@ -946,6 +948,15 @@ static enum ssl_hs_wait_t do_read_second_client_hello(SSL_HANDSHAKE *hs) {
      }
    }
  
@@ -2375,7 +2373,7 @@ index 94de72d98..7e4e25869 100644
    // consistency with what `select_certificate_cb` observed), which is in the
    // transcript, so we can ignore most of this second one.
 diff --git a/ssl/tls_method.cc b/ssl/tls_method.cc
-index a2e4dcf58..a5ff38451 100644
+index 08ce8df16..7096ab3cd 100644
 --- a/ssl/tls_method.cc
 +++ b/ssl/tls_method.cc
 @@ -69,6 +69,7 @@ static bool tls_set_read_state(SSLImpl *ssl, ssl_encryption_level_t level,

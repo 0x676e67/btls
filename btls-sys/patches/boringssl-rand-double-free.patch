@@ -1,0 +1,35 @@
+From bee44385a528bba66abe1af553113ed9a703bf0a Mon Sep 17 00:00:00 2001
+From: Tom Hughes <tomhughes@chromium.org>
+Date: Mon, 19 Oct 2026 13:24:00 -0700
+Subject: [PATCH] rand: Fix double-free on thread-local failure.
+
+Backport of upstream bee44385a, first released in 0.20261020.0. It is
+applied to every build, `fips` included, since FIPS builds compile the same
+module source.
+
+CRYPTO_set_thread_local invokes the destructor callback on the value
+before returning zero on failure. In BCM_rand_bytes_with_additional_data
+(updated in commit 364eef1863bf11e80a3fd8a603ba69f14b910fdb), calling
+Delete(state) in the failure branch frees state a second time after
+rand_thread_state_free has already freed it.
+
+Remove the redundant Delete(state) call.
+---
+ crypto/fipsmodule/rand/rand.cc.inc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crypto/fipsmodule/rand/rand.cc.inc b/crypto/fipsmodule/rand/rand.cc.inc
+index 5d4fc9f39..839a03fcb 100644
+--- a/crypto/fipsmodule/rand/rand.cc.inc
++++ b/crypto/fipsmodule/rand/rand.cc.inc
+@@ -381,8 +381,8 @@ bcm_infallible bssl::BCM_rand_bytes_with_additional_data(
+         !CRYPTO_set_thread_local(OPENSSL_THREAD_LOCAL_RAND, state,
+                                  rand_thread_state_free)) {
+       // If the system is out of memory, use an ephemeral state on the
+-      // stack.
+-      Delete(state);
++      // stack. `rand_thread_state_free` has already been called by
++      // `CRYPTO_set_thread_local` on failure.
+       state = &stack_state;
+     }
+ 

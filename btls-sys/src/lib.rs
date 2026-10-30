@@ -39,10 +39,10 @@ pub use generated::{MLKEM768_encap, MLKEM768_private_key_from_seed}; // your inc
 pub use generated::{SSL_CREDENTIAL_new_raw_public_key_empty, SSL_CREDENTIAL_set1_spki}; // your include path is incorrect or has a version of boringssl without rpk support
 
 #[cfg(not(feature = "fips"))]
-pub use generated::{SSL_seal_app_data, SSL_seal_app_data_limits}; // your include path is incorrect or has a version of boringssl without patch 0012 (seal-app-data)
+pub use generated::{SSL_seal_app_data, SSL_seal_app_data_limits}; // your include path is incorrect or has a version of boringssl without patch 0011 (seal-app-data)
 
 #[cfg(not(feature = "fips"))]
-pub use generated::{SSL_CTX_set_ech_grease_callback, SSL_set_ech_grease_callback}; // your include path is incorrect or has a version of boringssl without patch 0014 (ech-grease-payload-policy)
+pub use generated::{SSL_CTX_set_ech_grease_callback, SSL_set_ech_grease_callback}; // your include path is incorrect or has a version of boringssl without patch 0013 (ech-grease-payload-policy)
 
 pub use generated::*;
 #[cfg(target_pointer_width = "64")]
@@ -78,6 +78,7 @@ pub fn init() {
 
 // CBS_init is inline in BoringSSL, so bindgen can't generate bindings for it.
 #[inline]
+#[must_use]
 pub fn cbs_init(data: &[u8]) -> CBS {
     CBS {
         data: data.as_ptr(),

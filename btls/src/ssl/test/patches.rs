@@ -15,6 +15,7 @@ use crate::ffi;
 use crate::ssl::{
     with_ivecs, ExtensionType, Sealed, SslConnector, SslContextBuilder, SslMethod, SslOptions,
     SslRef, SslSession, SslSessionCacheMode, SslSignatureAlgorithm, SslStream, SslVersion,
+    Tls13Cipher,
 };
 
 type RecordHeaders = Arc<Mutex<Vec<[u8; 5]>>>;
@@ -696,6 +697,34 @@ fn record_size_limit_patch_keeps_configured_extension_position() {
 }
 
 #[test]
+fn boringssl_patch_f5_padding_fills_clienthello() {
+    // 0007-boringssl-f5-padding.patch keeps the RFC 7685 padding upstream
+    // removed: without ML-KEM a ClientHello of 256 to 511 bytes, handshake
+    // header included, is padded to 512.
+    let hello = Arc::new(Mutex::new(Vec::new()));
+    let mut server = Server::builder();
+    server.ctx().set_select_certificate_callback({
+        let hello = Arc::clone(&hello);
+        move |client_hello| {
+            *hello.lock().unwrap() = client_hello.as_bytes().to_vec();
+            Ok(())
+        }
+    });
+    let server = server.build();
+    let mut client = server.client_with_root_ca();
+    client.ctx().set_curves_list("X25519").unwrap();
+    client.ctx().set_alpn_protos(b"\x02h2\x08http/1.1").unwrap();
+    let client = client.build();
+    let mut connection = client.builder();
+    connection.ssl().set_hostname("padding.example").unwrap();
+    connection.connect();
+
+    let hello = hello.lock().unwrap();
+    assert!(client_hello_extension_types(&hello).contains(&ExtensionType::PADDING));
+    assert_eq!(4 + hello.len(), 512);
+}
+
+#[test]
 fn boringssl_patch_partial_extension_order_can_handshake() {
     // 0004-boringssl-extension-order.patch adds explicit ClientHello extension
     // ordering. Unknown and duplicate entries are ignored, and the unlisted
@@ -773,50 +802,6 @@ fn boringssl_patch_allows_duplicate_signature_algorithms() {
         2,
         "ClientHello did not preserve the duplicated 0008-boringssl-sigalgs.patch algorithm",
     );
-}
-
-#[test]
-fn boringssl_patch_preserves_tls13_cipher_order_in_clienthello() {
-    let client_ciphers = Arc::new(Mutex::new(None));
-
-    // 0007-boringssl-cipher-preferences.patch adds preserve_tls13_cipher_list to
-    // keep our configured TLS 1.3 cipher order in ClientHello instead of
-    // upstream BoringSSL's native default ordering.
-    let mut server = Server::builder();
-    server.ctx().set_select_certificate_callback({
-        let client_ciphers = Arc::clone(&client_ciphers);
-        move |client_hello| {
-            *client_ciphers.lock().unwrap() = Some(client_hello.ciphers().to_vec());
-            Ok(())
-        }
-    });
-    let server = server.build();
-
-    let mut client = server.client_with_root_ca();
-    client
-        .ctx()
-        .set_min_proto_version(Some(SslVersion::TLS1_3))
-        .unwrap();
-    client
-        .ctx()
-        .set_max_proto_version(Some(SslVersion::TLS1_3))
-        .unwrap();
-    client.ctx().set_preserve_tls13_cipher_list(true);
-    client.ctx().set_cipher_list("CHACHA20:AES128").unwrap();
-
-    client.connect();
-
-    let cipher_ids = u16_list(&client_ciphers.lock().unwrap().clone().unwrap());
-    let chacha = cipher_ids
-        .iter()
-        .position(|&cipher| cipher == 0x1303)
-        .unwrap();
-    let aes128 = cipher_ids
-        .iter()
-        .position(|&cipher| cipher == 0x1301)
-        .unwrap();
-
-    assert!(chacha < aes128);
 }
 
 #[test]
@@ -935,32 +920,37 @@ fn check_and_send(stream: &mut SslStream<TcpStream>, consumed: usize, out: &[u8]
 
 #[test]
 fn seal_app_data_round_trip() {
-    // (version, cipher list, AES hardware, negotiated suite). The CBC suite is restored by
+    // (version, cipher list, TLS 1.3 suites, negotiated suite). The CBC suite is restored by
     // 0002-boringssl-legacy-ciphers.patch.
-    let suites = [
+    let suites: [(_, _, &[Tls13Cipher], _); 5] = [
         (
             SslVersion::TLS1_2,
             "ECDHE-RSA-AES128-GCM-SHA256",
-            true,
+            &[],
             "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
         ),
         (
             SslVersion::TLS1_2,
             "ECDHE-RSA-CHACHA20-POLY1305",
-            true,
+            &[],
             "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         ),
         (
             SslVersion::TLS1_2,
             "ECDHE-RSA-AES256-SHA384",
-            true,
+            &[],
             "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
         ),
-        (SslVersion::TLS1_3, "", true, "TLS_AES_128_GCM_SHA256"),
         (
             SslVersion::TLS1_3,
             "",
-            false,
+            &[Tls13Cipher::AES_128_GCM_SHA256],
+            "TLS_AES_128_GCM_SHA256",
+        ),
+        (
+            SslVersion::TLS1_3,
+            "",
+            &[Tls13Cipher::CHACHA20_POLY1305_SHA256],
             "TLS_CHACHA20_POLY1305_SHA256",
         ),
     ];
@@ -981,11 +971,10 @@ fn seal_app_data_round_trip() {
     let mut expected: Vec<u8> = datas.concat();
     expected.extend_from_slice(datas.last().unwrap());
 
-    for (version, cipher_list, aes_hw, suite) in suites {
+    for (version, cipher_list, tls13_ciphers, suite) in suites {
         let mut server = Server::builder();
         server.ctx().set_min_proto_version(Some(version)).unwrap();
         server.ctx().set_max_proto_version(Some(version)).unwrap();
-        server.ctx().set_aes_hw_override(aes_hw);
         if !cipher_list.is_empty() {
             server.ctx().set_cipher_list(cipher_list).unwrap();
         }
@@ -1002,7 +991,7 @@ fn seal_app_data_round_trip() {
         let mut client = server.client_with_root_ca();
         client.ctx().set_min_proto_version(Some(version)).unwrap();
         client.ctx().set_max_proto_version(Some(version)).unwrap();
-        client.ctx().set_aes_hw_override(true);
+        client.ctx().set_tls13_ciphers(tls13_ciphers).unwrap();
         if !cipher_list.is_empty() {
             client.ctx().set_cipher_list(cipher_list).unwrap();
         }
@@ -1044,7 +1033,7 @@ fn seal_app_data_round_trip() {
 
 #[test]
 fn seal_app_data_honors_peer_record_size_limit() {
-    // 0012 seals records itself, so it must take the fragment that 0005 derives
+    // 0011 seals records itself, so it must take the fragment that 0005 derives
     // from the peer's record_size_limit. The TLS 1.3 limit counts the content type.
     let data = payload(5000, 3);
     for (version, fragment) in [(SslVersion::TLS1_2, 1000), (SslVersion::TLS1_3, 999)] {

@@ -14,7 +14,7 @@ use crate::ffi;
 use crate::ssl::EchGreaseRounding::{NssPre3127, Rfc9849};
 use crate::ssl::{
     EchGreaseAead, EchGreaseParameters, EchGreaseSizeInfo, ExtensionType, Ssl, SslConnector,
-    SslContext, SslMethod, SslRef, SslVerifyMode, SslVersion,
+    SslContext, SslMethod, SslRef, SslVerifyMode, SslVersion, Tls13Cipher,
 };
 
 const TLS_EXTENSION_HEADER_LEN: usize = 4;
@@ -306,38 +306,35 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
         let len = usize::from(u16::from_be_bytes([hello[offset], hello[offset + 1]]));
         hello[offset + 2..offset + 2 + len].to_vec()
     };
-    for aes_hw in [false, true] {
-        let default_aead = if aes_hw {
-            EchGreaseAead::AES_128_GCM
-        } else {
-            EchGreaseAead::CHACHA20_POLY1305
-        };
-        let baseline = handshake(|ssl| ssl.set_aes_hw_override(aes_hw), false);
-        for (aead, id) in [
-            (EchGreaseAead::AES_128_GCM, 1),
-            (EchGreaseAead::CHACHA20_POLY1305, 3),
-        ] {
-            assert_eq!(aead.id(), u16::from(id));
-            let messages = handshake(
-                |ssl| {
-                    ssl.set_aes_hw_override(aes_hw);
-                    ssl.set_ech_grease_callback(move |_, info| {
-                        assert_eq!(info.default_aead(), default_aead);
-                        Ok(EchGreaseParameters {
-                            aead,
-                            payload_length: NonZeroU16::new(239).unwrap(),
-                            random_enc: false,
-                        })
+    let default_aead = if super::has_aes_hardware() {
+        EchGreaseAead::AES_128_GCM
+    } else {
+        EchGreaseAead::CHACHA20_POLY1305
+    };
+    let baseline = handshake(|_| {}, false);
+    for (aead, id) in [
+        (EchGreaseAead::AES_128_GCM, 1),
+        (EchGreaseAead::CHACHA20_POLY1305, 3),
+    ] {
+        assert_eq!(aead.id(), u16::from(id));
+        let messages = handshake(
+            |ssl| {
+                ssl.set_ech_grease_callback(move |_, info| {
+                    assert_eq!(info.default_aead(), default_aead);
+                    Ok(EchGreaseParameters {
+                        aead,
+                        payload_length: NonZeroU16::new(239).unwrap(),
+                        random_enc: false,
                     })
-                    .unwrap();
-                },
-                false,
-            );
-            let extension = ech(&messages[0]);
-            assert_eq!(&extension[ECH_AEAD_OFFSET..ECH_AEAD_OFFSET + 2], &[0, id]);
-            assert_eq!(extension.len(), 239 + ECH_BODY_FRAMING_LEN);
-            assert_eq!(ciphers(&messages[0]), ciphers(&baseline[0]));
-        }
+                })
+                .unwrap();
+            },
+            false,
+        );
+        let extension = ech(&messages[0]);
+        assert_eq!(&extension[ECH_AEAD_OFFSET..ECH_AEAD_OFFSET + 2], &[0, id]);
+        assert_eq!(extension.len(), 239 + ECH_BODY_FRAMING_LEN);
+        assert_eq!(ciphers(&messages[0]), ciphers(&baseline[0]));
     }
 }
 
@@ -908,7 +905,6 @@ fn ech_firefox_policy_matches_live_client_hello() {
     // A bounded 15-suite test configuration. Neither range is a universal
     // limit: tickets and different extensions can grow it.
     const CIPHERS: &str = concat!(
-        "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384:",
         "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:",
         "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:",
         "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:",
@@ -933,7 +929,14 @@ fn ech_firefox_policy_matches_live_client_hello() {
         .ctx()
         .set_min_proto_version(Some(SslVersion::TLS1_2))
         .unwrap();
-    client.ctx().set_preserve_tls13_cipher_list(true);
+    client
+        .ctx()
+        .set_tls13_ciphers(&[
+            Tls13Cipher::AES_128_GCM_SHA256,
+            Tls13Cipher::CHACHA20_POLY1305_SHA256,
+            Tls13Cipher::AES_256_GCM_SHA384,
+        ])
+        .unwrap();
     client.ctx().set_cipher_list(CIPHERS).unwrap();
     client.ctx().set_alpn_protos(b"\x02h2\x08http/1.1").unwrap();
     client.ctx().set_grease_enabled(false);

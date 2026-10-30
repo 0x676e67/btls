@@ -38,7 +38,7 @@ use crate::stack::{Stack, StackRef, Stackable};
 use crate::string::OpensslString;
 use crate::try_int;
 use crate::util::ForeignTypeRefExt;
-use crate::x509::verify::{X509VerifyParam, X509VerifyParamRef};
+use crate::x509::verify::{X509CheckFlags, X509VerifyParam, X509VerifyParamRef};
 use crate::{cvt, cvt_n, cvt_p};
 use crate::{ffi, free_data_box};
 
@@ -717,13 +717,27 @@ impl X509Ref {
         }
     }
 
+    /// Checks whether the certificate matches the given hostname.
+    ///
+    /// This uses the default hostname matching behavior. Use
+    /// [`X509Ref::check_host_with_flags`] to customize it.
     pub fn check_host(&self, host: &str) -> Result<bool, ErrorStack> {
+        self.check_host_with_flags(host, X509CheckFlags::empty())
+    }
+
+    /// Checks whether the certificate matches the given hostname using the supplied flags.
+    #[corresponds(X509_check_host)]
+    pub fn check_host_with_flags(
+        &self,
+        host: &str,
+        flags: X509CheckFlags,
+    ) -> Result<bool, ErrorStack> {
         unsafe {
             cvt_n(ffi::X509_check_host(
                 self.as_ptr(),
                 host.as_ptr().cast(),
                 host.len(),
-                0,
+                flags.bits(),
                 ptr::null_mut(),
             ))
             .map(|n| n == 1)
@@ -1179,6 +1193,16 @@ impl X509NameRef {
         #[corresponds(i2d_X509_NAME)]
         to_der,
         ffi::i2d_X509_NAME
+    }
+
+    /// Compares `self` and `other`'s canonicalized forms.
+    #[corresponds(X509_NAME_cmp)]
+    pub fn try_cmp(&self, other: &X509NameRef) -> Result<std::cmp::Ordering, ErrorStack> {
+        let r = unsafe { ffi::X509_NAME_cmp(self.as_ptr(), other.as_ptr()) };
+        if r == -2 {
+            return Err(ErrorStack::get());
+        }
+        Ok(r.cmp(&0))
     }
 }
 

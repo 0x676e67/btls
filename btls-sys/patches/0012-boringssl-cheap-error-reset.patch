@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: gngpp <gngppz@gmail.com>
 Date: Thu, 1 Oct 2026 00:00:00 +0800
-Subject: [PATCH 13/13] boringssl: skip clearing an empty error queue
+Subject: [PATCH 12/13] boringssl: skip clearing an empty error queue
 
 Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
 
@@ -22,6 +22,7 @@ limitations under the License.
  2 files changed, 53 insertions(+), 2 deletions(-)
 
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 399c2a3b9..3b652af49 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -74,9 +74,12 @@ static ExDataClass g_ex_data_class_ssl_ctx(/*with_app_data=*/true);
@@ -40,9 +41,10 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
  }
  
 diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index 6c3e42ab5..ced8b9a57 100644
 --- a/ssl/ssl_test.cc
 +++ b/ssl/ssl_test.cc
-@@ -11727,6 +11727,54 @@ TEST(SSLTest, ErrorSyscallAfterCloseNotify) {
+@@ -12060,6 +12060,54 @@ TEST(SSLTest, ErrorSyscallAfterCloseNotify) {
    write_failed = false;
  }
  

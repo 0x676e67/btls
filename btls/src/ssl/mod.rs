@@ -106,7 +106,8 @@ use crate::{ffi, free_data_box};
 pub use self::async_callbacks::{
     AsyncPrivateKeyMethod, AsyncPrivateKeyMethodError, AsyncSelectCertError, BoxCustomVerifyFinish,
     BoxCustomVerifyFuture, BoxGetSessionFinish, BoxGetSessionFuture, BoxPrivateKeyMethodFinish,
-    BoxPrivateKeyMethodFuture, BoxSelectCertFinish, BoxSelectCertFuture, ExDataFuture,
+    BoxPrivateKeyMethodFuture, BoxSelectCertActionFinish, BoxSelectCertActionFuture,
+    BoxSelectCertFinish, BoxSelectCertFuture, ExDataFuture,
 };
 pub use self::connector::{
     ClientSession, ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector,
@@ -356,6 +357,18 @@ impl SslMethod {
     #[must_use]
     pub fn as_ptr(&self) -> *const ffi::SSL_METHOD {
         self.ptr
+    }
+
+    #[doc(hidden)]
+    #[deprecated(note = "renamed to `tls()`")]
+    pub fn tls_server() -> Self {
+        Self::tls()
+    }
+
+    #[doc(hidden)]
+    #[deprecated(note = "renamed to `tls()`")]
+    pub fn tls_client() -> Self {
+        Self::tls()
     }
 }
 
@@ -623,6 +636,22 @@ impl SelectCertError {
 
     /// The operation could not be completed and should be retried later.
     pub const RETRY: Self = Self(ffi::ssl_select_cert_result_t::ssl_select_cert_retry);
+}
+
+/// An action returned from a certificate selection callback.
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum SelectCertAction {
+    /// Complete certificate selection normally.
+    Success,
+    /// Discard ClientHelloInner and continue with ClientHelloOuter.
+    ///
+    /// BoringSSL calls the callback again with ClientHelloOuter and continues the handshake
+    /// without retry configs. This action is only valid when [`SslRef::ech_accepted`] is true;
+    /// otherwise the handshake fails.
+    /// Changes made to the connection while processing ClientHelloInner carry over to the outer
+    /// ClientHello.
+    DisableEch,
 }
 
 /// Extension types, to be used with `ClientHello::get_extension`.
@@ -895,6 +924,22 @@ impl KeyShare {
 
     #[cfg(not(feature = "fips"))]
     pub const FFDHE3072: KeyShare = KeyShare(ffi::SSL_GROUP_FFDHE3072 as _);
+}
+
+/// A TLS 1.3 cipher suite.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct Tls13Cipher(u16);
+
+impl Tls13Cipher {
+    pub const AES_128_GCM_SHA256: Tls13Cipher =
+        Tls13Cipher(ffi::SSL_CIPHER_AES_128_GCM_SHA256 as _);
+
+    pub const AES_256_GCM_SHA384: Tls13Cipher =
+        Tls13Cipher(ffi::SSL_CIPHER_AES_256_GCM_SHA384 as _);
+
+    pub const CHACHA20_POLY1305_SHA256: Tls13Cipher =
+        Tls13Cipher(ffi::SSL_CIPHER_CHACHA20_POLY1305_SHA256 as _);
 }
 
 /// A compliance policy.
@@ -1308,7 +1353,7 @@ impl SslContextBuilder {
             self.ctx.replace_ex_data(callback_index, callback);
             let callback = self.ctx.ex_data(callback_index).unwrap();
 
-            let arg = std::ptr::from_ref(callback).cast_mut().cast();
+            let arg = ptr::from_ref(callback).cast_mut().cast();
             ffi::SSL_CTX_set_tlsext_servername_arg(self.as_ptr(), arg);
             ffi::SSL_CTX_set_tlsext_servername_callback(self.as_ptr(), Some(raw_sni::<F>));
         }
@@ -1632,7 +1677,7 @@ impl SslContextBuilder {
     /// See [`SslContextBuilder::set_strict_cipher_list()`].
     ///
     /// The `set_ciphersuites` method controls the cipher suites for TLSv1.3 in OpenSSL.
-    /// BoringSSL doesn't implement `set_ciphersuites`.
+    /// BoringSSL doesn't implement `set_ciphersuites`; use [`Self::set_tls13_ciphers`] instead.
     /// See [ssl.h](https://github.com/google/boringssl/blob/master/include/openssl/ssl.h#L1542-L1544).
     ///
     /// See [`ciphers`] for details on the format.
@@ -1653,7 +1698,7 @@ impl SslContextBuilder {
     /// tolerate anything meaningless in the cipher list.
     ///
     /// The `set_ciphersuites` method controls the cipher suites for TLSv1.3 in OpenSSL.
-    /// BoringSSL doesn't implement `set_ciphersuites`.
+    /// BoringSSL doesn't implement `set_ciphersuites`; use [`Self::set_tls13_ciphers`] instead.
     /// See <https://github.com/google/boringssl/blob/main/include/openssl/ssl.h#L1685>
     ///
     /// See [`ciphers`] for details on the format.
@@ -1828,10 +1873,39 @@ impl SslContextBuilder {
     /// Sets a callback that is called before most ClientHello processing and before the decision whether
     /// to resume a session is made. The callback may inspect the ClientHello and configure the
     /// connection.
+    ///
+    /// A context has a single certificate selection callback. Calling this method replaces the
+    /// callback set by any of [`SslContextBuilder::set_select_certificate_callback`],
+    /// [`SslContextBuilder::set_select_certificate_callback_with_action`],
+    /// [`SslContextBuilder::set_async_select_certificate_callback`], or
+    /// [`SslContextBuilder::set_async_select_certificate_callback_with_action`].
     #[corresponds(SSL_CTX_set_select_certificate_cb)]
     pub fn set_select_certificate_callback<F>(&mut self, callback: F)
     where
         F: Fn(ClientHello<'_>) -> Result<(), SelectCertError> + Sync + Send + 'static,
+    {
+        self.set_select_certificate_callback_with_action(move |client_hello| {
+            callback(client_hello).map(|()| SelectCertAction::Success)
+        });
+    }
+
+    /// Sets an action-aware callback that is called before most ClientHello processing and before
+    /// the decision whether to resume a session is made. The callback may inspect the ClientHello
+    /// and configure the connection.
+    ///
+    /// [`SelectCertAction::DisableEch`] causes BoringSSL to discard an inner ClientHello, call
+    /// this callback again with the outer ClientHello, and continue without retry configs.
+    /// It is only valid when ECH has been accepted; returning it otherwise fails the handshake.
+    ///
+    /// A context has a single certificate selection callback. Calling this method replaces the
+    /// callback set by any of [`SslContextBuilder::set_select_certificate_callback`],
+    /// [`SslContextBuilder::set_select_certificate_callback_with_action`],
+    /// [`SslContextBuilder::set_async_select_certificate_callback`], or
+    /// [`SslContextBuilder::set_async_select_certificate_callback_with_action`].
+    #[corresponds(SSL_CTX_set_select_certificate_cb)]
+    pub fn set_select_certificate_callback_with_action<F>(&mut self, callback: F)
+    where
+        F: Fn(ClientHello<'_>) -> Result<SelectCertAction, SelectCertError> + Sync + Send + 'static,
     {
         unsafe {
             self.replace_ex_data(SslContext::cached_ex_index::<F>(), callback);
@@ -2235,37 +2309,23 @@ impl SslContextBuilder {
         }
     }
 
-    /// Sets whether the aes hardware override should be enabled.
-    #[cfg(not(feature = "fips"))]
-    #[corresponds(SSL_CTX_set_aes_hw_override)]
-    pub fn set_aes_hw_override(&mut self, enable: bool) {
-        unsafe { ffi::SSL_CTX_set_aes_hw_override(self.as_ptr(), enable as _) }
-    }
-
-    /// Sets whether to preserve the TLS 1.3 cipher list as configured by [`Self::set_cipher_list`].
+    /// Sets the TLS 1.3 cipher suites in preference order.
     ///
-    /// By default, BoringSSL does not preserve the TLS 1.3 cipher list. When this option is disabled
-    /// (the default), BoringSSL uses its internal default TLS 1.3 cipher suites in its default order,
-    /// regardless of what is set via [`Self::set_cipher_list`].
-    ///
-    /// When enabled, this option ensures that the TLS 1.3 cipher suites explicitly set via
-    /// [`Self::set_cipher_list`] are retained in their original order, without being reordered or
-    /// modified by BoringSSL's internal logic. This is useful for maintaining specific cipher suite
-    /// priorities for TLS 1.3. Note that if [`Self::set_cipher_list`] does not include any TLS 1.3
-    /// cipher suites, BoringSSL will still fall back to its default TLS 1.3 cipher suites and order.
-    ///
-    /// This feature isn't available in the certified version of BoringSSL.
-    ///
-    /// # Note
-    ///
-    /// This method must be called **before** [`Self::set_cipher_list`] to take effect.
-    /// If called after [`Self::set_cipher_list`], the setting will be ignored.
-    ///
-    /// [`Self::set_cipher_list`]: #method.set_cipher_list
-    #[cfg(not(feature = "fips"))]
-    #[corresponds(SSL_CTX_set_preserve_tls13_cipher_list)]
-    pub fn set_preserve_tls13_cipher_list(&mut self, enable: bool) {
-        unsafe { ffi::SSL_CTX_set_preserve_tls13_cipher_list(self.as_ptr(), enable as _) }
+    /// Clients offer them in this order, and servers pick strictly by it. An empty list restores
+    /// BoringSSL's default, which depends on AES hardware support. [`Self::set_cipher_list`] does
+    /// not affect TLS 1.3. [`Self::set_compliance_policy`] and this method replace each other's
+    /// TLS 1.3 list, so the later call wins.
+    #[corresponds(SSL_CTX_set1_tls13_ciphers)]
+    pub fn set_tls13_ciphers(&mut self, ciphers: &[Tls13Cipher]) -> Result<(), ErrorStack> {
+        // SAFETY: `Tls13Cipher` is a transparent `u16`, and BoringSSL copies the list.
+        unsafe {
+            cvt(ffi::SSL_CTX_set1_tls13_ciphers(
+                self.as_ptr(),
+                ciphers.as_ptr().cast(),
+                ptr::null(),
+                ciphers.len(),
+            ))
+        }
     }
 
     /// Sets the ClientHello extension order.
@@ -2433,7 +2493,7 @@ impl SslContextBuilder {
         unsafe {
             cvt_0i(ffi::SSL_CTX_set1_accepted_peer_cert_types(
                 self.as_ptr(),
-                types.as_ptr() as *const u8,
+                types.as_ptr().cast::<u8>(),
                 types.len(),
             ))
             .map(|_| ())
@@ -2741,7 +2801,7 @@ impl SslContextRef {
             }
 
             Some(slice::from_raw_parts(
-                types as *const CertificateType,
+                types.cast::<CertificateType>(),
                 types_len,
             ))
         }
@@ -3403,6 +3463,7 @@ impl SslRef {
     }
 
     /// Returns whether the TLS 1.3 HelloRetryRequest was used
+    #[must_use]
     pub fn used_hello_retry_request(&self) -> bool {
         unsafe { ffi::SSL_used_hello_retry_request(self.as_ptr()) == 1 }
     }
@@ -4611,6 +4672,7 @@ impl SslRef {
     /// Returns the public key sent by the other peer, `None` if there is no ongoing handshake.
     #[corresponds(SSL_get0_peer_pubkey)]
     #[cfg(feature = "rpk")]
+    #[must_use]
     pub fn peer_pubkey(&self) -> Option<&PKeyRef<Public>> {
         unsafe {
             let pubkey = ffi::SSL_get0_peer_pubkey(self.as_ptr());
@@ -4619,7 +4681,7 @@ impl SslRef {
                 return None;
             }
 
-            Some(PKeyRef::from_ptr(pubkey as *mut _))
+            Some(PKeyRef::from_ptr(pubkey.cast_mut()))
         }
     }
 
@@ -4642,7 +4704,7 @@ impl SslRef {
         unsafe {
             cvt_0i(ffi::SSL_set1_accepted_peer_cert_types(
                 self.as_ptr(),
-                types.as_ptr() as *const u8,
+                types.as_ptr().cast::<u8>(),
                 types.len(),
             ))
             .map(|_| ())
@@ -4671,7 +4733,7 @@ impl SslRef {
             }
 
             Some(slice::from_raw_parts(
-                types as *const CertificateType,
+                types.cast::<CertificateType>(),
                 types_len,
             ))
         }
@@ -4806,12 +4868,20 @@ impl SslRef {
         unsafe { ffi::SSL_set_alps_use_new_codepoint(self.as_ptr(), enable) }
     }
 
-    /// Sets whether the aes hardware override should be enabled.
-    #[cfg(not(feature = "fips"))]
-    #[corresponds(SSL_set_aes_hw_override)]
-    pub fn set_aes_hw_override(&mut self, enable: bool) {
-        let enable = if enable { 1 } else { 0 };
-        unsafe { ffi::SSL_set_aes_hw_override(self.as_ptr(), enable) }
+    /// Overrides [`SslContextBuilder::set_tls13_ciphers`] for this connection.
+    ///
+    /// An empty list restores BoringSSL's default, not the context's list.
+    #[corresponds(SSL_set1_tls13_ciphers)]
+    pub fn set_tls13_ciphers(&mut self, ciphers: &[Tls13Cipher]) -> Result<(), ErrorStack> {
+        // SAFETY: `Tls13Cipher` is a transparent `u16`, and BoringSSL copies the list.
+        unsafe {
+            cvt(ffi::SSL_set1_tls13_ciphers(
+                self.as_ptr(),
+                ciphers.as_ptr().cast(),
+                ptr::null(),
+                ciphers.len(),
+            ))
+        }
     }
 
     /// Requests `num_bytes` of padding from the server in its EncryptedExtensions.
@@ -5606,20 +5676,20 @@ pub trait CertificateCompressor: Send + Sync + 'static {
 
     /// Perform compression of `input` buffer and write compressed data to `output`.
     #[allow(unused_variables)]
-    fn compress<W>(&self, input: &[u8], output: &mut W) -> std::io::Result<()>
+    fn compress<W>(&self, input: &[u8], output: &mut W) -> io::Result<()>
     where
-        W: std::io::Write,
+        W: Write,
     {
-        Err(std::io::Error::other("not implemented"))
+        Err(io::Error::other("not implemented"))
     }
 
     /// Perform decompression of `input` buffer and write compressed data to `output`.
     #[allow(unused_variables)]
-    fn decompress<W>(&self, input: &[u8], output: &mut W) -> std::io::Result<()>
+    fn decompress<W>(&self, input: &[u8], output: &mut W) -> io::Result<()>
     where
-        W: std::io::Write,
+        W: Write,
     {
-        Err(std::io::Error::other("not implemented"))
+        Err(io::Error::other("not implemented"))
     }
 }
 
