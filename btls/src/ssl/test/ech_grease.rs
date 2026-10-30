@@ -339,6 +339,50 @@ fn ech_callback_selects_aead_without_changing_tls_ciphers() {
 }
 
 #[test]
+fn ech_boringssl_parameters_match_default_draw() {
+    // Each of the four lengths is missed by 256 draws with probability 2^-106,
+    // so the draws also prove a budget equal to the largest length fits.
+    let vector = firefox_tcp(19);
+    for aead in [EchGreaseAead::AES_128_GCM, EchGreaseAead::CHACHA20_POLY1305] {
+        let mut raw = vector.info();
+        raw.max_payload_length = 240;
+        let info = EchGreaseSizeInfo(&raw);
+        let mut lengths = (0..256)
+            .map(|_| {
+                let parameters = info.boringssl_parameters(aead).unwrap();
+                assert_eq!(
+                    parameters,
+                    EchGreaseParameters::new(aead, parameters.payload_length)
+                );
+                usize::from(parameters.payload_length.get())
+            })
+            .collect::<Vec<_>>();
+        lengths.sort_unstable();
+        lengths.dedup();
+        assert_eq!(lengths, DEFAULT_PAYLOAD_LENGTHS);
+    }
+    let mut raw = vector.info();
+    raw.max_payload_length = 143;
+    assert!(EchGreaseSizeInfo(&raw)
+        .boringssl_parameters(EchGreaseAead::AES_128_GCM)
+        .is_err());
+
+    // The helper also works inside a live callback.
+    let messages = handshake(
+        |ssl| {
+            ssl.set_ech_grease_callback(|_, info| {
+                info.boringssl_parameters(EchGreaseAead::AES_128_GCM)
+            })
+            .unwrap();
+        },
+        false,
+    );
+    let extension = ech(&messages[0]);
+    assert_eq!(&extension[ECH_AEAD_OFFSET..ECH_AEAD_OFFSET + 2], &[0, 1]);
+    assert!(DEFAULT_PAYLOAD_LENGTHS.contains(&(extension.len() - ECH_BODY_FRAMING_LEN)));
+}
+
+#[test]
 fn ech_callback_replacement_uses_latest_length() {
     let messages = handshake(
         |ssl| {

@@ -164,6 +164,39 @@ impl EchGreaseSizeInfo<'_> {
         self.0.is_quic != 0
     }
 
+    /// Parameters drawn as BoringSSL does without a callback, advertising `aead`.
+    ///
+    /// The payload is 128, 160, 192 or 224 bytes plus the AEAD tag, chosen
+    /// uniformly, and `enc` is an X25519 public key. Pass
+    /// [`default_aead`](Self::default_aead) to keep BoringSSL's choice, which
+    /// depends on AES hardware, or a fixed AEAD to advertise the same one on
+    /// every host. Fails if the length exceeds
+    /// [`max_payload_length`](Self::max_payload_length).
+    ///
+    /// ```
+    /// use btls::ssl::{EchGreaseAead, SslConnector, SslMethod};
+    /// # fn build() -> Result<(), btls::error::ErrorStack> {
+    /// let mut builder = SslConnector::builder(SslMethod::tls())?;
+    /// builder.set_ech_grease_callback(|_, info| {
+    ///     info.boringssl_parameters(EchGreaseAead::AES_128_GCM)
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn boringssl_parameters(
+        &self,
+        aead: EchGreaseAead,
+    ) -> Result<EchGreaseParameters, ErrorStack> {
+        let mut draw = [0];
+        rand_bytes(&mut draw)?;
+        // 256 is a multiple of 4, so each of the four sizes is equally likely.
+        let payload_length = 32 * (4 + usize::from(draw[0] % 4)) + self.aead_overhead();
+        Ok(EchGreaseParameters::new(
+            aead,
+            self.checked_payload_length(payload_length)?,
+        ))
+    }
+
     /// NSS-shaped payload length, including the tag, with explicit rounding.
     ///
     /// Follows NSS's [`tls13_MaybeGreaseEch`]: the inner hello keeps
@@ -267,11 +300,7 @@ impl EchGreaseSizeInfo<'_> {
         rounding: EchGreaseRounding,
     ) -> Result<EchGreaseParameters, ErrorStack> {
         let payload_length = self.nss_payload_length(max_name_len, host_len, rounding);
-        let payload_length = u16::try_from(payload_length)
-            .ok()
-            .filter(|len| usize::from(*len) <= self.max_payload_length())
-            .and_then(NonZeroU16::new)
-            .ok_or_else(|| ErrorStack::internal_error_str("ECH GREASE payload exceeds budget"))?;
+        let payload_length = self.checked_payload_length(payload_length)?;
         let mut coin = [0];
         rand_bytes(&mut coin)?;
         Ok(EchGreaseParameters {
@@ -283,6 +312,14 @@ impl EchGreaseSizeInfo<'_> {
             payload_length,
             random_enc: true,
         })
+    }
+
+    fn checked_payload_length(&self, len: usize) -> Result<NonZeroU16, ErrorStack> {
+        u16::try_from(len)
+            .ok()
+            .filter(|len| usize::from(*len) <= self.max_payload_length())
+            .and_then(NonZeroU16::new)
+            .ok_or_else(|| ErrorStack::internal_error_str("ECH GREASE payload exceeds budget"))
     }
 }
 
@@ -344,6 +381,7 @@ impl SslContextBuilder {
     /// callbacks.
     /// See [`EchGreaseSizeInfo::max_payload_length`] for sizing limits. Arbitrary
     /// lengths need not follow [RFC 9849]'s recommended distribution;
+    /// [`EchGreaseSizeInfo::boringssl_parameters`] reproduces BoringSSL's draw and
     /// [`EchGreaseSizeInfo::nss_parameters`] provides NSS-shaped parameters.
     /// Unlike NSS, this also applies to DTLS when ECH GREASE is enabled.
     /// Callbacks of other closure types may remain stored until this context
