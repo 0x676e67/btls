@@ -40,8 +40,8 @@ pub enum EchGreaseRounding {
     /// NSS before 3.127, as used by Firefox 119-154: pad to `32k + 31`.
     /// This reproduces the historical behavior, not RFC 9849's padding rule.
     NssPre3127,
-    /// Round up to a multiple of 32 ([RFC 9849] 6.1.3), as in NSS 3.127 /
-    /// Firefox 155 onward. See the [official fix] for Bug 2060720.
+    /// NSS 3.127 and later, as used by Firefox 155 onward: round up to a
+    /// multiple of 32 ([RFC 9849] 6.1.3). See the [official fix] for Bug 2060720.
     ///
     /// [RFC 9849]: https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.3
     /// [official fix]: https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_127.html
