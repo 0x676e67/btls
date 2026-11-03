@@ -11,7 +11,7 @@ use foreign_types::ForeignTypeRef;
 use super::server::{ClientSslBuilder, Server};
 use crate::error::ErrorStack;
 use crate::ffi;
-use crate::ssl::EchGreaseRounding::{NssPre3127, Rfc9849};
+use crate::ssl::EchGreaseRounding::{Nss3127, NssPre3127};
 use crate::ssl::{
     EchGreaseAead, EchGreaseParameters, EchGreaseSizeInfo, ExtensionType, Ssl, SslConnector,
     SslContext, SslMethod, SslRef, SslVerifyMode, SslVersion, Tls13Cipher,
@@ -716,7 +716,7 @@ fn ech_connector_policy_uses_per_connection_host_length() {
     });
     let server = server.build();
     let host_length = Ssl::new_ex_index::<usize>().unwrap();
-    for rounding in [NssPre3127, Rfc9849] {
+    for rounding in [NssPre3127, Nss3127] {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let metadata = Arc::clone(&observed);
         let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
@@ -904,7 +904,7 @@ fn ech_nss_historical_payload_lengths() {
         assert_eq!(
             [
                 info.nss_payload_length(max_name, host, NssPre3127),
-                info.nss_payload_length(max_name, host, Rfc9849)
+                info.nss_payload_length(max_name, host, Nss3127)
             ],
             expected,
             "{name}",
@@ -934,7 +934,7 @@ fn ech_nss_historical_rounding_boundaries() {
         assert_eq!(
             [
                 info.nss_payload_length(max_name, 19, NssPre3127),
-                info.nss_payload_length(max_name, 19, Rfc9849)
+                info.nss_payload_length(max_name, 19, Nss3127)
             ],
             expected,
             "max_name_len={max_name}",
@@ -986,7 +986,7 @@ fn ech_firefox_policy_matches_live_client_hello() {
     client.ctx().set_grease_enabled(false);
     client.ctx().set_extension_permutation(&order).unwrap();
     let client = client.build();
-    for (rounding, allowed_lengths) in [(NssPre3127, [207, 239, 271]), (Rfc9849, [208, 240, 272])] {
+    for (rounding, allowed_lengths) in [(NssPre3127, [207, 239, 271]), (Nss3127, [208, 240, 272])] {
         let mut host_lengths = [None; 3];
         for (index, &host) in hosts.iter().enumerate() {
             for hrr in [false, true] {
@@ -1063,7 +1063,7 @@ fn ech_nss_ip_host_length_without_sni() {
     let raw = vector.info();
     let info = EchGreaseSizeInfo(&raw);
     for (host_len, below, above) in [(9, 93, 94), (3, 87, 88), (265, 93, 94)] {
-        for (rounding, lower, upper) in [(NssPre3127, 239, 239), (Rfc9849, 208, 240)] {
+        for (rounding, lower, upper) in [(NssPre3127, 239, 239), (Nss3127, 208, 240)] {
             assert_eq!(info.nss_payload_length(below, host_len, rounding), lower);
             assert_eq!(info.nss_payload_length(above, host_len, rounding), upper);
         }
@@ -1106,7 +1106,7 @@ fn ech_nss_sizing_ablation() {
         assert_eq!(
             [
                 info.nss_payload_length(max_name, 19, NssPre3127),
-                info.nss_payload_length(max_name, 19, Rfc9849)
+                info.nss_payload_length(max_name, 19, Nss3127)
             ],
             expected,
             "{factor}"
@@ -1117,7 +1117,7 @@ fn ech_nss_sizing_ablation() {
 #[test]
 fn ech_nss_parameters_enforce_budget_and_draw_aead() {
     let vector = firefox_tcp(19);
-    for (rounding, length) in [(NssPre3127, 239), (Rfc9849, 240)] {
+    for (rounding, length) in [(NssPre3127, 239), (Nss3127, 240)] {
         for budget in [0, length - 1, length, length + 1] {
             let mut raw = vector.info();
             raw.max_payload_length = budget;
@@ -1139,7 +1139,7 @@ fn ech_nss_parameters_enforce_budget_and_draw_aead() {
         let info = EchGreaseSizeInfo(&raw);
         let aes = (0..64)
             .filter(|_| {
-                info.nss_parameters(100, 19, Rfc9849).unwrap().aead == EchGreaseAead::AES_128_GCM
+                info.nss_parameters(100, 19, Nss3127).unwrap().aead == EchGreaseAead::AES_128_GCM
             })
             .count();
         assert!(aes > 0 && aes < 64, "default={default_aead:?}, aes={aes}");
@@ -1221,7 +1221,7 @@ fn ech_policy_resumption_preserves_psk_binder() {
     client.ctx().set_ech_grease_callback(move |_, info| {
         let resumed = count.fetch_add(1, Ordering::SeqCst) != 0;
         assert_eq!(info.psk_extension_length() != 0, resumed);
-        let parameters = info.nss_parameters(100, 9, Rfc9849)?;
+        let parameters = info.nss_parameters(100, 9, Nss3127)?;
         *reported.lock().unwrap() = Some((
             info.psk_extension_length(),
             info.message_length(),
