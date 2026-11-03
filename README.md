@@ -17,13 +17,13 @@ To use `btls`, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-btls = "0.5"
+btls = "0.6"
 ```
 
 Next, add this to your crate:
 
 ```rust
-use btls::ssl::{{Ssl, SslConnector};
+use btls::ssl::{Ssl, SslConnector};
 
 fn main() {
     // ...
@@ -32,7 +32,7 @@ fn main() {
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 ([LICENSE](LICENSE) or
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or
 http://www.apache.org/licenses/LICENSE-2.0).
 
 ## Contribution
