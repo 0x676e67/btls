@@ -713,3 +713,56 @@ async fn shutdown_after_fatal_alert_closes_the_transport() {
     server.get_mut().read_to_end(&mut wire).await.unwrap();
     assert_eq!(wire, alert);
 }
+
+/// Accepts every write and fails every read with `NotConnected`.
+struct Unconnected;
+
+impl AsyncRead for Unconnected {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::ErrorKind::NotConnected.into()))
+    }
+}
+
+impl AsyncWrite for Unconnected {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn handshake_reports_not_connected() {
+    // btls retries `NotConnected` like `WouldBlock`, but no waker is registered for it.
+    let connector = SslConnector::builder(SslMethod::tls()).unwrap().build();
+    let ssl = connector
+        .configure()
+        .unwrap()
+        .into_ssl("localhost")
+        .unwrap();
+    let mut client = SslStream::new(ssl, Unconnected).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    match Pin::new(&mut client).poll_connect(&mut cx) {
+        Poll::Ready(Err(e)) => {
+            assert_eq!(
+                e.io_error().map(io::Error::kind),
+                Some(io::ErrorKind::NotConnected)
+            );
+        }
+        result => panic!("expected NotConnected: {result:?}"),
+    }
+}

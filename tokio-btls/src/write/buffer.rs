@@ -6,10 +6,12 @@ use tokio::io::AsyncWrite;
 use super::{MAX_RECORD, RECORD_OVERHEAD, WRITE_BUF_CAPACITY};
 use crate::transport::Transport;
 
-/// Sealed records not yet written to the transport.
+/// Sealed records not yet written to the transport, in order.
 ///
-/// Partial writes advance `pos` instead of shifting the rest; appends drop the written prefix
-/// through [`make_room`](Self::make_room).
+/// Output of [`seal_app_data`](btls::ssl::SslRef::seal_app_data) must reach the peer before
+/// anything written later, so buffered records are never dropped or overtaken. Partial writes
+/// advance `pos` instead of shifting the rest; appends drop the written prefix through
+/// [`make_room`](Self::make_room).
 #[derive(Default)]
 pub(crate) struct WriteBuffer {
     bytes: Vec<u8>,
@@ -44,7 +46,7 @@ impl WriteBuffer {
         self.bytes.is_empty()
     }
 
-    /// Allocated room, buffered records included.
+    /// Capacity of the backing allocation.
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.bytes.capacity()
@@ -105,7 +107,8 @@ impl WriteBuffer {
     }
 
     /// Reserves room for the records sealed from `total` plaintext bytes, up to the cap, when
-    /// they span more than one record.
+    /// they span more than one record. Assumes full records up to the cap; smaller fragments or a
+    /// tail past it grow the buffer.
     #[inline]
     pub(crate) fn reserve(&mut self, total: usize) {
         if total > MAX_RECORD {
@@ -148,7 +151,8 @@ impl WriteBuffer {
         }
     }
 
-    /// Writes buffered records to `transport`, keeping what it does not accept.
+    /// Writes buffered records to `transport`, keeping what it does not accept and freeing the
+    /// allocation once empty. Fails with `InvalidData` on an overcounted write, keeping its bytes.
     pub(crate) fn drain<S>(&mut self, transport: &mut Transport<S>) -> io::Result<()>
     where
         S: AsyncWrite,
@@ -157,10 +161,19 @@ impl WriteBuffer {
             if self.pos == self.bytes.len() {
                 break Ok(());
             }
-            let (stream, cx) = transport.parts();
+            let (stream, cx) = match transport.parts() {
+                Ok(parts) => parts,
+                Err(e) => break Err(e),
+            };
             match stream.poll_write(cx, self.buffered()) {
                 Poll::Ready(Ok(0)) => break Err(io::ErrorKind::WriteZero.into()),
-                Poll::Ready(Ok(n)) => self.pos += n,
+                Poll::Ready(Ok(n)) if n <= self.len() => self.pos += n,
+                Poll::Ready(Ok(_)) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "transport wrote more bytes than it was given",
+                    ))
+                }
                 Poll::Ready(Err(e)) => break Err(e),
                 Poll::Pending => break Err(io::Error::from(io::ErrorKind::WouldBlock)),
             }
@@ -172,28 +185,29 @@ impl WriteBuffer {
         res
     }
 
-    /// Writes buffered records and `record` in one transport write and buffers the rest.
+    /// Writes buffered records and `record` in one transport write and buffers the rest; without
+    /// vectored writes, `record` instead waits behind buffered records for the next drain.
     ///
-    /// Sets `blocked` if the transport returns `Pending` or an error, which leaves the unwritten
-    /// bytes buffered. The error is dropped; the next drain reports it only if it recurs.
+    /// Sets `blocked` on `Pending`, an error or an overcount, keeping the unwritten bytes (all of
+    /// them on an overcount) buffered; the next drain reports the error if it recurs.
     pub(crate) fn write_last<S>(&mut self, transport: &mut Transport<S>, record: &[u8])
     where
         S: AsyncWrite,
     {
-        let (stream, cx) = transport.parts();
         let pending = self.len();
-        let res = if pending == 0 {
-            stream.poll_write(cx, record)
-        } else if stream.is_write_vectored() {
-            let bufs = [io::IoSlice::new(self.buffered()), io::IoSlice::new(record)];
-            stream.poll_write_vectored(cx, &bufs)
-        } else {
+        let res = match transport.parts() {
+            Ok((stream, cx)) if pending == 0 => stream.poll_write(cx, record),
+            Ok((stream, cx)) if stream.is_write_vectored() => {
+                let bufs = [io::IoSlice::new(self.buffered()), io::IoSlice::new(record)];
+                stream.poll_write_vectored(cx, &bufs)
+            }
             // Let the next drain combine the buffer and record into one write.
-            Poll::Ready(Ok(0))
+            Ok(_) => Poll::Ready(Ok(0)),
+            Err(e) => Poll::Ready(Err(e)),
         };
         let n = match res {
-            Poll::Ready(Ok(n)) => n,
-            Poll::Ready(Err(_)) | Poll::Pending => {
+            Poll::Ready(Ok(n)) if n <= pending.saturating_add(record.len()) => n,
+            Poll::Ready(_) | Poll::Pending => {
                 self.blocked = true;
                 0
             }
@@ -238,11 +252,7 @@ fn seal_budget(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::Write,
-        pin::Pin,
-        task::{Context, Waker},
-    };
+    use std::{io::Write, pin::Pin, task::Context};
 
     use super::*;
     use crate::bio::StreamWrapper;
@@ -301,12 +311,11 @@ mod tests {
 
     #[test]
     fn last_record_follows_buffered_records() {
-        let mut cx = Context::from_waker(Waker::noop());
         let mut wrapper = StreamWrapper::new(Sink {
             budget: 0,
             data: Vec::new(),
         });
-        wrapper.transport.context = &mut cx as *mut _ as usize;
+        wrapper.transport.set_noop_context();
 
         wrapper.write_all(b"0123456789").unwrap();
         let err = wrapper.flush().unwrap_err();
@@ -335,12 +344,11 @@ mod tests {
     #[test]
     fn write_buf_bounded_under_partial_writes() {
         const CHUNK: usize = 16 * 1024;
-        let mut cx = Context::from_waker(Waker::noop());
         let mut wrapper = StreamWrapper::new(Sink {
             budget: 0,
             data: Vec::new(),
         });
-        wrapper.transport.context = &mut cx as *mut _ as usize;
+        wrapper.transport.set_noop_context();
 
         wrapper.write_all(&[0; 3 * CHUNK]).unwrap();
         for _ in 0..64 {
@@ -356,12 +364,11 @@ mod tests {
 
     #[test]
     fn write_buf_keeps_order_under_short_writes() {
-        let mut cx = Context::from_waker(Waker::noop());
         let mut wrapper = StreamWrapper::new(Sink {
             budget: 0,
             data: Vec::new(),
         });
-        wrapper.transport.context = &mut cx as *mut _ as usize;
+        wrapper.transport.set_noop_context();
 
         // A backlog that never empties, so the written prefix is only ever dropped by compaction.
         let mut expected = vec![0xff; 1024];
@@ -389,6 +396,51 @@ mod tests {
         wrapper.flush().unwrap();
         assert_eq!(wrapper.transport.stream.data, expected);
         assert_eq!(wrapper.write_buf.bytes.capacity(), 0);
+    }
+
+    /// Claims one byte more than each write was given.
+    struct Overreport;
+
+    impl AsyncWrite for Overreport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len() + 1))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn misused_transport_fails_without_panicking() {
+        let mut transport = Transport::new(Overreport);
+        let mut write_buf = WriteBuffer::default();
+        write_buf.push(b"record");
+
+        // Outside a poll there is no context to hand the transport.
+        let err = write_buf.drain(&mut transport).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        write_buf.write_last(&mut transport, b"last");
+        assert!(write_buf.blocked);
+        assert_eq!(write_buf.buffered(), b"recordlast");
+
+        // An overcount keeps the records, as an error would.
+        transport.set_noop_context();
+        let err = write_buf.drain(&mut transport).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(write_buf.buffered(), b"recordlast");
+        let mut write_buf = WriteBuffer::default();
+        write_buf.write_last(&mut transport, b"last");
+        assert!(write_buf.blocked);
+        assert_eq!(write_buf.buffered(), b"last");
     }
 
     #[test]

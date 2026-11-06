@@ -9,12 +9,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::{read::ReadBuffer, transport::Transport, write::WriteBuffer};
 
 /// The BIO stream handed to BoringSSL, buffering ciphertext in both directions.
+///
+/// Owned by the BIO for the life of the stream and reached through `SslStreamCore::get_mut`.
 pub(crate) struct StreamWrapper<S> {
     pub(crate) transport: Transport<S>,
     pub(crate) read_buf: ReadBuffer,
     pub(crate) write_buf: WriteBuffer,
-    // Set while sealing the last record of a write, which goes straight to the transport unless
-    // `write_buf` is blocked.
+    // Set while sealing the record packed last in a write, which `write_last` sends with the
+    // buffered records unless `write_buf` is blocked.
     pub(crate) write_through: bool,
     // Set once `SSL_shutdown` has nothing left to send; later polls only flush.
     pub(crate) shutdown_sent: bool,
@@ -25,7 +27,7 @@ pub(crate) struct StreamWrapper<S> {
 impl<S> StreamWrapper<S> {
     pub(crate) fn new(stream: S) -> Self {
         StreamWrapper {
-            transport: Transport { stream, context: 0 },
+            transport: Transport::new(stream),
             read_buf: ReadBuffer::default(),
             write_buf: WriteBuffer::default(),
             write_through: false,
@@ -70,7 +72,7 @@ where
 
     fn flush(&mut self) -> io::Result<()> {
         self.write_buf.drain(&mut self.transport)?;
-        let (stream, cx) = self.transport.parts();
+        let (stream, cx) = self.transport.parts()?;
         match stream.poll_flush(cx) {
             Poll::Ready(r) => r,
             Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),

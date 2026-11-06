@@ -4,12 +4,11 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::transport::Transport;
 
-/// Capacity of the ciphertext read buffer, large enough for one TLS record
-/// supported by BoringSSL.
+/// Capacity of the ciphertext read buffer, enough for a record header plus the largest
+/// ciphertext BoringSSL accepts (`SSL3_RT_MAX_ENCRYPTED_LENGTH`).
 ///
-/// BoringSSL may request record headers and bodies in separate BIO reads.
-/// Buffering lets these reads share data from one underlying read.
-/// Larger bursts may require multiple refills.
+/// BoringSSL may request record headers and bodies in separate BIO reads. Buffering lets these
+/// reads share data from one underlying read. Larger bursts may require multiple refills.
 const READ_BUF_CAPACITY: usize = 17 * 1024;
 
 /// Ciphertext read from the transport but not yet taken by BoringSSL.
@@ -57,16 +56,17 @@ impl ReadBuffer {
 
     /// Fills the empty buffer with a single read of `transport`.
     ///
-    /// Maps the stream's `Poll::Pending` to `WouldBlock`; the stream registers the waker.
+    /// Maps the stream's `Poll::Pending` to `WouldBlock`; the stream registers the waker. On
+    /// failure the buffer stays empty and unallocated.
     fn fill<S>(&mut self, transport: &mut Transport<S>) -> io::Result<()>
     where
         S: AsyncRead,
     {
+        let (stream, cx) = transport.parts()?;
         let mut bytes = mem::take(&mut self.bytes);
         bytes.reserve(READ_BUF_CAPACITY);
         self.pos = 0;
 
-        let (stream, cx) = transport.parts();
         let mut buf = ReadBuf::uninit(bytes.spare_capacity_mut());
         match stream.poll_read(cx, &mut buf)? {
             Poll::Ready(()) => {
@@ -83,11 +83,7 @@ impl ReadBuffer {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::Read,
-        pin::Pin,
-        task::{Context, Waker},
-    };
+    use std::{io::Read, pin::Pin, task::Context};
 
     use super::*;
     use crate::bio::StreamWrapper;
@@ -111,9 +107,8 @@ mod tests {
 
     #[test]
     fn read_buf_released_when_drained() {
-        let mut cx = Context::from_waker(Waker::noop());
         let mut wrapper = StreamWrapper::new(Once(vec![1; 100]));
-        wrapper.transport.context = &mut cx as *mut _ as usize;
+        wrapper.transport.set_noop_context();
 
         let mut buf = [0; 60];
         assert_eq!(wrapper.read(&mut buf).unwrap(), 60);

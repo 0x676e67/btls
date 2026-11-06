@@ -21,10 +21,12 @@ use crate::bio::StreamWrapper;
 /// plaintext tail of at most `MAX_RECORD` bytes.
 pub(crate) const WRITE_BUF_CAPACITY: usize = 64 * 1024;
 
-/// Largest plaintext in one TLS record.
+/// Largest plaintext in one TLS record
+/// ([RFC 8446 §5.1](https://www.rfc-editor.org/rfc/rfc8446#section-5.1)).
 pub(crate) const MAX_RECORD: usize = 16 * 1024;
 
-/// Room reserved per record for header, nonce and tag.
+/// Estimated per-record overhead (header, nonce, tag) reserved for `SSL_write` records; the
+/// buffer grows when CBC records need more.
 pub(crate) const RECORD_OVERHEAD: usize = 64;
 
 /// Output room for writes sealed on the stack: one full record plus a ticket flight.
@@ -34,10 +36,12 @@ pub(crate) const SEAL_STACK_LEN: usize = 17 * 1024;
 ///
 /// BoringSSL seals records across slice boundaries straight into caller memory: on the stack
 /// for a write of at most `MAX_RECORD` bytes with nothing buffered, otherwise after the
-/// buffered records, within the budget of [`WriteBuffer::seal`]. [`ssl_write_records`] handles
-/// the states it declines. Either way, once the transport refuses records in this write, later
-/// ones are only buffered. Only BoringSSL's own flush inside `SSL_write`, after a handshake or an
-/// alert, ignores this, and a `Pending` there is not tracked by the final drain.
+/// buffered records within the budget of [`WriteBuffer::seal`]; [`ssl_write_records`] handles
+/// what it declines. Once the transport refuses a record, the rest of the write is only buffered;
+/// only BoringSSL's own flush inside `SSL_write` ignores `blocked`.
+///
+/// Returns the plaintext consumed, `Ok(0)` only when `bufs` holds no bytes. Errors after sealing
+/// are dropped, as sealed bytes must not be resent; the next write reports them if they recur.
 pub(crate) fn write_records<S>(
     s: &mut SslStreamCore<StreamWrapper<S>>,
     bufs: &[io::IoSlice<'_>],
@@ -106,9 +110,9 @@ where
 /// Seals a write of at most `MAX_RECORD` bytes on the stack and sends it with one transport
 /// write.
 ///
-/// Records that cannot all fit, with small send fragments or a large pending flight, are
-/// buffered instead for the caller to send with the rest. Returns `Ok(None)` if BoringSSL
-/// declines, changing nothing.
+/// If small send fragments split the write and not every record fits, the sealed ones are
+/// buffered for the caller to send with the rest. Returns `Ok(None)` if BoringSSL declines,
+/// changing nothing.
 #[inline(never)] // keep the 17 KiB frame out of `write_records`
 fn seal_on_stack<S>(
     s: &mut SslStreamCore<StreamWrapper<S>>,
@@ -148,10 +152,12 @@ where
 ///
 /// Small adjacent slices share records as in a flattened buffer. Sealing stops once buffered
 /// ciphertext reaches `WRITE_BUF_CAPACITY`, except when at most `MAX_RECORD` plaintext bytes
-/// remain. The last record goes out with the buffer when possible; backpressure can leave it
-/// buffered too, and records are only buffered once the transport refuses one. The BIO accepts
-/// every record, so BoringSSL never holds a pending write that a retry with less data would
-/// fail.
+/// remain. Records are buffered as sealed; unless `blocked`, the one packed last goes out with
+/// them and a final drain sends anything left. The BIO accepts every record, so BoringSSL never
+/// holds a pending write that a retry with less data would fail.
+///
+/// Must follow [`WriteBuffer::retry`], with `total` the saturating sum of `bufs`. Returns like
+/// [`write_records`].
 pub(crate) fn ssl_write_records<S>(
     s: &mut SslStreamCore<StreamWrapper<S>>,
     bufs: &[io::IoSlice<'_>],
@@ -165,7 +171,7 @@ where
     let mut written = 0usize;
     let mut err = None;
     let mut packer = Packer::new(bufs);
-    // A short seal means a smaller fragment size; batch the rest instead.
+    // A short seal means a smaller send fragment or 0-RTT budget; batch the rest instead.
     let mut through = true;
     while let Some(plaintext) = packer.next_record() {
         let len = plaintext.len();

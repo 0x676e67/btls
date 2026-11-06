@@ -1,12 +1,12 @@
 //! Async TLS streams backed by BoringSSL.
 //!
-//! This crate provides a wrapper around the [`btls`] crate's [`SslStream`](ssl::SslStream) type
-//! that works with with [`tokio`]'s [`AsyncRead`] and [`AsyncWrite`] traits rather than std's
-//! blocking [`Read`](io::Read) and [`Write`] traits.
+//! This crate wraps the [`btls`] crate's [`SslStream`](ssl::SslStream) type so that it works
+//! with [`tokio`]'s [`AsyncRead`] and [`AsyncWrite`] traits rather than std's blocking
+//! [`Read`](io::Read) and [`Write`] traits.
 //!
-//! This file reimplements tokio-btls with the [overhauled](https://github.com/sfackler/tokio-openssl/commit/56f6618ab619f3e431fa8feec2d20913bf1473aa)
-//! tokio-openssl interface while the tokio APIs from official [boring](https://github.com/cloudflare/boring) crate is not yet caught up
-//! to it.
+//! It follows the [overhauled](https://github.com/sfackler/tokio-openssl/commit/56f6618ab619f3e431fa8feec2d20913bf1473aa)
+//! tokio-openssl interface, which the tokio APIs of the official
+//! [boring](https://github.com/cloudflare/boring) crate have not caught up to.
 
 mod bio;
 mod error;
@@ -31,7 +31,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     bio::StreamWrapper,
-    error::{closed_by_alert, cvt, cvt_ossl},
+    error::{closed_by_alert, cvt, cvt_ossl, would_block},
 };
 
 /// An asynchronous version of [`btls::ssl::SslStream`].
@@ -43,7 +43,8 @@ pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
 
 impl<S: AsyncRead + AsyncWrite> SslStream<S> {
     #[inline]
-    /// Like [`SslStream::new`](ssl::SslStream::new).
+    /// Like [`SslStream::new`](ssl::SslStream::new), but also enables
+    /// [`SslMode::ENABLE_PARTIAL_WRITE`] on `ssl`.
     pub fn new(mut ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
         // Allow `SSL_write` to return after one plaintext fragment.
         ssl.set_mode(SslMode::ENABLE_PARTIAL_WRITE);
@@ -127,17 +128,28 @@ impl<S> SslStream<S> {
         unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0.get_mut().transport.stream) }
     }
 
-    /// Runs `f` with `ctx` installed as the context of the transport I/O BoringSSL performs in it.
+    /// Runs `f` with `ctx` installed for the transport I/O performed in it, clearing it even if
+    /// `f` unwinds.
     fn with_context<F, R>(self: Pin<&mut Self>, ctx: &mut Context<'_>, f: F) -> R
     where
         F: FnOnce(&mut SslStreamCore<StreamWrapper<S>>) -> R,
     {
+        /// Clears the installed context when dropped.
+        struct Clear<'a, S>(&'a mut SslStreamCore<StreamWrapper<S>>);
+
+        impl<S> Drop for Clear<'_, S> {
+            fn drop(&mut self) {
+                self.0.get_mut().transport.clear_context();
+            }
+        }
+
         // SAFETY: nothing is moved out of `this`; `Transport::parts` re-pins the stream in place.
         let this = unsafe { self.get_unchecked_mut() };
-        this.0.get_mut().transport.context = ctx as *mut _ as usize;
-        let r = f(&mut this.0);
-        this.0.get_mut().transport.context = 0;
-        r
+        // SAFETY: `ctx` stays borrowed for this call and is not used again; `clear` clears it on
+        // return or unwind. The stream is structurally pinned in this `SslStream`.
+        unsafe { this.0.get_mut().transport.set_context(ctx) };
+        let clear = Clear(&mut this.0);
+        f(&mut *clear.0)
     }
 }
 
@@ -226,12 +238,7 @@ where
                     Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => {}
                     // A fatal alert already closed the write side; flush it and close the transport.
                     Err(ref e) if closed_by_alert(e) => {}
-                    Err(ref e)
-                        if e.code() == ErrorCode::WANT_READ
-                            || e.code() == ErrorCode::WANT_WRITE =>
-                    {
-                        return Poll::Pending;
-                    }
+                    Err(ref e) if would_block(e) => return Poll::Pending,
                     Err(e) => {
                         return Poll::Ready(Err(e
                             .into_io_error()
@@ -239,7 +246,8 @@ where
                     }
                 }
 
-                // Calling `SSL_shutdown` again would wait for the peer's close_notify instead.
+                // Calling `SSL_shutdown` again would wait for the peer's close_notify, which is
+                // not required: https://www.rfc-editor.org/rfc/rfc8446#section-6.1
                 s.get_mut().shutdown_sent = true;
                 Poll::Ready(Ok(()))
             }))?;
