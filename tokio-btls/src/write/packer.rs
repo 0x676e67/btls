@@ -11,8 +11,8 @@ pub(super) struct Packer<'a> {
     // The next unsealed byte is `bufs[i][off]`.
     i: usize,
     off: usize,
-    // Largest record to pack: `MAX_RECORD` until a short seal lowers it to a smaller send
-    // fragment or the remaining 0-RTT budget.
+    // Largest record to pack: `MAX_RECORD` until a short seal outside client 0-RTT reveals a
+    // smaller send fragment.
     pub(super) limit: usize,
     scratch: Vec<u8>,
 }

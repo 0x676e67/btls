@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context, Poll, Waker},
 };
@@ -38,6 +38,23 @@ struct Gate {
     tap: Vec<u8>,
     // Returned once instead of `Pending` when no data is left: EOF or an error.
     drained: Option<io::Result<()>>,
+}
+
+impl Gate {
+    fn new(io: DuplexStream) -> Self {
+        Gate {
+            io,
+            open: true,
+            budget: usize::MAX,
+            fail_when_spent: false,
+            interrupt: false,
+            interrupt_flush: false,
+            broken: false,
+            polls: 0,
+            tap: Vec::new(),
+            drained: None,
+        }
+    }
 }
 
 impl AsyncRead for Gate {
@@ -144,19 +161,7 @@ async fn tls_pair_from(
     if let Some(fragment) = max_fragment {
         ssl.set_max_send_fragment(fragment).unwrap();
     }
-    let gate = Gate {
-        io: client_io,
-        open: true,
-        budget: usize::MAX,
-        fail_when_spent: false,
-        interrupt: false,
-        interrupt_flush: false,
-        broken: false,
-        polls: 0,
-        tap: Vec::new(),
-        drained: None,
-    };
-    let mut client = SslStream::new(ssl, gate).unwrap();
+    let mut client = SslStream::new(ssl, Gate::new(client_io)).unwrap();
 
     let (connected, accepted) = tokio::join!(
         Pin::new(&mut client).connect(),
@@ -765,4 +770,82 @@ fn handshake_reports_not_connected() {
         }
         result => panic!("expected NotConnected: {result:?}"),
     }
+}
+
+#[tokio::test]
+async fn early_data_budget_keeps_full_records() {
+    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    acceptor.set_early_data_enabled(true);
+    acceptor
+        .set_private_key_file("tests/key.pem", SslFiletype::PEM)
+        .unwrap();
+    acceptor
+        .set_certificate_chain_file("tests/cert.pem")
+        .unwrap();
+    let acceptor = acceptor.build();
+
+    let session = Arc::new(Mutex::new(None));
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_early_data_enabled(true);
+    connector.set_ca_file("tests/cert.pem").unwrap();
+    let latest = session.clone();
+    connector.set_client_session_callback(move |_, new| *latest.lock().unwrap() = Some(new));
+    let connector = connector.build();
+
+    // The first connection leaves a ticket that allows early data.
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let ssl = connector
+        .configure()
+        .unwrap()
+        .into_ssl("localhost")
+        .unwrap();
+    let mut client = SslStream::new(ssl, client_io).unwrap();
+    let mut server = SslStream::new(Ssl::new(acceptor.context()).unwrap(), server_io).unwrap();
+    let (connected, accepted) = tokio::join!(
+        Pin::new(&mut client).connect(),
+        Pin::new(&mut server).accept()
+    );
+    connected.unwrap();
+    accepted.unwrap();
+    server.write_all(b"x").await.unwrap();
+    server.flush().await.unwrap();
+    client.read_exact(&mut [0; 1]).await.unwrap();
+    let session = session.lock().unwrap().take().unwrap();
+    assert!(session.session().early_data_capable());
+
+    // The resumed client enters 0-RTT at once and leaves 336 bytes of the 14336-byte budget.
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let ssl = connector
+        .configure()
+        .unwrap()
+        .client_session(session)
+        .into_ssl("localhost")
+        .unwrap();
+    let mut client = SslStream::new(ssl, Gate::new(client_io)).unwrap();
+    let mut server = SslStream::new(Ssl::new(acceptor.context()).unwrap(), server_io).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let res = Pin::new(&mut client).poll_connect(&mut cx);
+    assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
+    let early = vec![1; 14000];
+    client.write_all(&early).await.unwrap();
+    client.flush().await.unwrap();
+
+    // The server accepts early data and sends its flight, so the next write finishes the
+    // handshake on the way.
+    let res = Pin::new(&mut server).poll_accept(&mut cx);
+    assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
+    client.get_mut().tap.clear();
+    let data: Vec<u8> = (0..2 * MAX_RECORD).map(|i| i as u8).collect();
+    let res = Pin::new(&mut client).poll_write(&mut cx, &data);
+    assert!(
+        matches!(res, Poll::Ready(Ok(n)) if n == data.len()),
+        "{res:?}"
+    );
+    // The budget's last 336 bytes, EndOfEarlyData and Finished, then a full record and the tail.
+    let records = records(&client.get_ref().tap);
+    assert_eq!(records.len(), 5, "{records:?}");
+
+    let mut received = vec![0; early.len() + data.len()];
+    server.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, [&early[..], &data].concat());
 }

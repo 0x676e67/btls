@@ -171,7 +171,7 @@ where
     let mut written = 0usize;
     let mut err = None;
     let mut packer = Packer::new(bufs);
-    // A short seal means a smaller send fragment or 0-RTT budget; batch the rest instead.
+    // A short seal means a smaller send fragment or a 0-RTT budget; batch the rest instead.
     let mut through = true;
     while let Some(plaintext) = packer.next_record() {
         let len = plaintext.len();
@@ -184,8 +184,11 @@ where
             }
         };
         if n < len {
-            // Pack no more than one fragment, so a smaller one copies no plaintext twice.
-            packer.limit = n;
+            // Pack no more than one fragment, so a smaller one copies no plaintext twice. A
+            // client still in 0-RTT may instead have hit the early data budget.
+            if s.ssl().is_server() || !s.ssl().in_early_data() {
+                packer.limit = n;
+            }
             through = false;
         }
         written += n;
