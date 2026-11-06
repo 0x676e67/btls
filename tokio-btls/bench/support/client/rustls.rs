@@ -22,7 +22,7 @@ pub(super) struct Adapter;
 
 /// Accepts any server certificate, like the tokio-btls client with `SslVerifyMode::NONE`.
 ///
-/// The test certificate has no SAN and is a CA certificate, which webpki rejects.
+/// The test certificate is a self-signed CA certificate, which webpki rejects.
 #[derive(Debug)]
 struct NoVerifier(WebPkiSupportedAlgorithms);
 
