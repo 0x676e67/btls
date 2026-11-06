@@ -16,7 +16,7 @@ include = [
     "/*.toml",
     "/LICENSE-*",
     "/src",
-    # Read by the unit tests in src/lib.rs.
+    # Read by the unit tests in src/tests.rs.
     "/tests/*.pem",
 ]
 
