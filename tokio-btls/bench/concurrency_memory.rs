@@ -215,7 +215,7 @@ struct Rustls(TlsConnector);
 /// Bare `TcpStream`s, the baseline without TLS.
 struct Plain;
 
-/// Accepts any server certificate; the test certificate has no SAN and is a CA certificate.
+/// Accepts any server certificate; the test certificate is a self-signed CA certificate.
 #[derive(Debug)]
 struct NoVerifier(WebPkiSupportedAlgorithms);
 
