@@ -46,7 +46,7 @@ openssl-macros = "0.1.1"
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
 cpu-time = "1.0.0"
 criterion = "0.8.2"
-sysinfo = { version = "0.39.6", default-features = false }
+sysinfo = { version = "0.40.1", default-features = false }
 tikv-jemallocator = { version = "0.7.0", default-features = false }
 tokio-rustls = { version = "0.26.6", default-features = false }
 
