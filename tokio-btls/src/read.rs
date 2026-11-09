@@ -1,8 +1,12 @@
-use std::{io, mem, task::Poll};
+use std::{io, mem, ops::Range, task::Poll};
 
+use btls::{
+    error::ErrorStack,
+    ssl::{Opened, SslRef, SslStream as SslStreamCore},
+};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::transport::Transport;
+use crate::{bio::StreamWrapper, transport::Transport};
 
 /// Capacity of the ciphertext read buffer, enough for a record header plus the largest
 /// ciphertext BoringSSL accepts (`SSL3_RT_MAX_ENCRYPTED_LENGTH`).
@@ -11,19 +15,34 @@ use crate::transport::Transport;
 /// reads share data from one underlying read. Larger bursts may require multiple refills.
 const READ_BUF_CAPACITY: usize = 17 * 1024;
 
-/// Ciphertext read from the transport but not yet taken by BoringSSL.
+/// Ciphertext read from the transport, and plaintext opened in place but not yet delivered.
+///
+/// The allocation is kept once made, so idle polls and refills on a busy connection reuse it.
 #[derive(Default)]
 pub(crate) struct ReadBuffer {
     bytes: Vec<u8>,
-    // The next byte to hand out is `bytes[pos]`.
+    // The next ciphertext byte is `bytes[pos]`.
     pos: usize,
+    plain: Range<usize>,
+    // Set once the transport ended; the next refill reports the end to BoringSSL.
+    eof: bool,
+}
+
+/// Outcome of opening the next buffered record in place.
+pub(crate) enum Open {
+    /// A record was opened; its plaintext, if any, waits in the buffer.
+    Record,
+    /// No complete record is buffered; the next one needs this many bytes.
+    Partial(usize),
+    /// BoringSSL declined; read through `SSL_read`.
+    Declined,
 }
 
 impl ReadBuffer {
-    /// Whether no ciphertext is waiting; a drained buffer is released at once.
+    /// Whether no ciphertext is waiting.
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.pos == self.bytes.len()
     }
 
     /// Copies buffered ciphertext into `buf`, first refilling an empty buffer from `transport`.
@@ -36,7 +55,7 @@ impl ReadBuffer {
     where
         S: AsyncRead,
     {
-        if self.bytes.is_empty() {
+        if self.is_empty() {
             self.fill(transport)?;
         }
 
@@ -44,41 +63,176 @@ impl ReadBuffer {
         let n = buffered.len().min(buf.len());
         buf[..n].copy_from_slice(&buffered[..n]);
         self.pos += n;
-
-        // Release the buffer as soon as it is drained, so a connection that stops reading here,
-        // such as one returned to a pool, does not keep it.
-        if self.pos == self.bytes.len() {
-            self.bytes = Vec::new();
-            self.pos = 0;
-        }
         Ok(n)
     }
 
-    /// Fills the empty buffer with a single read of `transport`.
+    /// Refills the empty buffer with a single read of `transport`, or reports an end it already
+    /// returned.
     ///
-    /// Maps the stream's `Poll::Pending` to `WouldBlock`; the stream registers the waker. On
-    /// failure the buffer stays empty and unallocated.
+    /// Maps the stream's `Poll::Pending` to `WouldBlock`; the stream registers the waker.
+    /// Undelivered plaintext is dropped, which only a shutdown read leaves behind.
     fn fill<S>(&mut self, transport: &mut Transport<S>) -> io::Result<()>
     where
         S: AsyncRead,
     {
-        let (stream, cx) = transport.parts()?;
-        let mut bytes = mem::take(&mut self.bytes);
-        bytes.reserve(READ_BUF_CAPACITY);
+        self.bytes.clear();
         self.pos = 0;
+        self.plain = 0..0;
+        if self.eof {
+            return Ok(());
+        }
+        self.read_transport(transport, READ_BUF_CAPACITY)?;
+        Ok(())
+    }
 
-        let mut buf = ReadBuf::uninit(bytes.spare_capacity_mut());
+    /// Whether opened plaintext waits for delivery.
+    #[inline]
+    pub(crate) fn has_plain(&self) -> bool {
+        !self.plain.is_empty()
+    }
+
+    /// Copies opened plaintext into `buf`; returns whether some is left.
+    #[inline]
+    pub(crate) fn take_plain(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        let n = self.plain.len().min(buf.remaining());
+        buf.put_slice(&self.bytes[self.plain.start..self.plain.start + n]);
+        self.plain.start += n;
+        self.has_plain()
+    }
+
+    /// Opens the next buffered record in place once its plaintext is delivered.
+    #[inline]
+    pub(crate) fn open(&mut self, ssl: &mut SslRef) -> Result<Open, ErrorStack> {
+        debug_assert!(!self.has_plain(), "opening over undelivered plaintext");
+        Ok(match ssl.open_app_data(&mut self.bytes[self.pos..])? {
+            Opened::Record {
+                consumed,
+                plaintext,
+            } => {
+                self.plain = self.pos + plaintext.start..self.pos + plaintext.end;
+                self.pos += consumed;
+                Open::Record
+            }
+            Opened::Partial { needed } => Open::Partial(needed),
+            Opened::Declined { consumed } => {
+                self.pos += consumed;
+                Open::Declined
+            }
+            _ => Open::Declined,
+        })
+    }
+
+    /// Moves a partial record to the front and appends one read of `transport`, with room for at
+    /// least `needed` bytes. Returns the bytes read, 0 at the end.
+    pub(crate) fn fill_partial<S>(
+        &mut self,
+        transport: &mut Transport<S>,
+        needed: usize,
+    ) -> io::Result<usize>
+    where
+        S: AsyncRead,
+    {
+        debug_assert!(!self.has_plain(), "refilling over undelivered plaintext");
+        if self.eof {
+            return Ok(0);
+        }
+        self.bytes.drain(..self.pos);
+        self.pos = 0;
+        self.read_transport(transport, needed.max(READ_BUF_CAPACITY))
+    }
+
+    /// Appends one read of `transport` after growing the buffer to `capacity` bytes.
+    fn read_transport<S>(
+        &mut self,
+        transport: &mut Transport<S>,
+        capacity: usize,
+    ) -> io::Result<usize>
+    where
+        S: AsyncRead,
+    {
+        let (stream, cx) = transport.parts()?;
+        let len = self.bytes.len();
+        self.bytes.reserve_exact(capacity.saturating_sub(len));
+
+        let mut buf = ReadBuf::uninit(self.bytes.spare_capacity_mut());
         match stream.poll_read(cx, &mut buf)? {
             Poll::Ready(()) => {
                 let filled = buf.filled().len();
                 // SAFETY: `ReadBuf` guarantees its first `filled` bytes are initialized.
-                unsafe { bytes.set_len(filled) };
-                self.bytes = bytes;
-                Ok(())
+                unsafe { self.bytes.set_len(len + filled) };
+                self.eof = filled == 0;
+                Ok(filled)
             }
             Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
         }
     }
+}
+
+/// Delivers application data opened in place in the read buffer, or returns `None`, having
+/// delivered nothing, when the read must go through `SSL_read`.
+///
+/// Like the `SSL_read` path, it keeps taking the records the transport has ready, and leaves an
+/// end or error met after taking plaintext for the next read.
+pub(crate) fn read_in_place<S>(
+    s: &mut SslStreamCore<StreamWrapper<S>>,
+    buf: &mut ReadBuf<'_>,
+) -> Option<Poll<io::Result<()>>>
+where
+    S: AsyncRead,
+{
+    let start = buf.filled().len();
+    // The buffer lives behind the BIO; move it out while the `SslRef` is borrowed mutably.
+    let mut read_buf = mem::take(&mut s.get_mut().read_buf);
+    let (mut declined, mut pending, mut end) = (false, false, None);
+    loop {
+        if (read_buf.has_plain() && read_buf.take_plain(buf)) || buf.remaining() == 0 {
+            break;
+        }
+        // Without buffered ciphertext, another record needs a transport poll.
+        if buf.filled().len() > start && read_buf.is_empty() {
+            break;
+        }
+        // Open even an empty buffer: BoringSSL declines while `SSL_read` left input in it.
+        let needed = match read_buf.open(s.ssl_mut()) {
+            Ok(Open::Record) => continue,
+            Ok(Open::Partial(needed)) => needed,
+            Ok(Open::Declined) => {
+                declined = true;
+                break;
+            }
+            Err(err) => {
+                end = Some(Err(io::Error::other(err)));
+                break;
+            }
+        };
+        match read_buf.fill_partial(&mut s.get_mut().transport, needed) {
+            Ok(0) => {
+                // `SSL_read` reports the end, or the truncated record before it.
+                declined = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                pending = true;
+                break;
+            }
+            Err(err) => {
+                end = Some(Err(err));
+                break;
+            }
+        }
+    }
+    let wrapper = s.get_mut();
+    wrapper.read_buf = read_buf;
+    if buf.filled().len() > start {
+        wrapper.read_end = end;
+        return Some(Poll::Ready(Ok(())));
+    }
+    if declined {
+        return None;
+    }
+    debug_assert!(pending || end.is_some(), "an empty read must wait or end");
+    Some(end.map_or(Poll::Pending, Poll::Ready))
 }
 
 #[cfg(test)]
@@ -86,7 +240,6 @@ mod tests {
     use std::{io::Read, pin::Pin, task::Context};
 
     use super::*;
-    use crate::bio::StreamWrapper;
 
     /// Yields the given bytes in one read, then stays pending.
     struct Once(Vec<u8>);
@@ -106,19 +259,17 @@ mod tests {
     }
 
     #[test]
-    fn read_buf_released_when_drained() {
+    fn read_buf_kept_once_drained() {
         let mut wrapper = StreamWrapper::new(Once(vec![1; 100]));
         wrapper.transport.set_noop_context();
 
         let mut buf = [0; 60];
         assert_eq!(wrapper.read(&mut buf).unwrap(), 60);
-        assert_eq!(wrapper.read_buf.bytes.capacity(), READ_BUF_CAPACITY);
-
         assert_eq!(wrapper.read(&mut buf).unwrap(), 40);
-        assert_eq!(wrapper.read_buf.bytes.capacity(), 0);
-
+        // A drained buffer and an idle poll reuse the allocation.
         let err = wrapper.read(&mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(wrapper.read_buf.bytes.capacity(), 0);
+        assert!(wrapper.read_buf.is_empty());
+        assert_eq!(wrapper.read_buf.bytes.capacity(), READ_BUF_CAPACITY);
     }
 }

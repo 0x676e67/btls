@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 0x676e67 <gngppz@gmail.com>
+Date: Mon, 9 Nov 2026 12:00:00 +0800
+Subject: [PATCH 14/14] boringssl: open application data in caller memory
+
+Copyright (c) 2025-2026 0x676e67 <gngppz@gmail.com>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+SSL_open_app_data is the read-side counterpart of SSL_seal_app_data: it
+opens one record in place in the caller's buffer through the same
+ssl_open_app_data path SSL_read uses, then processes any post-handshake
+message the record completed. Every other state is left to SSL_read,
+which also reports a close_notify or error met here.
+---
+ include/openssl/ssl.h | 35 ++++++++++++++++++++++++++
+ ssl/ssl_lib.cc        | 68 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 103 insertions(+)
+
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 6f5d90f..80500fc 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -392,6 +392,41 @@ OPENSSL_EXPORT enum ssl_seal_app_data_result_t SSL_seal_app_data(
+     SSL *ssl, uint8_t *out, size_t *out_len, size_t max_out,
+     const CRYPTO_IVEC *in, size_t num_in, size_t max_in, size_t *out_consumed);
+ 
++// Opening application data in caller memory.
++//
++// This function is a btls extension and the read-side counterpart of
++// `SSL_seal_app_data`. A caller that owns the transport's input buffer can
++// open application data records in place in it, which skips the read buffer,
++// the `BIO` and a copy per record. It never reads from the transport and
++// writes to it only to send a fatal alert. Whenever it declines, read with
++// `SSL_read`, which handles every other state of the connection.
++
++// ssl_open_app_data_result_t is the result of `SSL_open_app_data`.
++enum ssl_open_app_data_result_t BORINGSSL_ENUM_INT {
++  // ssl_open_app_data_success means one record of `*out_consumed` bytes was
++  // opened. `*out` and `*out_len` locate its plaintext, decrypted in place
++  // within the record. The plaintext is empty for a record without
++  // application data, such as a post-handshake message, which has been
++  // processed.
++  ssl_open_app_data_success,
++  // ssl_open_app_data_partial means `in` holds no complete record, and
++  // `*out_consumed` is the length the next record needs.
++  ssl_open_app_data_partial,
++  // ssl_open_app_data_declined means the caller must read with `SSL_read`
++  // after dropping the first `*out_consumed` bytes of `in`. It is zero, and
++  // nothing was changed, when the connection is in a state only `SSL_read`
++  // handles or holds input of its own. Otherwise opening met a close_notify
++  // or an error, which `SSL_read` then reports.
++  ssl_open_app_data_declined,
++};
++
++// SSL_open_app_data opens at most one TLS record from the `in_len` bytes at
++// `in`, which must start at a record boundary, for reading application data.
++// Bytes of `in` past the record are left untouched.
++OPENSSL_EXPORT enum ssl_open_app_data_result_t SSL_open_app_data(
++    SSL *ssl, uint8_t *in, size_t in_len, size_t *out_consumed, uint8_t **out,
++    size_t *out_len);
++
+ // SSL_KEY_UPDATE_REQUESTED indicates that the peer should reply to a KeyUpdate
+ // message with its own, thus updating traffic secrets for both directions on
+ // the connection.
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 3b652af..93c7049 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -1028,6 +1028,74 @@ enum ssl_seal_app_data_result_t SSL_seal_app_data(
+                            Span(in, num_in), max_in, out_consumed);
+ }
+ 
++enum ssl_open_app_data_result_t SSL_open_app_data(SSL *ssl, uint8_t *in,
++                                                  size_t in_len,
++                                                  size_t *out_consumed,
++                                                  uint8_t **out,
++                                                  size_t *out_len) {
++  auto *ssl_impl = FromOpaque(ssl);
++  *out_consumed = 0;
++  *out = nullptr;
++  *out_len = 0;
++  ssl_reset_error_state(ssl_impl);
++  // Leave every state with work besides opening a record to `SSL_read`,
++  // including input it buffered itself and errors it replays.
++  SSLMessage msg;
++  if (SSL_is_dtls(ssl_impl) || ssl_impl->do_handshake == nullptr ||
++      SSL_in_init(ssl_impl) || !ssl_can_read(ssl_impl) ||
++      ssl_impl->s3->renegotiate_pending ||
++      !ssl_impl->s3->pending_app_data.empty() ||
++      !ssl_impl->s3->read_buffer.empty() || !check_read_error(ssl_impl) ||
++      ssl_impl->method->get_message(ssl_impl, &msg)) {
++    return ssl_open_app_data_declined;
++  }
++
++  uint8_t alert = SSL_AD_DECODE_ERROR;
++  size_t consumed = 0;
++  Span<uint8_t> data;
++  switch (ssl_open_app_data(ssl_impl, &data, &consumed, &alert,
++                            Span(in, in_len))) {
++    case ssl_open_record_success:
++      ssl_impl->s3->key_update_count = 0;
++      *out_consumed = consumed;
++      *out = data.data();
++      *out_len = data.size();
++      return ssl_open_app_data_success;
++
++    case ssl_open_record_discard:
++      *out_consumed = consumed;
++      // Process the post-handshake messages this record completed, as
++      // `SSL_read` does before it opens the next record. One that begins a
++      // handshake leaves the rest to `SSL_read`.
++      while (!ssl_impl->s3->renegotiate_pending && !SSL_in_init(ssl_impl) &&
++             ssl_impl->method->get_message(ssl_impl, &msg)) {
++        if (!ssl_do_post_handshake(ssl_impl, msg)) {
++          ssl_set_read_error(ssl_impl);
++          return ssl_open_app_data_declined;
++        }
++        ssl_impl->method->next_message(ssl_impl);
++      }
++      return ssl_open_app_data_success;
++
++    case ssl_open_record_partial:
++      *out_consumed = consumed;
++      return ssl_open_app_data_partial;
++
++    case ssl_open_record_close_notify:
++      *out_consumed = consumed;
++      return ssl_open_app_data_declined;
++
++    case ssl_open_record_error:
++      if (alert != 0) {
++        ssl_send_alert(ssl_impl, SSL3_AL_FATAL, alert);
++      }
++      *out_consumed = consumed;
++      return ssl_open_app_data_declined;
++  }
++  assert(0);
++  return ssl_open_app_data_declined;
++}
++
+ int SSL_key_update(SSL *ssl, int request_type) {
+   auto *ssl_impl = FromOpaque(ssl);
+   ssl_reset_error_state(ssl_impl);

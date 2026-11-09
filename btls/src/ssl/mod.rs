@@ -69,7 +69,7 @@ use std::io::prelude::*;
 use std::io::{self, IoSlice};
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop, MaybeUninit};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::panic::resume_unwind;
 use std::path::Path;
 use std::ptr::{self, NonNull};
@@ -4522,6 +4522,67 @@ impl SslRef {
         }
     }
 
+    /// Opens at most one application data record in place at the start of `buf`, without
+    /// transport I/O apart from a fatal alert on an error.
+    ///
+    /// `buf` must start at a record boundary of the ciphertext read from the transport. On
+    /// [`Opened::Declined`], drop its first `consumed` bytes and read through
+    /// [`SslStream::ssl_read`], which handles every other state and reports a close_notify or
+    /// an error met here.
+    ///
+    /// Always declines in FIPS builds, which lack the BoringSSL patch.
+    #[corresponds(SSL_open_app_data)]
+    pub fn open_app_data(&mut self, buf: &mut [u8]) -> Result<Opened, ErrorStack> {
+        #[cfg(not(feature = "fips"))]
+        {
+            use ffi::ssl_open_app_data_result_t as R;
+
+            let (mut consumed, mut out, mut out_len) = (0, ptr::null_mut(), 0);
+            // SAFETY: `self` is a live `SSL`, `buf` is valid for `buf.len()` reads and writes,
+            // and the out-pointers are valid for writes.
+            let res = unsafe {
+                ffi::SSL_open_app_data(
+                    self.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut consumed,
+                    &mut out,
+                    &mut out_len,
+                )
+            };
+            if res == R::ssl_open_app_data_partial {
+                return Ok(Opened::Partial { needed: consumed });
+            }
+            if consumed > buf.len() {
+                return Err(ErrorStack::internal_error_str(
+                    "SSL_open_app_data reported more than it was given",
+                ));
+            }
+            if res != R::ssl_open_app_data_success {
+                return Ok(Opened::Declined { consumed });
+            }
+            let start = if out_len == 0 {
+                0
+            } else {
+                out.addr().wrapping_sub(buf.as_ptr().addr())
+            };
+            match start.checked_add(out_len) {
+                Some(end) if end <= consumed => Ok(Opened::Record {
+                    consumed,
+                    plaintext: start..end,
+                }),
+                _ => Err(ErrorStack::internal_error_str(
+                    "SSL_open_app_data placed plaintext outside the record",
+                )),
+            }
+        }
+        #[cfg(feature = "fips")]
+        {
+            let _ = buf;
+            Ok(Opened::Declined { consumed: 0 })
+        }
+    }
+
     /// Sets the certificate.
     #[corresponds(SSL_use_certificate)]
     pub fn set_certificate(&mut self, cert: &X509Ref) -> Result<(), ErrorStack> {
@@ -4955,6 +5016,22 @@ pub struct Sealed {
     pub consumed: usize,
     /// Bytes written to the start of the output, pending handshake records included.
     pub written: usize,
+}
+
+/// Outcome of [`SslRef::open_app_data`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Opened {
+    /// One record of `consumed` bytes was opened. Its plaintext is `buf[plaintext]`, empty for a
+    /// record without application data, such as a post-handshake message.
+    Record {
+        consumed: usize,
+        plaintext: Range<usize>,
+    },
+    /// `buf` holds no complete record; the next one needs `needed` bytes.
+    Partial { needed: usize },
+    /// Drop the first `consumed` bytes of `buf` and read through [`SslStream::ssl_read`].
+    Declined { consumed: usize },
 }
 
 // std guarantees that `IoSlice` is ABI-compatible with `iovec` on Unix, so it can be read as a

@@ -170,6 +170,9 @@ where
             if let Some(end) = s.get_mut().read_end.take() {
                 return Poll::Ready(end);
             }
+            if let Some(poll) = read::read_in_place(s, buf) {
+                return poll;
+            }
             // SSL_read returns at most one record, so keep reading while buffered ciphertext can
             // fill the caller's buffer. An end or error met after taking plaintext is reported by
             // the next read.

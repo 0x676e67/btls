@@ -25,7 +25,8 @@ use crate::{
 /// Duplex transport whose writes can stall, fail once, or keep returning `BrokenPipe`.
 ///
 /// A spent `budget` stalls writes, or fails them with `TimedOut` if `fail_when_spent` is set.
-/// It counts write polls and copies the bytes it accepts into `tap`.
+/// It counts write polls and copies the bytes it accepts into `tap`. Reads return at most
+/// `read_chunk` bytes.
 struct Gate {
     io: DuplexStream,
     open: bool,
@@ -36,6 +37,7 @@ struct Gate {
     broken: bool,
     polls: usize,
     tap: Vec<u8>,
+    read_chunk: usize,
     // Returned once instead of `Pending` when no data is left: EOF or an error.
     drained: Option<io::Result<()>>,
 }
@@ -52,6 +54,7 @@ impl Gate {
             broken: false,
             polls: 0,
             tap: Vec::new(),
+            read_chunk: usize::MAX,
             drained: None,
         }
     }
@@ -63,7 +66,17 @@ impl AsyncRead for Gate {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match Pin::new(&mut self.io).poll_read(cx, buf) {
+        let read = if self.read_chunk < buf.remaining() {
+            let chunk = self.read_chunk;
+            let mut part = ReadBuf::new(buf.initialize_unfilled_to(chunk));
+            let read = Pin::new(&mut self.io).poll_read(cx, &mut part);
+            let filled = part.filled().len();
+            buf.advance(filled);
+            read
+        } else {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        };
+        match read {
             Poll::Pending => self.drained.take().map_or(Poll::Pending, Poll::Ready),
             read => read,
         }
@@ -202,6 +215,32 @@ async fn read_takes_every_ready_record() {
     // The read stops once the buffered ciphertext is used, before the transport's end.
     assert!(client.get_ref().drained.is_some());
     assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn read_reassembles_split_records() {
+    let payload: Vec<u8> = (0..2 * MAX_RECORD + 100).map(|i| i as u8).collect();
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        for chunk in [7, 1000] {
+            let (mut client, mut server) = tls_pair_with(version, None).await;
+            client.get_mut().read_chunk = chunk;
+            server.write_all(&payload).await.unwrap();
+            server.shutdown().await.unwrap();
+
+            // Records, TLS 1.3 tickets and close_notify arrive split across transport reads;
+            // reads shorter than a record leave plaintext for the next read.
+            let mut received = Vec::new();
+            let mut buf = [0; 1500];
+            loop {
+                let n = client.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(received, payload, "{version:?} chunk {chunk}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -834,6 +873,14 @@ async fn early_data_budget_keeps_full_records() {
     // handshake on the way.
     let res = Pin::new(&mut server).poll_accept(&mut cx);
     assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
+    // Early data read in pieces stays in BoringSSL once the read buffer is drained.
+    let mut piece = [0; 1000];
+    for _ in 0..2 {
+        let mut read = ReadBuf::new(&mut piece);
+        let res = Pin::new(&mut server).poll_read(&mut cx, &mut read);
+        assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
+        assert_eq!(read.filled(), &early[..1000]);
+    }
     client.get_mut().tap.clear();
     let data: Vec<u8> = (0..2 * MAX_RECORD).map(|i| i as u8).collect();
     let res = Pin::new(&mut client).poll_write(&mut cx, &data);
@@ -845,7 +892,7 @@ async fn early_data_budget_keeps_full_records() {
     let records = records(&client.get_ref().tap);
     assert_eq!(records.len(), 5, "{records:?}");
 
-    let mut received = vec![0; early.len() + data.len()];
+    let mut received = vec![0; early.len() - 2000 + data.len()];
     server.read_exact(&mut received).await.unwrap();
-    assert_eq!(received, [&early[..], &data].concat());
+    assert_eq!(received, [&early[2000..], &data].concat());
 }
