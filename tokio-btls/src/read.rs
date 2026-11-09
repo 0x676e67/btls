@@ -26,6 +26,9 @@ pub(crate) struct ReadBuffer {
     plain: Range<usize>,
     // Set once the transport ended; the next refill reports the end to BoringSSL.
     eof: bool,
+    // BoringSSL holds no input of its own, so an empty buffer needs no call into it. Only BIO
+    // reads give it input, and post-handshake messages or a decline may leave it work.
+    ssl_idle: bool,
 }
 
 /// Outcome of opening the next buffered record in place.
@@ -55,6 +58,7 @@ impl ReadBuffer {
     where
         S: AsyncRead,
     {
+        self.ssl_idle = false;
         if self.is_empty() {
             self.fill(transport)?;
         }
@@ -101,10 +105,23 @@ impl ReadBuffer {
     }
 
     /// Opens the next buffered record in place once its plaintext is delivered.
+    ///
+    /// Without buffered ciphertext, BoringSSL is only asked while it may hold input of its own.
     #[inline]
     pub(crate) fn open(&mut self, ssl: &mut SslRef) -> Result<Open, ErrorStack> {
         debug_assert!(!self.has_plain(), "opening over undelivered plaintext");
-        Ok(match ssl.open_app_data(&mut self.bytes[self.pos..])? {
+        if self.ssl_idle && self.is_empty() {
+            return Ok(Open::Partial(0));
+        }
+        let opened = ssl.open_app_data(&mut self.bytes[self.pos..]);
+        // Application data, or a partial record, passed the checks for pending work; an empty
+        // record may have carried a post-handshake message that left some.
+        self.ssl_idle = match &opened {
+            Ok(Opened::Partial { .. }) => true,
+            Ok(Opened::Record { plaintext, .. }) => !plaintext.is_empty(),
+            _ => false,
+        };
+        Ok(match opened? {
             Opened::Record {
                 consumed,
                 plaintext,
@@ -192,7 +209,6 @@ where
         if buf.filled().len() > start && read_buf.is_empty() {
             break;
         }
-        // Open even an empty buffer: BoringSSL declines while `SSL_read` left input in it.
         let needed = match read_buf.open(s.ssl_mut()) {
             Ok(Open::Record) => continue,
             Ok(Open::Partial(needed)) => needed,
