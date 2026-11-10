@@ -215,6 +215,30 @@ async fn read_takes_every_ready_record() {
     // The read stops once the buffered ciphertext is used, before the transport's end.
     assert!(client.get_ref().drained.is_some());
     assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+
+    // An end the transport reported once does not keep later reads from polling it.
+    server.write_all(b"late").await.unwrap();
+    server.flush().await.unwrap();
+    assert_eq!(client.read(&mut buf).await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn read_ends_after_quiet_shutdown() {
+    let (mut client, _server) = tls_pair().await;
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut buf = [0; 16];
+    let mut read = ReadBuf::new(&mut buf);
+
+    // An idle read leaves BoringSSL nothing to report, until the shutdown closes its read side.
+    assert!(Pin::new(&mut client)
+        .poll_read(&mut cx, &mut read)
+        .is_pending());
+    // SAFETY: `client.ssl()` is a live `SSL`.
+    unsafe { btls_sys::SSL_set_quiet_shutdown(client.ssl().as_ptr(), 1) };
+    client.shutdown().await.unwrap();
+    let res = Pin::new(&mut client).poll_read(&mut cx, &mut read);
+    assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
+    assert!(read.filled().is_empty());
 }
 
 #[tokio::test]

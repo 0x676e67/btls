@@ -22,16 +22,24 @@ opens one record in place in the caller's buffer through the same
 ssl_open_app_data path SSL_read uses, then processes any post-handshake
 message the record completed. Every other state is left to SSL_read,
 which also reports a close_notify or error met here.
+
+The bssl_shim flag -open-app-data reads through it. A filter BIO holds
+the input the shim pulled ahead of BoringSSL, so SSL_read continues
+where opening stops, and the runner suite passes with the flag.
 ---
- include/openssl/ssl.h | 35 ++++++++++++++++++++++++++
- ssl/ssl_lib.cc        | 68 +++++++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 103 insertions(+)
+ include/openssl/ssl.h   |  37 ++++
+ ssl/ssl_lib.cc          |  73 ++++++++
+ ssl/ssl_test.cc         | 448 ++++++++++++++++++++++++++++++++++++++++++++++++
+ ssl/test/bssl_shim.cc   | 202 ++++++++++++++++++++++
+ ssl/test/test_config.cc |   1 +
+ ssl/test/test_config.h  |   1 +
+ 6 files changed, 762 insertions(+)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 6f5d90f..80500fc 100644
+index 6f5d90f..2140c9b 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -392,6 +392,41 @@ OPENSSL_EXPORT enum ssl_seal_app_data_result_t SSL_seal_app_data(
+@@ -392,6 +392,43 @@ OPENSSL_EXPORT enum ssl_seal_app_data_result_t SSL_seal_app_data(
      SSL *ssl, uint8_t *out, size_t *out_len, size_t max_out,
      const CRYPTO_IVEC *in, size_t num_in, size_t max_in, size_t *out_consumed);
  
@@ -42,7 +50,8 @@ index 6f5d90f..80500fc 100644
 +// open application data records in place in it, which skips the read buffer,
 +// the `BIO` and a copy per record. It never reads from the transport and
 +// writes to it only to send a fatal alert. Whenever it declines, read with
-+// `SSL_read`, which handles every other state of the connection.
++// `SSL_read`, which handles every other state of the connection. DTLS and
++// QUIC connections always decline.
 +
 +// ssl_open_app_data_result_t is the result of `SSL_open_app_data`.
 +enum ssl_open_app_data_result_t BORINGSSL_ENUM_INT {
@@ -57,9 +66,10 @@ index 6f5d90f..80500fc 100644
 +  ssl_open_app_data_partial,
 +  // ssl_open_app_data_declined means the caller must read with `SSL_read`
 +  // after dropping the first `*out_consumed` bytes of `in`. It is zero, and
-+  // nothing was changed, when the connection is in a state only `SSL_read`
-+  // handles or holds input of its own. Otherwise opening met a close_notify
-+  // or an error, which `SSL_read` then reports.
++  // the connection's read state is unchanged, when the connection is in a
++  // state only `SSL_read` handles or holds input of its own. Otherwise opening
++  // met a close_notify or an error, which `SSL_read` then reports. The error
++  // queue is left empty either way.
 +  ssl_open_app_data_declined,
 +};
 +
@@ -74,10 +84,10 @@ index 6f5d90f..80500fc 100644
  // message with its own, thus updating traffic secrets for both directions on
  // the connection.
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index 3b652af..93c7049 100644
+index 3b652af..f595572 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -1028,6 +1028,74 @@ enum ssl_seal_app_data_result_t SSL_seal_app_data(
+@@ -1028,6 +1028,79 @@ enum ssl_seal_app_data_result_t SSL_seal_app_data(
                             Span(in, num_in), max_in, out_consumed);
  }
  
@@ -92,13 +102,14 @@ index 3b652af..93c7049 100644
 +  *out_len = 0;
 +  ssl_reset_error_state(ssl_impl);
 +  // Leave every state with work besides opening a record to `SSL_read`,
-+  // including input it buffered itself and errors it replays.
++  // including input it buffered itself and the close or error it replays.
 +  SSLMessage msg;
-+  if (SSL_is_dtls(ssl_impl) || ssl_impl->do_handshake == nullptr ||
-+      SSL_in_init(ssl_impl) || !ssl_can_read(ssl_impl) ||
++  if (SSL_is_dtls(ssl_impl) || SSL_is_quic(ssl_impl) ||
++      ssl_impl->do_handshake == nullptr || SSL_in_init(ssl_impl) ||
++      ssl_impl->s3->read_shutdown != ssl_shutdown_none ||
 +      ssl_impl->s3->renegotiate_pending ||
 +      !ssl_impl->s3->pending_app_data.empty() ||
-+      !ssl_impl->s3->read_buffer.empty() || !check_read_error(ssl_impl) ||
++      !ssl_impl->s3->read_buffer.empty() ||
 +      ssl_impl->method->get_message(ssl_impl, &msg)) {
 +    return ssl_open_app_data_declined;
 +  }
@@ -123,7 +134,9 @@ index 3b652af..93c7049 100644
 +      while (!ssl_impl->s3->renegotiate_pending && !SSL_in_init(ssl_impl) &&
 +             ssl_impl->method->get_message(ssl_impl, &msg)) {
 +        if (!ssl_do_post_handshake(ssl_impl, msg)) {
++          // `SSL_read` replays the error saved here.
 +          ssl_set_read_error(ssl_impl);
++          ERR_clear_error();
 +          return ssl_open_app_data_declined;
 +        }
 +        ssl_impl->method->next_message(ssl_impl);
@@ -142,6 +155,8 @@ index 3b652af..93c7049 100644
 +      if (alert != 0) {
 +        ssl_send_alert(ssl_impl, SSL3_AL_FATAL, alert);
 +      }
++      // `SSL_read` replays the error, which `ssl_open_app_data` saved.
++      ERR_clear_error();
 +      *out_consumed = consumed;
 +      return ssl_open_app_data_declined;
 +  }
@@ -152,3 +167,727 @@ index 3b652af..93c7049 100644
  int SSL_key_update(SSL *ssl, int request_type) {
    auto *ssl_impl = FromOpaque(ssl);
    ssl_reset_error_state(ssl_impl);
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index ced8b9a..dc6a0f5 100644
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -6180,6 +6180,431 @@ TEST_P(SSLVersionTest, SealAppDataProperty) {
+   }
+ }
+ 
++// ReadTransport appends the bytes `ssl`'s peer sent it, and it has not read,
++// to `out`.
++static bool ReadTransport(SSL *ssl, std::vector<uint8_t> *out) {
++  BIO *bio = SSL_get_rbio(ssl);
++  uint8_t buf[4096];
++  for (;;) {
++    int ret = BIO_read(bio, buf, sizeof(buf));
++    if (ret <= 0) {
++      return BIO_should_read(bio);
++    }
++    out->insert(out->end(), buf, buf + ret);
++  }
++}
++
++// WriteToWire writes `data` on `ssl` and moves the records it sent `peer` from
++// the transport to `wire`.
++static bool WriteToWire(SSL *ssl, SSL *peer, Span<const uint8_t> data,
++                        std::vector<uint8_t> *wire) {
++  for (;;) {
++    int ret = SSL_write(ssl, data.data(), static_cast<int>(data.size()));
++    if (!ReadTransport(peer, wire)) {
++      return false;
++    }
++    if (ret > 0) {
++      return static_cast<size_t>(ret) == data.size();
++    }
++    if (SSL_get_error(ssl, ret) != SSL_ERROR_WANT_WRITE) {
++      return false;
++    }
++  }
++}
++
++// WireRecordLen returns the length, with its header, of the record `wire`
++// starts with.
++static size_t WireRecordLen(Span<const uint8_t> wire) {
++  BSSL_CHECK(wire.size() >= SSL3_RT_HEADER_LENGTH);
++  return SSL3_RT_HEADER_LENGTH + ((size_t{wire[3]} << 8) | wire[4]);
++}
++
++// OpenNoIO calls `SSL_open_app_data` with `ssl`'s `BIO`s replaced by one that
++// fails the test when read, written to or flushed.
++static ssl_open_app_data_result_t OpenNoIO(SSL *ssl, Span<uint8_t> in,
++                                           size_t *out_consumed,
++                                           Span<uint8_t> *out) {
++  UniquePtr<BIO_METHOD> method(BIO_meth_new(0, "tripwire"));
++  BSSL_CHECK(method);
++  BSSL_CHECK(
++      BIO_meth_set_read(method.get(), [](BIO *bio, char *out_, int len) -> int {
++        ADD_FAILURE() << "SSL_open_app_data read from the BIO";
++        return -1;
++      }));
++  BSSL_CHECK(BIO_meth_set_write(
++      method.get(), [](BIO *bio, const char *in_, int len) -> int {
++        ADD_FAILURE() << "SSL_open_app_data wrote to the BIO";
++        return -1;
++      }));
++  BSSL_CHECK(BIO_meth_set_ctrl(
++      method.get(), [](BIO *bio, int cmd, long larg, void *parg) -> long {
++        if (cmd == BIO_CTRL_FLUSH) {
++          ADD_FAILURE() << "SSL_open_app_data flushed the BIO";
++        }
++        return 0;
++      }));
++  UniquePtr<BIO> tripwire(BIO_new(method.get()));
++  BSSL_CHECK(tripwire);
++  BIO_set_init(tripwire.get(), 1);
++
++  BIO *rbio = SSL_get_rbio(ssl);
++  BIO *wbio = SSL_get_wbio(ssl);
++  if (rbio != nullptr) {
++    BIO_up_ref(rbio);
++  }
++  if (wbio != nullptr) {
++    BIO_up_ref(wbio);
++  }
++  SSL_set0_rbio(ssl, UpRef(tripwire).release());
++  SSL_set0_wbio(ssl, tripwire.release());
++  uint8_t *data = in.data();
++  size_t len = 1;
++  ssl_open_app_data_result_t ret = SSL_open_app_data(
++      ssl, in.data(), in.size(), out_consumed, &data, &len);
++  if (len == 0) {
++    EXPECT_EQ(data, nullptr);
++  }
++  *out = Span(data, len);
++  SSL_set0_rbio(ssl, rbio);
++  SSL_set0_wbio(ssl, wbio);
++  return ret;
++}
++
++// OpenWire opens the records `wire` holds on `ssl`. It appends their plaintext
++// to `out` and sets `*out_empty` to the number of records without any.
++static void OpenWire(SSL *ssl, Span<uint8_t> wire, std::vector<uint8_t> *out,
++                     size_t *out_empty) {
++  *out_empty = 0;
++  while (!wire.empty()) {
++    size_t consumed;
++    Span<uint8_t> plaintext;
++    ASSERT_EQ(OpenNoIO(ssl, wire, &consumed, &plaintext),
++              ssl_open_app_data_success);
++    ASSERT_EQ(consumed, WireRecordLen(wire));
++    if (plaintext.empty()) {
++      (*out_empty)++;
++    }
++    out->insert(out->end(), plaintext.begin(), plaintext.end());
++    wire = wire.subspan(consumed);
++  }
++  EXPECT_EQ(ERR_peek_error(), 0u);
++}
++
++TEST_P(SSLVersionTest, OpenAppDataRoundTrip) {
++  if (is_dtls()) {
++    return;
++  }
++
++  // Records of one byte, of a full fragment, and in between.
++  static const size_t kLens[] = {1, 100, 16384, 16383};
++  std::vector<uint8_t> data(1 + 100 + 16384 + 16383);
++  RAND_bytes(data.data(), data.size());
++
++  for (const SealCipher &cipher : kSealCiphers) {
++    if (!SealCipherApplies(cipher, version())) {
++      continue;
++    }
++    SCOPED_TRACE(SSL_CIPHER_standard_name(SSL_get_cipher_by_value(cipher.id)));
++    ASSERT_NO_FATAL_FAILURE(ResetContexts());
++    ASSERT_TRUE(ConfigureSealCipher(client_ctx_.get(), server_ctx_.get(),
++                                    cipher, version()));
++    ASSERT_TRUE(Connect());
++    ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++
++    for (bool from_server : {true, false}) {
++      SCOPED_TRACE(from_server);
++      SSL *writer = from_server ? server_.get() : client_.get();
++      SSL *reader = from_server ? client_.get() : server_.get();
++      std::vector<uint8_t> wire;
++      size_t offset = 0;
++      for (size_t len : kLens) {
++        ASSERT_TRUE(WriteToWire(writer, reader,
++                                Span(data).subspan(offset, len), &wire));
++        offset += len;
++      }
++
++      const uint64_t seq = SSL_get_read_sequence(reader);
++      std::vector<uint8_t> received;
++      Span<uint8_t> rest(wire);
++      size_t records = 0;
++      while (!rest.empty()) {
++        const size_t record_len = WireRecordLen(rest);
++        ASSERT_LE(record_len, rest.size());
++        const std::vector<uint8_t> before(rest.begin(), rest.end());
++        size_t consumed;
++        Span<uint8_t> plaintext;
++
++        // A record cut short needs its header, then its whole length, and
++        // changes nothing.
++        for (size_t prefix : {size_t{0}, size_t{4}, size_t{5}, record_len - 1}) {
++          ASSERT_EQ(OpenNoIO(reader, rest.first(prefix), &consumed, &plaintext),
++                    ssl_open_app_data_partial);
++          EXPECT_EQ(consumed,
++                    prefix < SSL3_RT_HEADER_LENGTH ? size_t{SSL3_RT_HEADER_LENGTH}
++                                                   : record_len);
++          EXPECT_TRUE(plaintext.empty());
++        }
++        EXPECT_EQ(Bytes(rest), Bytes(before));
++        EXPECT_EQ(SSL_get_read_sequence(reader), seq + records);
++
++        // One record opens in place, and the input after it is not touched.
++        ASSERT_EQ(OpenNoIO(reader, rest, &consumed, &plaintext),
++                  ssl_open_app_data_success);
++        ASSERT_EQ(consumed, record_len);
++        ASSERT_FALSE(plaintext.empty());
++        EXPECT_GE(plaintext.data(), rest.data() + SSL3_RT_HEADER_LENGTH);
++        EXPECT_LE(plaintext.data() + plaintext.size(),
++                  rest.data() + record_len);
++        EXPECT_EQ(Bytes(rest.subspan(record_len)),
++                  Bytes(Span(before).subspan(record_len)));
++        received.insert(received.end(), plaintext.begin(), plaintext.end());
++        rest = rest.subspan(record_len);
++        records++;
++        EXPECT_EQ(ERR_peek_error(), 0u);
++      }
++      EXPECT_EQ(records, std::size(kLens));
++      EXPECT_EQ(Bytes(received), Bytes(data));
++
++      // Nothing is left for `SSL_read`.
++      uint8_t byte;
++      EXPECT_EQ(SSL_pending(reader), 0);
++      EXPECT_EQ(SSL_read(reader, &byte, 1), -1);
++      EXPECT_EQ(SSL_get_error(reader, -1), SSL_ERROR_WANT_READ);
++    }
++  }
++}
++
++// Records that carry post-handshake messages open as records without
++// application data, once the messages are processed.
++TEST_P(SSLVersionTest, OpenAppDataPostHandshake) {
++  if (is_dtls() || !is_tls13()) {
++    return;
++  }
++
++  static int sessions;
++  sessions = 0;
++  SSL_CTX_set_session_cache_mode(client_ctx_.get(), SSL_SESS_CACHE_CLIENT);
++  SSL_CTX_sess_set_new_cb(client_ctx_.get(), [](SSL *, SSL_SESSION *) -> int {
++    sessions++;
++    return 0;
++  });
++  ASSERT_TRUE(Connect());
++  SSLImpl *client = FromOpaque(client_.get());
++
++  // The server's first write carries its tickets.
++  static const uint8_t kData[] = "data";
++  std::vector<uint8_t> wire, received;
++  size_t empty;
++  ASSERT_TRUE(WriteToWire(server_.get(), client_.get(), kData, &wire));
++  ASSERT_NO_FATAL_FAILURE(OpenWire(client_.get(), Span(wire), &received, &empty));
++  EXPECT_GT(empty, 0u);
++  EXPECT_GT(sessions, 0);
++  EXPECT_EQ(Bytes(received), Bytes(kData));
++
++  // A KeyUpdate changes the key for the records after it, and queues the
++  // response it requests for the next write.
++  for (int request : {SSL_KEY_UPDATE_NOT_REQUESTED, SSL_KEY_UPDATE_REQUESTED}) {
++    SCOPED_TRACE(request);
++    wire.clear();
++    received.clear();
++    ASSERT_TRUE(SSL_key_update(server_.get(), request));
++    ASSERT_TRUE(WriteToWire(server_.get(), client_.get(), kData, &wire));
++    ASSERT_NO_FATAL_FAILURE(OpenWire(client_.get(), Span(wire), &received, &empty));
++    EXPECT_EQ(empty, 1u);
++    EXPECT_EQ(Bytes(received), Bytes(kData));
++    EXPECT_EQ(bool{client->s3->key_update_pending},
++              request == SSL_KEY_UPDATE_REQUESTED);
++
++    uint8_t buf[sizeof(kData)];
++    ASSERT_EQ(SSL_write(client_.get(), kData, sizeof(kData)),
++              int{sizeof(kData)});
++    ASSERT_EQ(SSL_read(server_.get(), buf, sizeof(buf)), int{sizeof(buf)});
++    EXPECT_EQ(Bytes(buf), Bytes(kData));
++    EXPECT_FALSE(client->s3->key_update_pending);
++  }
++}
++
++TEST_P(SSLVersionTest, OpenAppDataDeclines) {
++  static const uint8_t kData[100] = {1};
++  uint8_t buf[sizeof(kData)];
++  auto expect_declined = [&](SSL *ssl, Span<const uint8_t> wire) {
++    std::vector<uint8_t> in(wire.begin(), wire.end());
++    size_t consumed = 1;
++    Span<uint8_t> plaintext;
++    EXPECT_EQ(OpenNoIO(ssl, Span(in), &consumed, &plaintext),
++              ssl_open_app_data_declined);
++    EXPECT_EQ(consumed, 0u);
++    EXPECT_TRUE(plaintext.empty());
++    EXPECT_EQ(Bytes(in), Bytes(wire));
++    EXPECT_EQ(ERR_peek_error(), 0u);
++  };
++
++  // DTLS records are never opened in caller memory.
++  if (is_dtls()) {
++    ASSERT_TRUE(Connect());
++    expect_declined(client_.get(), kData);
++    expect_declined(server_.get(), kData);
++    return;
++  }
++
++  // Neither a client nor a server yet.
++  UniquePtr<SSL> ssl(SSL_new(client_ctx_.get()));
++  ASSERT_TRUE(ssl);
++  expect_declined(ssl.get(), kData);
++
++  // Before and during the handshake.
++  ASSERT_TRUE(CreateClientAndServer(&client_, &server_, client_ctx_.get(),
++                                    server_ctx_.get()));
++  expect_declined(client_.get(), kData);
++  EXPECT_EQ(SSL_read(client_.get(), buf, sizeof(buf)), -1);
++  EXPECT_EQ(SSL_get_error(client_.get(), -1), SSL_ERROR_WANT_READ);
++  expect_declined(client_.get(), kData);
++  ASSERT_TRUE(CompleteHandshakes(client_.get(), server_.get()));
++
++  // While `SSL_read` holds part of a record, or plaintext it has not returned.
++  ASSERT_TRUE(Connect());
++  ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++  std::vector<uint8_t> wire;
++  ASSERT_TRUE(WriteToWire(server_.get(), client_.get(), kData, &wire));
++  const size_t record_len = wire.size();
++  ASSERT_TRUE(WriteToWire(server_.get(), client_.get(), kData, &wire));
++  BIO *transport = SSL_get_wbio(server_.get());
++  ASSERT_EQ(BIO_write(transport, wire.data(), 3), 3);
++  EXPECT_EQ(SSL_read(client_.get(), buf, sizeof(buf)), -1);
++  EXPECT_EQ(SSL_get_error(client_.get(), -1), SSL_ERROR_WANT_READ);
++  expect_declined(client_.get(), Span(wire).subspan(3));
++  ASSERT_EQ(BIO_write(transport, wire.data() + 3,
++                      static_cast<int>(record_len - 3)),
++            static_cast<int>(record_len - 3));
++  ASSERT_EQ(SSL_read(client_.get(), buf, 1), 1);
++  expect_declined(client_.get(), Span(wire).subspan(record_len));
++  ASSERT_EQ(SSL_read(client_.get(), buf, sizeof(buf)), int{sizeof(buf) - 1});
++  // Once it holds nothing, the next record opens.
++  std::vector<uint8_t> received;
++  size_t empty;
++  ASSERT_NO_FATAL_FAILURE(OpenWire(
++      client_.get(), Span(wire).subspan(record_len), &received, &empty));
++  EXPECT_EQ(Bytes(received), Bytes(kData));
++
++  // A close_notify is consumed, and `SSL_read` reports it without input.
++  ASSERT_TRUE(Connect());
++  ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++  wire.clear();
++  ASSERT_EQ(SSL_shutdown(server_.get()), 0);
++  ASSERT_TRUE(ReadTransport(client_.get(), &wire));
++  size_t consumed;
++  Span<uint8_t> plaintext;
++  EXPECT_EQ(OpenNoIO(client_.get(), Span(wire), &consumed, &plaintext),
++            ssl_open_app_data_declined);
++  EXPECT_EQ(consumed, wire.size());
++  EXPECT_TRUE(plaintext.empty());
++  EXPECT_EQ(ERR_peek_error(), 0u);
++  EXPECT_EQ(SSL_read(client_.get(), buf, sizeof(buf)), 0);
++  EXPECT_EQ(SSL_get_error(client_.get(), 0), SSL_ERROR_ZERO_RETURN);
++  expect_declined(client_.get(), kData);
++
++  // After the read side was shut down some other way.
++  ASSERT_TRUE(Connect());
++  SSL_set_shutdown(client_.get(), SSL_RECEIVED_SHUTDOWN);
++  expect_declined(client_.get(), kData);
++
++  ASSERT_TRUE(Connect());
++  SSL_set_quiet_shutdown(client_.get(), 1);
++  EXPECT_EQ(SSL_shutdown(client_.get()), 1);
++  expect_declined(client_.get(), kData);
++}
++
++TEST_P(SSLVersionTest, OpenAppDataErrors) {
++  if (is_dtls()) {
++    return;
++  }
++
++  static const uint8_t kData[100] = {1};
++  uint8_t buf[sizeof(kData)];
++  // expect_error opens `wire` on `ssl`, which fails after `expected_consumed`
++  // bytes. `SSL_read` then reports `reason`, and both keep failing.
++  auto expect_error = [&](SSL *ssl, Span<uint8_t> wire,
++                          size_t expected_consumed, int reason) {
++    size_t consumed, len;
++    uint8_t *data;
++    EXPECT_EQ(SSL_open_app_data(ssl, wire.data(), wire.size(), &consumed,
++                                &data, &len),
++              ssl_open_app_data_declined);
++    EXPECT_EQ(consumed, expected_consumed);
++    EXPECT_EQ(data, nullptr);
++    EXPECT_EQ(len, 0u);
++    EXPECT_EQ(ERR_peek_error(), 0u);
++    for (int i = 0; i < 2; i++) {
++      EXPECT_EQ(SSL_read(ssl, buf, sizeof(buf)), -1);
++      EXPECT_EQ(SSL_get_error(ssl, -1), SSL_ERROR_SSL);
++      EXPECT_TRUE(ERR_equals(ERR_peek_last_error(), ERR_LIB_SSL, reason));
++      ERR_clear_error();
++      EXPECT_EQ(SSL_open_app_data(ssl, wire.data(), wire.size(), &consumed,
++                                  &data, &len),
++                ssl_open_app_data_declined);
++      EXPECT_EQ(consumed, 0u);
++      EXPECT_EQ(ERR_peek_error(), 0u);
++    }
++  };
++
++  // A record that fails to open is answered with a fatal alert.
++  ASSERT_TRUE(Connect());
++  ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++  std::vector<uint8_t> wire;
++  ASSERT_TRUE(WriteToWire(server_.get(), client_.get(), kData, &wire));
++  wire.back() ^= 1;
++  expect_error(client_.get(), Span(wire), wire.size(),
++               SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC);
++  EXPECT_EQ(SSL_read(server_.get(), buf, sizeof(buf)), -1);
++  EXPECT_EQ(SSL_get_error(server_.get(), -1), SSL_ERROR_SSL);
++  EXPECT_TRUE(ExpectSingleError(ERR_LIB_SSL, SSL_R_SSLV3_ALERT_BAD_RECORD_MAC));
++
++  // The peer's fatal alert is not answered.
++  ASSERT_TRUE(Connect());
++  ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++  wire.clear();
++  ASSERT_TRUE(SSL_send_fatal_alert(server_.get(), SSL_AD_INTERNAL_ERROR));
++  ASSERT_TRUE(ReadTransport(client_.get(), &wire));
++  expect_error(client_.get(), Span(wire), wire.size(),
++               SSL_R_TLSV1_ALERT_INTERNAL_ERROR);
++  std::vector<uint8_t> answer;
++  ASSERT_TRUE(ReadTransport(server_.get(), &answer));
++  EXPECT_TRUE(answer.empty());
++
++  // A header that announces an oversized record fails before its body.
++  ASSERT_TRUE(Connect());
++  ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++  wire.clear();
++  ASSERT_TRUE(WriteToWire(server_.get(), client_.get(), kData, &wire));
++  wire.resize(SSL3_RT_HEADER_LENGTH);
++  wire[3] = wire[4] = 0xff;
++  expect_error(client_.get(), Span(wire), 0,
++               SSL_R_ENCRYPTED_LENGTH_TOO_LONG);
++
++  // A post-handshake message that fails is consumed with its record.
++  if (is_tls13()) {
++    static const int kMaxKeyUpdates = 32;
++    ASSERT_TRUE(Connect());
++    ASSERT_TRUE(FlushNewSessionTickets(client_.get(), server_.get()));
++    wire.clear();
++    for (int i = 0; i <= kMaxKeyUpdates; i++) {
++      ASSERT_TRUE(SSL_key_update(server_.get(), SSL_KEY_UPDATE_NOT_REQUESTED));
++      ASSERT_EQ(SSL_write(server_.get(), nullptr, 0), 0);
++      ASSERT_TRUE(ReadTransport(client_.get(), &wire));
++    }
++    Span<uint8_t> rest(wire);
++    for (int i = 0; i < kMaxKeyUpdates; i++) {
++      size_t consumed;
++      Span<uint8_t> plaintext;
++      ASSERT_EQ(OpenNoIO(client_.get(), rest, &consumed, &plaintext),
++                ssl_open_app_data_success);
++      EXPECT_TRUE(plaintext.empty());
++      rest = rest.subspan(consumed);
++    }
++    expect_error(client_.get(), rest, rest.size(), SSL_R_TOO_MANY_KEY_UPDATES);
++  }
++}
++
+ TEST_P(SSLVersionTest, RecordCallback) {
+   if (version() == DTLS1_3_VERSION) {
+     // The DTLS 1.3 record header is vastly different than the TLS or DTLS < 1.3
+@@ -9307,6 +9732,29 @@ TEST_F(QUICMethodTest, SealAppDataDeclines) {
+   }
+ }
+ 
++// Test that `SSL_open_app_data` declines QUIC connections, which have no
++// records, and leaves them usable.
++TEST_F(QUICMethodTest, OpenAppDataDeclines) {
++  const SSL_QUIC_METHOD quic_method = DefaultQUICMethod();
++  ASSERT_TRUE(SSL_CTX_set_quic_method(client_ctx_.get(), &quic_method));
++  ASSERT_TRUE(SSL_CTX_set_quic_method(server_ctx_.get(), &quic_method));
++  ASSERT_TRUE(CreateClientAndServer());
++  ASSERT_TRUE(CompleteHandshakesForQUIC());
++
++  for (SSL *ssl : {client_.get(), server_.get()}) {
++    uint8_t in[100] = {SSL3_RT_APPLICATION_DATA, 3, 3, 0, 95};
++    size_t consumed = 1, len = 1;
++    uint8_t *out = in;
++    EXPECT_EQ(SSL_open_app_data(ssl, in, sizeof(in), &consumed, &out, &len),
++              ssl_open_app_data_declined);
++    EXPECT_EQ(consumed, 0u);
++    EXPECT_EQ(out, nullptr);
++    EXPECT_EQ(len, 0u);
++    EXPECT_EQ(ERR_peek_error(), 0u);
++    EXPECT_EQ(SSL_process_quic_post_handshake(ssl), 1);
++  }
++}
++
+ // Test that HelloRetryRequest in QUIC works.
+ TEST_F(QUICMethodTest, HelloRetryRequest) {
+   const SSL_QUIC_METHOD quic_method = DefaultQUICMethod();
+diff --git a/ssl/test/bssl_shim.cc b/ssl/test/bssl_shim.cc
+index 6c813d4..852367d 100644
+--- a/ssl/test/bssl_shim.cc
++++ b/ssl/test/bssl_shim.cc
+@@ -51,6 +51,7 @@ OPENSSL_MSVC_PRAGMA(comment(lib, "Ws2_32.lib"))
+ #include <openssl/ssl.h>
+ #include <openssl/x509.h>
+ 
++#include <algorithm>
+ #include <functional>
+ #include <memory>
+ #include <string>
+@@ -205,6 +206,193 @@ static OwnedSocket Connect(const TestConfig *config) {
+   return sock;
+ }
+ 
++// OpenInput is the transport input `ReadOpened` pulled ahead of BoringSSL, and
++// plaintext it opened but has not returned yet.
++struct OpenInput {
++  std::vector<uint8_t> in;
++  std::vector<uint8_t> plain;
++  size_t reads = 0;
++};
++
++static int OpenBioMethodType() {
++  static int type = [] {
++    int idx = BIO_get_new_index();
++    BSSL_CHECK(idx > 0);
++    return idx | BIO_TYPE_FILTER;
++  }();
++  return type;
++}
++
++static OpenInput *GetOpenInput(BIO *bio) {
++  if (bio == nullptr || BIO_method_type(bio) != OpenBioMethodType()) {
++    return nullptr;
++  }
++  return static_cast<OpenInput *>(BIO_get_data(bio));
++}
++
++static int OpenBioWriteEx(BIO *bio, const char *in, size_t inl,
++                          size_t *out_written) {
++  BIO *next = BIO_next(bio);
++  if (next == nullptr) {
++    return 0;
++  }
++  BIO_clear_retry_flags(bio);
++  int ret = BIO_write_ex(next, in, inl, out_written);
++  if (!ret) {
++    BIO_copy_next_retry(bio);
++  }
++  return ret;
++}
++
++// OpenBioRead serves the input `ReadOpened` left behind before reading more,
++// so `SSL_read` continues where `SSL_open_app_data` stopped.
++static int OpenBioRead(BIO *bio, char *out, int outl) {
++  OpenInput *input = GetOpenInput(bio);
++  BIO *next = BIO_next(bio);
++  if (input == nullptr || next == nullptr || outl < 0) {
++    return 0;
++  }
++  BIO_clear_retry_flags(bio);
++  if (!input->in.empty()) {
++    const size_t len = std::min(input->in.size(), static_cast<size_t>(outl));
++    OPENSSL_memcpy(out, input->in.data(), len);
++    input->in.erase(input->in.begin(), input->in.begin() + len);
++    return static_cast<int>(len);
++  }
++  int ret = BIO_read(next, out, outl);
++  if (ret <= 0) {
++    BIO_copy_next_retry(bio);
++  }
++  return ret;
++}
++
++static long OpenBioCtrl(BIO *bio, int cmd, long num, void *ptr) {
++  BIO *next = BIO_next(bio);
++  if (next == nullptr) {
++    return 0;
++  }
++  BIO_clear_retry_flags(bio);
++  long ret = BIO_ctrl(next, cmd, num, ptr);
++  BIO_copy_next_retry(bio);
++  return ret;
++}
++
++static long OpenBioCallbackCtrl(BIO *bio, int cmd, BIO_info_cb *fp) {
++  BIO *next = BIO_next(bio);
++  if (next == nullptr) {
++    return 0;
++  }
++  return BIO_callback_ctrl(next, cmd, fp);
++}
++
++static int OpenBioNew(BIO *bio) {
++  BIO_set_data(bio, new OpenInput);
++  BIO_set_init(bio, 1);
++  return 1;
++}
++
++static int OpenBioFree(BIO *bio) {
++  if (bio == nullptr) {
++    return 0;
++  }
++  delete GetOpenInput(bio);
++  BIO_set_data(bio, nullptr);
++  BIO_set_init(bio, 0);
++  return 1;
++}
++
++// OpenBioCreate returns a filter `BIO` that holds an `OpenInput`.
++static bssl::UniquePtr<BIO> OpenBioCreate() {
++  static const BIO_METHOD *method = [] {
++    BIO_METHOD *ret = BIO_meth_new(OpenBioMethodType(), "open bio");
++    BSSL_CHECK(ret);
++    BSSL_CHECK(BIO_meth_set_write_ex(ret, OpenBioWriteEx));
++    BSSL_CHECK(BIO_meth_set_read(ret, OpenBioRead));
++    BSSL_CHECK(BIO_meth_set_ctrl(ret, OpenBioCtrl));
++    BSSL_CHECK(BIO_meth_set_create(ret, OpenBioNew));
++    BSSL_CHECK(BIO_meth_set_destroy(ret, OpenBioFree));
++    BSSL_CHECK(BIO_meth_set_callback_ctrl(ret, OpenBioCallbackCtrl));
++    return ret;
++  }();
++  return bssl::UniquePtr<BIO>(BIO_new(method));
++}
++
++// ReadOpened is `DoRead` through `SSL_open_app_data`. It pulls input from the
++// transport in irregular amounts, ahead of BoringSSL, and checks that opening
++// only touches the record it opened. It returns zero for `DoRead` to continue
++// with `SSL_read` where opening declines or the transport ends.
++static int ReadOpened(SSL *ssl, uint8_t *out, size_t max_out) {
++  static const size_t kReadLens[] = {1, 4, 17, 1024, 20000};
++  const TestConfig *config = GetTestConfig(ssl);
++  TestState *test_state = GetTestState(ssl);
++  BIO *bio = SSL_get_rbio(ssl);
++  OpenInput *input = GetOpenInput(bio);
++  if (input == nullptr) {
++    return 0;
++  }
++  for (;;) {
++    if (!input->plain.empty()) {
++      const size_t len = std::min(input->plain.size(), max_out);
++      OPENSSL_memcpy(out, input->plain.data(), len);
++      input->plain.erase(input->plain.begin(), input->plain.begin() + len);
++      return static_cast<int>(len);
++    }
++
++    const std::vector<uint8_t> before = input->in;
++    size_t consumed, len;
++    uint8_t *data;
++    const auto result = SSL_open_app_data(
++        ssl, input->in.data(), input->in.size(), &consumed, &data, &len);
++    if (ERR_peek_error() != 0) {
++      fprintf(stderr, "SSL_open_app_data left an error queued.\n");
++      return -1;
++    }
++    switch (result) {
++      case ssl_open_app_data_success:
++        if (consumed == 0 || consumed > input->in.size() ||
++            (len != 0 && (data < input->in.data() ||
++                          len > consumed ||
++                          data > input->in.data() + consumed - len)) ||
++            !std::equal(before.begin() + consumed, before.end(),
++                        input->in.begin() + consumed)) {
++          fprintf(stderr, "SSL_open_app_data opened outside its record.\n");
++          return -1;
++        }
++        input->plain.assign(data, data + len);
++        input->in.erase(input->in.begin(), input->in.begin() + consumed);
++        break;
++
++      case ssl_open_app_data_partial: {
++        if (consumed <= input->in.size() || data != nullptr || len != 0 ||
++            input->in != before) {
++          fprintf(stderr, "SSL_open_app_data changed a partial record.\n");
++          return -1;
++        }
++        uint8_t buf[20000];
++        const size_t want = kReadLens[input->reads++ % std::size(kReadLens)];
++        const int ret = BIO_read(BIO_next(bio), buf, static_cast<int>(want));
++        if (ret > 0) {
++          input->in.insert(input->in.end(), buf, buf + ret);
++        } else if (config->async && BIO_should_read(BIO_next(bio))) {
++          AsyncBioAllowRead(test_state->async_bio, 1);
++        } else {
++          // `SSL_read` meets the end or the error itself.
++          return 0;
++        }
++        break;
++      }
++
++      case ssl_open_app_data_declined:
++        if (consumed > input->in.size() || data != nullptr || len != 0) {
++          fprintf(stderr, "SSL_open_app_data declined with bad output.\n");
++          return -1;
++        }
++        input->in.erase(input->in.begin(), input->in.begin() + consumed);
++        return 0;
++    }
++  }
++}
++
+ // DoRead reads from `ssl`, resolving any asynchronous operations. It returns
+ // the result value of the final `SSL_read` call.
+ static int DoRead(SSL *ssl, uint8_t *out, size_t max_out) {
+@@ -213,6 +401,12 @@ static int DoRead(SSL *ssl, uint8_t *out, size_t max_out) {
+   if (test_state->quic_transport) {
+     return test_state->quic_transport->ReadApplicationData(out, max_out);
+   }
++  if (config->open_app_data && !config->peek_then_read && max_out > 0) {
++    int opened = ReadOpened(ssl, out, max_out);
++    if (opened != 0) {
++      return opened;
++    }
++  }
+   int ret;
+   do {
+     ret = CheckIdempotentError("SSL_peek/SSL_read", ssl, [&]() -> int {
+@@ -939,6 +1133,14 @@ static bool DoConnection(bssl::UniquePtr<SSL_SESSION> *out_session,
+     GetTestState(ssl.get())->async_bio = async_scoped.get();
+     bio = std::move(async_scoped);
+   }
++  if (config->open_app_data && !config->is_dtls && !config->is_quic) {
++    bssl::UniquePtr<BIO> open_bio = OpenBioCreate();
++    if (!open_bio) {
++      return false;
++    }
++    BIO_push(open_bio.get(), bio.release());
++    bio = std::move(open_bio);
++  }
+   if (config->is_quic) {
+     GetTestState(ssl.get())->quic_transport =
+         std::make_unique<MockQuicTransport>(std::move(bio), ssl.get());
+diff --git a/ssl/test/test_config.cc b/ssl/test/test_config.cc
+index bd547a8..972d875 100644
+--- a/ssl/test/test_config.cc
++++ b/ssl/test/test_config.cc
+@@ -387,6 +387,7 @@ const Flag<TestConfig> *FindFlag(const char *name) {
+         BoolFlag("-cbc-record-splitting", &TestConfig::cbc_record_splitting),
+         BoolFlag("-partial-write", &TestConfig::partial_write),
+         BoolFlag("-seal-app-data", &TestConfig::seal_app_data),
++        BoolFlag("-open-app-data", &TestConfig::open_app_data),
+         BoolFlag("-no-tls13", &TestConfig::no_tls13),
+         BoolFlag("-no-tls12", &TestConfig::no_tls12),
+         BoolFlag("-no-tls11", &TestConfig::no_tls11),
+diff --git a/ssl/test/test_config.h b/ssl/test/test_config.h
+index e854e7c..81158c4 100644
+--- a/ssl/test/test_config.h
++++ b/ssl/test/test_config.h
+@@ -107,6 +107,7 @@ struct TestConfig {
+   bool cbc_record_splitting = false;
+   bool partial_write = false;
+   bool seal_app_data = false;
++  bool open_app_data = false;
+   bool no_tls13 = false;
+   bool no_tls12 = false;
+   bool no_tls11 = false;

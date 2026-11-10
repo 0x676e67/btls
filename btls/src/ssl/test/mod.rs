@@ -95,6 +95,18 @@ fn seal_app_data_is_unavailable_in_fips() {
 }
 
 #[test]
+#[cfg(feature = "fips")]
+fn open_app_data_is_unavailable_in_fips() {
+    let server = Server::builder().build();
+
+    let mut s = server.client().connect();
+    assert!(matches!(
+        s.ssl_mut().open_app_data(&mut [0; 16]),
+        Ok(crate::ssl::Opened::Declined { consumed: 0 })
+    ));
+}
+
+#[test]
 fn peer_certificate() {
     let server = Server::builder().build();
 

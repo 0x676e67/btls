@@ -70,7 +70,7 @@ use std::io::{self, IoSlice};
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, Range};
-use std::panic::resume_unwind;
+use std::panic::{resume_unwind, RefUnwindSafe, UnwindSafe};
 use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::slice;
@@ -4528,9 +4528,9 @@ impl SslRef {
     /// `buf` must start at a record boundary of the ciphertext read from the transport. On
     /// [`Opened::Declined`], drop its first `consumed` bytes and read through
     /// [`SslStream::ssl_read`], which handles every other state and reports a close_notify or
-    /// an error met here.
+    /// an error met here; no error is left queued for it.
     ///
-    /// Always declines in FIPS builds, which lack the BoringSSL patch.
+    /// Always declines for DTLS and QUIC, and in FIPS builds, which lack the BoringSSL patch.
     #[corresponds(SSL_open_app_data)]
     pub fn open_app_data(&mut self, buf: &mut [u8]) -> Result<Opened, ErrorStack> {
         #[cfg(not(feature = "fips"))]
@@ -5177,6 +5177,10 @@ pub struct SslStream<S> {
 // field would be; `&self` only reaches the stream, so `S` decides both, as before it was cached.
 unsafe impl<S: Send> Send for SslStream<S> {}
 unsafe impl<S: Sync> Sync for SslStream<S> {}
+// Unwind safety follows `S`, as before `state` was cached: its stashed error and panic only
+// leave through `&mut self`.
+impl<S: UnwindSafe> UnwindSafe for SslStream<S> {}
+impl<S: RefUnwindSafe> RefUnwindSafe for SslStream<S> {}
 
 impl<S> Drop for SslStream<S> {
     fn drop(&mut self) {

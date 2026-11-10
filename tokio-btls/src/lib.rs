@@ -97,6 +97,8 @@ impl<S: AsyncRead + AsyncWrite> SslStream<S> {
 impl<S> SslStream<S> {
     #[inline]
     /// Returns a shared reference to the `Ssl` object associated with this stream.
+    ///
+    /// Its `pending()` does not count plaintext this stream holds for the next read.
     pub fn ssl(&self) -> &SslRef {
         self.0.ssl()
     }
@@ -251,7 +253,10 @@ where
 
                 // Calling `SSL_shutdown` again would wait for the peer's close_notify, which is
                 // not required: https://www.rfc-editor.org/rfc/rfc8446#section-6.1
-                s.get_mut().shutdown_sent = true;
+                let wrapper = s.get_mut();
+                wrapper.shutdown_sent = true;
+                // A quiet shutdown closes the read side too.
+                wrapper.read_buf.ask_ssl();
                 Poll::Ready(Ok(()))
             }))?;
         }

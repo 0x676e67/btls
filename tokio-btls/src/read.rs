@@ -1,4 +1,4 @@
-use std::{io, mem, ops::Range, task::Poll};
+use std::{cell::Cell, io, mem, ops::Range, task::Poll};
 
 use btls::{
     error::ErrorStack,
@@ -15,16 +15,26 @@ use crate::{bio::StreamWrapper, transport::Transport};
 /// reads share data from one underlying read. Larger bursts may require multiple refills.
 const READ_BUF_CAPACITY: usize = 17 * 1024;
 
+thread_local! {
+    /// The last read buffer released on this thread, taken by the next refill.
+    ///
+    /// Connections hold a buffer only while it holds data, so most refills would allocate one
+    /// and most reads free it again; passing one along costs each thread a single buffer.
+    static SPARE: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+}
+
 /// Ciphertext read from the transport, and plaintext opened in place but not yet delivered.
 ///
-/// The allocation is kept once made, so idle polls and refills on a busy connection reuse it.
+/// The allocation is held only while it holds either: a read that leaves a partial record
+/// refills it in place, and one that drains it hands it to [`SPARE`], so a connection that stops
+/// reading there, such as one returned to a pool, keeps none.
 #[derive(Default)]
 pub(crate) struct ReadBuffer {
     bytes: Vec<u8>,
     // The next ciphertext byte is `bytes[pos]`.
     pos: usize,
     plain: Range<usize>,
-    // Set once the transport ended; the next refill reports the end to BoringSSL.
+    // The transport ended in `fill_partial`; the next BIO read reports the end to BoringSSL.
     eof: bool,
     // BoringSSL holds no input of its own, so an empty buffer needs no call into it. Only BIO
     // reads give it input, and post-handshake messages or a decline may leave it work.
@@ -67,26 +77,56 @@ impl ReadBuffer {
         let n = buffered.len().min(buf.len());
         buf[..n].copy_from_slice(&buffered[..n]);
         self.pos += n;
+        self.release_drained();
         Ok(n)
     }
 
-    /// Refills the empty buffer with a single read of `transport`, or reports an end it already
-    /// returned.
+    /// Releases the allocation once it holds neither ciphertext nor undelivered plaintext.
+    #[inline]
+    pub(crate) fn release_drained(&mut self) {
+        if self.is_empty() && !self.has_plain() {
+            self.release();
+        }
+    }
+
+    /// Hands the allocation to [`SPARE`], dropping what it holds.
+    fn release(&mut self) {
+        self.pos = 0;
+        self.plain = 0..0;
+        let mut bytes = mem::take(&mut self.bytes);
+        if bytes.capacity() != 0 {
+            bytes.clear();
+            // Unavailable while the thread shuts down; the buffer is freed then.
+            let _ = SPARE.try_with(|spare| spare.set(bytes));
+        }
+    }
+
+    /// Refills the empty buffer with a single read of `transport`, or reports the end
+    /// `fill_partial` met.
     ///
-    /// Maps the stream's `Poll::Pending` to `WouldBlock`; the stream registers the waker.
-    /// Undelivered plaintext is dropped, which only a shutdown read leaves behind.
+    /// Maps the stream's `Poll::Pending` to `WouldBlock`; the stream registers the waker. Every
+    /// read delivers opened plaintext before BoringSSL reads again, so none is waiting here.
     fn fill<S>(&mut self, transport: &mut Transport<S>) -> io::Result<()>
     where
         S: AsyncRead,
     {
-        self.bytes.clear();
+        debug_assert!(!self.has_plain(), "refilling over undelivered plaintext");
         self.pos = 0;
         self.plain = 0..0;
-        if self.eof {
+        if mem::take(&mut self.eof) {
+            self.release();
             return Ok(());
         }
+        self.bytes.clear();
         self.read_transport(transport, READ_BUF_CAPACITY)?;
         Ok(())
+    }
+
+    /// Makes the next `open` ask BoringSSL even with an empty buffer, after a call that may have
+    /// changed what its read side reports.
+    #[inline]
+    pub(crate) fn ask_ssl(&mut self) {
+        self.ssl_idle = false;
     }
 
     /// Whether opened plaintext waits for delivery.
@@ -140,7 +180,7 @@ impl ReadBuffer {
     }
 
     /// Moves a partial record to the front and appends one read of `transport`, with room for at
-    /// least `needed` bytes. Returns the bytes read, 0 at the end.
+    /// least `needed` bytes. Returns the bytes read, 0 at the end, which the next BIO read reports.
     pub(crate) fn fill_partial<S>(
         &mut self,
         transport: &mut Transport<S>,
@@ -155,10 +195,13 @@ impl ReadBuffer {
         }
         self.bytes.drain(..self.pos);
         self.pos = 0;
-        self.read_transport(transport, needed.max(READ_BUF_CAPACITY))
+        let filled = self.read_transport(transport, needed.max(READ_BUF_CAPACITY))?;
+        self.eof = filled == 0;
+        Ok(filled)
     }
 
-    /// Appends one read of `transport` after growing the buffer to `capacity` bytes.
+    /// Appends one read of `transport` after growing the buffer to `capacity` bytes, and
+    /// releases a buffer the read leaves empty, as an idle poll does.
     fn read_transport<S>(
         &mut self,
         transport: &mut Transport<S>,
@@ -168,20 +211,26 @@ impl ReadBuffer {
         S: AsyncRead,
     {
         let (stream, cx) = transport.parts()?;
+        if self.bytes.capacity() == 0 {
+            self.bytes = SPARE.try_with(Cell::take).unwrap_or_default();
+        }
         let len = self.bytes.len();
         self.bytes.reserve_exact(capacity.saturating_sub(len));
 
         let mut buf = ReadBuf::uninit(self.bytes.spare_capacity_mut());
-        match stream.poll_read(cx, &mut buf)? {
-            Poll::Ready(()) => {
-                let filled = buf.filled().len();
-                // SAFETY: `ReadBuf` guarantees its first `filled` bytes are initialized.
-                unsafe { self.bytes.set_len(len + filled) };
-                self.eof = filled == 0;
-                Ok(filled)
-            }
+        let read = match stream.poll_read(cx, &mut buf) {
+            Poll::Ready(Ok(())) => Ok(buf.filled().len()),
+            Poll::Ready(Err(err)) => Err(err),
             Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        };
+        if let Ok(filled) = read {
+            // SAFETY: `ReadBuf` guarantees its first `filled` bytes are initialized.
+            unsafe { self.bytes.set_len(len + filled) };
         }
+        if self.bytes.is_empty() {
+            self.release();
+        }
+        read
     }
 }
 
@@ -238,6 +287,7 @@ where
             }
         }
     }
+    read_buf.release_drained();
     let wrapper = s.get_mut();
     wrapper.read_buf = read_buf;
     if buf.filled().len() > start {
@@ -275,17 +325,25 @@ mod tests {
     }
 
     #[test]
-    fn read_buf_kept_once_drained() {
+    fn read_buf_released_when_drained() {
         let mut wrapper = StreamWrapper::new(Once(vec![1; 100]));
         wrapper.transport.set_noop_context();
 
         let mut buf = [0; 60];
         assert_eq!(wrapper.read(&mut buf).unwrap(), 60);
+        // The buffer is held while ciphertext waits in it, and released once drained or idle.
+        assert_eq!(wrapper.read_buf.bytes.capacity(), READ_BUF_CAPACITY);
+        let allocation = wrapper.read_buf.bytes.as_ptr();
         assert_eq!(wrapper.read(&mut buf).unwrap(), 40);
-        // A drained buffer and an idle poll reuse the allocation.
+        assert_eq!(wrapper.read_buf.bytes.capacity(), 0);
         let err = wrapper.read(&mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert!(wrapper.read_buf.is_empty());
-        assert_eq!(wrapper.read_buf.bytes.capacity(), READ_BUF_CAPACITY);
+        assert_eq!(wrapper.read_buf.bytes.capacity(), 0);
+
+        // The next refill on this thread, by any connection, takes the released allocation.
+        let mut other = StreamWrapper::new(Once(vec![2; 100]));
+        other.transport.set_noop_context();
+        assert_eq!(other.read(&mut buf).unwrap(), 60);
+        assert_eq!(other.read_buf.bytes.as_ptr(), allocation);
     }
 }
