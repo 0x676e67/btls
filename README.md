@@ -23,7 +23,7 @@ btls = "0.5"
 Next, add this to your crate:
 
 ```rust
-use btls::ssl::{{Ssl, SslConnector};
+use btls::ssl::{Ssl, SslConnector};
 
 fn main() {
     // ...
