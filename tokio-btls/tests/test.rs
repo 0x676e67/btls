@@ -10,14 +10,17 @@ use std::{
     time::Duration,
 };
 
-use btls::ssl::{Ssl, SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVersion};
+use btls::ssl::{
+    BoxCustomVerifyFinish, ErrorCode, Ssl, SslAcceptor, SslAlert, SslConnector, SslFiletype,
+    SslMethod, SslRef, SslVerifyMode, SslVersion,
+};
 use futures::future;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
 };
 
-use tokio_btls::SslStream;
+use tokio_btls::{ConnectConfigurationExt, SslAcceptorExt, SslConnectorExt, SslExt, SslStream};
 
 #[tokio::test]
 async fn google() {
@@ -33,7 +36,7 @@ async fn google() {
         .unwrap();
     let mut stream = SslStream::new(ssl, stream).unwrap();
 
-    Pin::new(&mut stream).connect().await.unwrap();
+    stream.connect().await.unwrap();
 
     stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
     stream.flush().await.unwrap();
@@ -63,11 +66,8 @@ async fn server() {
             .unwrap();
         let acceptor = acceptor.build();
 
-        let ssl = Ssl::new(acceptor.context()).unwrap();
         let stream = listener.accept().await.unwrap().0;
-        let mut stream = SslStream::new(ssl, stream).unwrap();
-
-        Pin::new(&mut stream).accept().await.unwrap();
+        let mut stream = acceptor.accept_async(stream).await.unwrap();
 
         let mut buf = [0; 4];
         stream.read_exact(&mut buf).await.unwrap();
@@ -83,17 +83,13 @@ async fn server() {
     let client = async {
         let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
         connector.set_ca_file("tests/cert.pem").unwrap();
-        let ssl = connector
-            .build()
-            .configure()
-            .unwrap()
-            .into_ssl("localhost")
-            .unwrap();
 
         let stream = TcpStream::connect(&addr).await.unwrap();
-        let mut stream = SslStream::new(ssl, stream).unwrap();
-
-        Pin::new(&mut stream).connect().await.unwrap();
+        let mut stream = connector
+            .build()
+            .connect_async("localhost", stream)
+            .await
+            .unwrap();
 
         stream.write_all(b"asdf").await.unwrap();
 
@@ -130,7 +126,7 @@ async fn buffered_reads_preserve_record_boundaries() {
         let ssl = Ssl::new(acceptor.context()).unwrap();
         let stream = listener.accept().await.unwrap().0;
         let mut stream = SslStream::new(ssl, stream).unwrap();
-        Pin::new(&mut stream).accept().await.unwrap();
+        stream.accept().await.unwrap();
 
         for record in &records {
             stream.write_all(record).await.unwrap();
@@ -152,7 +148,7 @@ async fn buffered_reads_preserve_record_boundaries() {
 
         let stream = TcpStream::connect(&addr).await.unwrap();
         let mut stream = SslStream::new(ssl, stream).unwrap();
-        Pin::new(&mut stream).connect().await.unwrap();
+        stream.connect().await.unwrap();
 
         let mut buf = vec![];
         stream.read_to_end(&mut buf).await.unwrap();
@@ -341,7 +337,7 @@ async fn vectored_writes_for_version(version: SslVersion) {
             wire: wire.clone(),
         };
         let mut stream = SslStream::new(ssl, stream).unwrap();
-        Pin::new(&mut stream).accept().await.unwrap();
+        stream.accept().await.unwrap();
         assert_eq!(stream.ssl().version2(), Some(version));
         // Without the sealing API (FIPS builds), writes take the `SSL_write` loop.
         let sealed = stream.ssl().seal_app_data_limits().is_some();
@@ -439,7 +435,7 @@ async fn vectored_writes_for_version(version: SslVersion) {
 
         let stream = TcpStream::connect(&addr).await.unwrap();
         let mut stream = SslStream::new(ssl, stream).unwrap();
-        Pin::new(&mut stream).connect().await.unwrap();
+        stream.connect().await.unwrap();
         assert_eq!(stream.ssl().version2(), Some(version));
 
         let mut buf = vec![];
@@ -448,4 +444,84 @@ async fn vectored_writes_for_version(version: SslVersion) {
     };
 
     future::join(server, client).await;
+}
+
+/// An acceptor serving the test certificate.
+fn test_acceptor() -> SslAcceptor {
+    let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+    acceptor
+        .set_private_key_file("tests/key.pem", SslFiletype::PEM)
+        .unwrap();
+    acceptor
+        .set_certificate_chain_file("tests/cert.pem")
+        .unwrap();
+    acceptor.build()
+}
+
+#[tokio::test]
+async fn handshake_waits_for_async_callbacks() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let acceptor = test_acceptor();
+
+    // Keeps the built-in checks, then answers later, as a verifier that fetches something does.
+    let answers = Arc::new(AtomicUsize::new(0));
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_ca_file("tests/cert.pem").unwrap();
+    connector.set_async_custom_verify_callback(SslVerifyMode::PEER, {
+        let answers = answers.clone();
+        move |ssl| {
+            ssl.verify_peer_cert_chain()
+                .map_err(|_| SslAlert::BAD_CERTIFICATE)?;
+            let answers = answers.clone();
+            Ok(Box::pin(async move {
+                tokio::task::yield_now().await;
+                answers.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(|_: &mut SslRef| Ok(())) as BoxCustomVerifyFinish)
+            }))
+        }
+    });
+    let config = connector.build().configure().unwrap();
+
+    // Converting a failure drops its stream, which ends the peer's handshake too.
+    let (client, server) = tokio::join!(
+        async {
+            config
+                .connect_async("localhost", client_io)
+                .await
+                .map_err(io::Error::from)
+        },
+        Ssl::new(acceptor.context())
+            .unwrap()
+            .accept_async(server_io),
+    );
+    client.unwrap();
+    server.unwrap();
+    assert_eq!(answers.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn failed_handshake_keeps_its_stream() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let acceptor = test_acceptor();
+    // This client does not trust the server's certificate.
+    let ssl = SslConnector::builder(SslMethod::tls())
+        .unwrap()
+        .build()
+        .configure()
+        .unwrap()
+        .into_ssl("localhost")
+        .unwrap();
+
+    let (client, _) = tokio::join!(
+        ssl.connect_async(client_io),
+        acceptor.accept_async(server_io),
+    );
+    let err = client.unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::SSL));
+    assert!(err.ssl().unwrap().verify_result().is_err());
+    assert!(
+        err.to_string().contains("cert verification failed"),
+        "{err}"
+    );
+    assert!(err.into_source_stream().is_some());
 }

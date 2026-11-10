@@ -1,7 +1,5 @@
 //! tokio-btls adapter: BoringSSL through the crate under test.
 
-use std::pin::Pin;
-
 use ::btls::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion, Tls13Cipher};
 use ::tokio_btls::SslStream;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -43,7 +41,7 @@ impl ClientAdapter for Adapter {
             .verify_hostname(false)
             .into_ssl("localhost")?;
         let mut stream = SslStream::new(ssl, transport)?;
-        Pin::new(&mut stream).connect().await?;
+        stream.connect().await?;
         Ok(stream)
     }
 }

@@ -53,7 +53,7 @@ fn create_server() -> (
         let stream = listener.accept().await.unwrap().0;
         let mut stream = SslStream::new(ssl, stream).unwrap();
 
-        Pin::new(&mut stream).accept().await?;
+        stream.accept().await?;
         Ok(stream)
     };
 
@@ -95,7 +95,7 @@ async fn connect(
     let stream = TcpStream::connect(&addr).await.unwrap();
     let mut stream = SslStream::new(ssl, stream).unwrap();
 
-    Pin::new(&mut stream).connect().await?;
+    stream.connect().await?;
     Ok(stream)
 }
 
