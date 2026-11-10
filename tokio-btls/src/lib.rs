@@ -125,6 +125,9 @@ pub struct SslStream<S>(SslStreamCore<StreamWrapper<S>>);
 
 /// A TLS handshake in progress, which resolves to the [`SslStream`] it ran on.
 ///
+/// When early data applies, it resolves in the early data state ([`SslRef::in_early_data`]);
+/// reads, writes or [`SslStream::do_handshake`] then finish the handshake.
+///
 /// Like every handshake poll, it stays pending while a callback on the `Ssl` asks to retry
 /// later. Such a callback must wake the task; the async callbacks of [`btls`] do.
 #[must_use = "futures do nothing unless polled"]
@@ -486,6 +489,13 @@ impl<S: AsyncRead + AsyncWrite> Future for Handshake<S> {
     }
 }
 
+// The stream is left out, so the future is `Debug` whatever the transport is.
+impl<S> fmt::Debug for Handshake<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Handshake").finish_non_exhaustive()
+    }
+}
+
 // ===== impl HandshakeError =====
 
 impl<S> HandshakeError<S> {
@@ -575,6 +585,15 @@ impl<S> Error for HandshakeError<S> {
         match &self.0 {
             Failure::Setup(err) => Some(err),
             Failure::Handshake(err, _) => Some(err),
+        }
+    }
+}
+
+impl<S> From<HandshakeError<S>> for ssl::Error {
+    fn from(err: HandshakeError<S>) -> Self {
+        match err.0 {
+            Failure::Setup(err) => err.into(),
+            Failure::Handshake(err, _) => err,
         }
     }
 }
