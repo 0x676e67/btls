@@ -107,6 +107,34 @@ fn open_app_data_is_unavailable_in_fips() {
 }
 
 #[test]
+fn signed_cert_timestamp_list() {
+    // One three-byte SCT; BoringSSL only checks the framing of the list.
+    const LIST: &[u8] = &[0, 5, 0, 3, 1, 2, 3];
+
+    let mut server = Server::builder();
+    server.expected_connections_count(2);
+    // SAFETY: the context is live, and BoringSSL copies the list.
+    let set = unsafe {
+        crate::ffi::SSL_CTX_set_signed_cert_timestamp_list(
+            server.ctx().as_ptr(),
+            LIST.as_ptr(),
+            LIST.len(),
+        )
+    };
+    assert_eq!(set, 1);
+    let server = server.build();
+
+    let mut client = server.client();
+    client.ctx().enable_signed_cert_timestamps();
+    let stream = client.connect();
+    assert_eq!(stream.ssl().signed_cert_timestamp_list(), Some(LIST));
+
+    // A server only sends the list to a client that asked for it.
+    let stream = server.client().connect();
+    assert_eq!(stream.ssl().signed_cert_timestamp_list(), None);
+}
+
+#[test]
 fn peer_certificate() {
     let server = Server::builder().build();
 

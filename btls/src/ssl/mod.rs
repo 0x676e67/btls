@@ -4290,6 +4290,22 @@ impl SslRef {
         }
     }
 
+    /// Returns the signed certificate timestamps the server sent in its TLS extension, if any:
+    /// a `SignedCertificateTimestampList`
+    /// ([RFC 6962 §3.3](https://www.rfc-editor.org/rfc/rfc6962#section-3.3)).
+    ///
+    /// A client asks for them with [`SslContextBuilder::enable_signed_cert_timestamps`].
+    #[corresponds(SSL_get0_signed_cert_timestamp_list)]
+    #[must_use]
+    pub fn signed_cert_timestamp_list(&self) -> Option<&[u8]> {
+        let (mut list, mut len) = (ptr::null(), 0);
+        // SAFETY: `self` is a live `SSL`, and its session owns the list while it is borrowed.
+        unsafe {
+            ffi::SSL_get0_signed_cert_timestamp_list(self.as_ptr(), &mut list, &mut len);
+            (len != 0).then(|| slice::from_raw_parts(list, len))
+        }
+    }
+
     /// Returns the server's OCSP response, if present.
     #[corresponds(SSL_get_tlsext_status_ocsp_resp)]
     #[must_use]
