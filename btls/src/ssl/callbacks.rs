@@ -1,6 +1,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use super::connector::{CLIENT_SESSION_INDEX, SESSION_PEER_INDEX};
+use super::mut_only::MutOnly;
 use super::{
     AlpnError, CertificateCompressor, ClientHello, ClientSession, GetSessionPendingError,
     PrivateKeyMethod, PrivateKeyMethodError, SelectCertAction, SelectCertError, SniError, Ssl,
@@ -9,6 +10,7 @@ use super::{
     SESSION_CTX_INDEX,
 };
 use crate::error::ErrorStack;
+use crate::ex_data::Index;
 use crate::ffi;
 use crate::hmac::HmacCtxRef;
 use crate::ssl::TicketKeyCallbackResult;
@@ -17,35 +19,102 @@ use crate::x509::{X509StoreContext, X509StoreContextRef};
 use foreign_types::ForeignType;
 use foreign_types::ForeignTypeRef;
 use libc::{c_char, c_int, c_uchar, c_uint, c_void};
+use std::any::Any;
 use std::ffi::CStr;
 use std::mem::{self, MaybeUninit};
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 use std::str;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// The payload of a caught panic.
+type Panic = Box<dyn Any + Send>;
+
+/// A panic caught in a callback, kept until BoringSSL returns to the call that entered it.
+static PANIC_INDEX: LazyLock<Index<Ssl, MutOnly<Option<Panic>>>> =
+    LazyLock::new(|| Ssl::new_ex_index().unwrap());
+
+/// Runs the body of a callback BoringSSL invoked for `ssl`, catching a panic, which cannot
+/// unwind through BoringSSL.
+///
+/// The panic is kept on `ssl` and `failed` is returned to BoringSSL in the body's place;
+/// [`SslRef::resume_callback_panic`] resumes it once BoringSSL has returned.
+///
+/// # Safety
+///
+/// `ssl` must be null or valid, and not borrowed once `body` has returned or unwound.
+pub(super) unsafe fn catch<R>(ssl: *mut ffi::SSL, failed: R, body: impl FnOnce() -> R) -> R {
+    match panic::catch_unwind(AssertUnwindSafe(body)) {
+        Ok(ret) => ret,
+        Err(panic) => {
+            if !ssl.is_null() {
+                // SAFETY: the caller passes a valid `SSL` that nothing else borrows now.
+                let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+                match ssl.ex_data_mut(*PANIC_INDEX) {
+                    // The first panic is the one to report.
+                    Some(kept) => {
+                        kept.get_mut().get_or_insert(panic);
+                    }
+                    None => ssl.set_ex_data(*PANIC_INDEX, MutOnly::new(Some(panic))),
+                }
+            }
+            failed
+        }
+    }
+}
+
+/// Returns the `SSL` whose peer chain `x509_ctx` verifies, or null.
+///
+/// # Safety
+///
+/// `x509_ctx` must be valid.
+unsafe fn verified_ssl(x509_ctx: *mut ffi::X509_STORE_CTX) -> *mut ffi::SSL {
+    // SAFETY: the caller passes a valid store context.
+    let ctx = unsafe { X509StoreContextRef::from_ptr(x509_ctx) };
+    X509StoreContext::ssl_idx()
+        .ok()
+        .and_then(|idx| ctx.ex_data(idx))
+        .map_or(ptr::null_mut(), SslRef::as_ptr)
+}
+
+impl SslRef {
+    /// Resumes a panic caught in a callback while BoringSSL ran for this connection.
+    pub(crate) fn resume_callback_panic(&mut self) {
+        let kept = self.ex_data_mut(*PANIC_INDEX);
+        if let Some(panic) = kept.and_then(|kept| kept.get_mut().take()) {
+            panic::resume_unwind(panic)
+        }
+    }
+}
 
 pub extern "C" fn raw_verify<F>(preverify_ok: c_int, x509_ctx: *mut ffi::X509_STORE_CTX) -> c_int
 where
     F: Fn(bool, &mut X509StoreContextRef) -> bool + 'static + Sync + Send,
 {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
+
+        let ssl_idx = X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
+        let verify_idx = SslContext::cached_ex_index::<F>();
+
+        let verify = ctx
+            .ex_data(ssl_idx)
+            .expect("BUG: store context missing ssl")
+            .ssl_context()
+            .ex_data(verify_idx)
+            .expect("BUG: verify callback missing");
+
+        // SAFETY: The callback won't outlive the context it's associated with
+        // because there is no `X509StoreContextRef::ssl_mut(&mut self)` method.
+        let verify = unsafe { &*ptr::from_ref::<F>(verify) };
+
+        c_int::from(verify(preverify_ok != 0, ctx))
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
-
-    let ssl_idx = X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
-    let verify_idx = SslContext::cached_ex_index::<F>();
-
-    let verify = ctx
-        .ex_data(ssl_idx)
-        .expect("BUG: store context missing ssl")
-        .ssl_context()
-        .ex_data(verify_idx)
-        .expect("BUG: verify callback missing");
-
-    // SAFETY: The callback won't outlive the context it's associated with
-    // because there is no `X509StoreContextRef::ssl_mut(&mut self)` method.
-    let verify = unsafe { &*ptr::from_ref::<F>(verify) };
-
-    c_int::from(verify(preverify_ok != 0, ctx))
+    unsafe { catch(verified_ssl(x509_ctx), 0, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_custom_verify<F>(
@@ -76,25 +145,30 @@ pub(super) unsafe extern "C" fn raw_cert_verify<F>(
 where
     F: Fn(&mut X509StoreContextRef) -> bool + 'static + Sync + Send,
 {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
+
+        let ssl_idx = X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
+        let verify_idx = SslContext::cached_ex_index::<F>();
+
+        let verify = ctx
+            .ex_data(ssl_idx)
+            .expect("BUG: store context missing ssl")
+            .ssl_context()
+            .ex_data(verify_idx)
+            .expect("BUG: verify callback missing");
+
+        // SAFETY: The callback won't outlive the context it's associated with
+        // because there is no way to get a mutable reference to the `SslContext`,
+        // so the callback can't replace itself.
+        let verify = unsafe { &*ptr::from_ref::<F>(verify) };
+
+        c_int::from(verify(ctx))
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
-
-    let ssl_idx = X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
-    let verify_idx = SslContext::cached_ex_index::<F>();
-
-    let verify = ctx
-        .ex_data(ssl_idx)
-        .expect("BUG: store context missing ssl")
-        .ssl_context()
-        .ex_data(verify_idx)
-        .expect("BUG: verify callback missing");
-
-    // SAFETY: The callback won't outlive the context it's associated with
-    // because there is no way to get a mutable reference to the `SslContext`,
-    // so the callback can't replace itself.
-    let verify = unsafe { &*ptr::from_ref::<F>(verify) };
-
-    c_int::from(verify(ctx))
+    unsafe { catch(verified_ssl(x509_ctx), 0, body) }
 }
 
 pub(super) unsafe extern "C" fn ssl_raw_custom_verify<F>(
@@ -122,10 +196,12 @@ unsafe fn raw_custom_verify_callback(
     callback: impl FnOnce(&mut SslRef) -> Result<(), SslVerifyError>,
 ) -> ffi::ssl_verify_result_t {
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
     let out_alert = unsafe { &mut *out_alert };
+    let body = || callback(unsafe { SslRef::from_ptr_mut(ssl) });
+    let failed = Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR));
 
-    match callback(ssl) {
+    // SAFETY: btls provides valid inputs.
+    match unsafe { catch(ssl, failed, body) } {
         Ok(()) => ffi::ssl_verify_result_t::ssl_verify_ok,
         Err(SslVerifyError::Invalid(alert)) => {
             *out_alert = alert.0 as u8;
@@ -150,33 +226,37 @@ where
         + Sync
         + Send,
 {
-    // SAFETY: btls provides valid inputs.
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl_ptr) };
 
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl_ptr) };
+        let hint = if hint.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(hint) }.to_bytes())
+        };
 
-    let hint = if hint.is_null() {
-        None
-    } else {
-        Some(unsafe { CStr::from_ptr(hint) }.to_bytes())
+        // Give the callback mutable slices into which it can write the identity and psk.
+        let identity_sl =
+            unsafe { slice::from_raw_parts_mut(identity.cast::<u8>(), max_identity_len as usize) };
+        let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
+
+        let ssl_context = ssl.ssl_context().to_owned();
+        let callback = ssl_context
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: psk callback missing");
+
+        match callback(ssl, hint, identity_sl, psk_sl) {
+            Ok(psk_len) => psk_len as u32,
+            Err(e) => {
+                e.put();
+                0
+            }
+        }
     };
 
-    // Give the callback mutable slices into which it can write the identity and psk.
-    let identity_sl =
-        unsafe { slice::from_raw_parts_mut(identity.cast::<u8>(), max_identity_len as usize) };
-    let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
-
-    let ssl_context = ssl.ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: psk callback missing");
-
-    match callback(ssl, hint, identity_sl, psk_sl) {
-        Ok(psk_len) => psk_len as u32,
-        Err(e) => {
-            e.put();
-            0
-        }
-    }
+    // SAFETY: btls provides valid inputs.
+    unsafe { catch(ssl_ptr, 0, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_server_psk<F>(
@@ -191,31 +271,35 @@ where
         + Sync
         + Send,
 {
-    // SAFETY: btls provides valid inputs.
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+        let identity = if identity.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(identity) }.to_bytes())
+        };
 
-    let identity = if identity.is_null() {
-        None
-    } else {
-        Some(unsafe { CStr::from_ptr(identity) }.to_bytes())
+        // Give the callback mutable slices into which it can write the psk.
+        let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
+
+        let ssl_context = ssl.ssl_context().to_owned();
+        let callback = ssl_context
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: psk callback missing");
+
+        match callback(ssl, identity, psk_sl) {
+            Ok(psk_len) => psk_len as u32,
+            Err(e) => {
+                e.put();
+                0
+            }
+        }
     };
 
-    // Give the callback mutable slices into which it can write the psk.
-    let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
-
-    let ssl_context = ssl.ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: psk callback missing");
-
-    match callback(ssl, identity, psk_sl) {
-        Ok(psk_len) => psk_len as u32,
-        Err(e) => {
-            e.put();
-            0
-        }
-    }
+    // SAFETY: btls provides valid inputs.
+    unsafe { catch(ssl, 0, body) }
 }
 
 pub(super) unsafe extern "C" fn ssl_raw_verify<F>(
@@ -225,22 +309,27 @@ pub(super) unsafe extern "C" fn ssl_raw_verify<F>(
 where
     F: Fn(bool, &mut X509StoreContextRef) -> bool + 'static + Sync + Send,
 {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
+
+        let ssl_idx = X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
+
+        // NOTE(nox): I'm pretty sure this Arc<F> is unnecessary here as there is
+        // no way to get a `&mut SslRef` from a `&mut X509StoreContextRef`, and I
+        // don't understand how this callback is different from `raw_verify` above.
+        let callback = ctx
+            .ex_data(ssl_idx)
+            .expect("BUG: store context missing ssl")
+            .ex_data(Ssl::cached_ex_index::<Arc<F>>())
+            .expect("BUG: ssl verify callback missing")
+            .clone();
+
+        c_int::from(callback(preverify_ok != 0, ctx))
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
-
-    let ssl_idx = X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
-
-    // NOTE(nox): I'm pretty sure this Arc<F> is unnecessary here as there is
-    // no way to get a `&mut SslRef` from a `&mut X509StoreContextRef`, and I
-    // don't understand how this callback is different from `raw_verify` above.
-    let callback = ctx
-        .ex_data(ssl_idx)
-        .expect("BUG: store context missing ssl")
-        .ex_data(Ssl::cached_ex_index::<Arc<F>>())
-        .expect("BUG: ssl verify callback missing")
-        .clone();
-
-    c_int::from(callback(preverify_ok != 0, ctx))
+    unsafe { catch(verified_ssl(x509_ctx), 0, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_sni<F>(
@@ -251,27 +340,32 @@ pub(super) unsafe extern "C" fn raw_sni<F>(
 where
     F: Fn(&mut SslRef, &mut SslAlert) -> Result<(), SniError> + 'static + Sync + Send,
 {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+        let al = unsafe { &mut *al };
+
+        // SAFETY: We can make `callback` outlive `ssl` because it is a callback
+        // stored in the original context with which `ssl` was built. That
+        // original context is always stored as the session context in
+        // `Ssl::new` so it is always guaranteed to outlive the lifetime of
+        // this function's scope.
+        let callback = unsafe { &*(arg as *const F) };
+
+        let mut alert = SslAlert(*al);
+
+        let r = callback(ssl, &mut alert);
+
+        *al = alert.0;
+
+        match r {
+            Ok(()) => ffi::SSL_TLSEXT_ERR_OK,
+            Err(e) => e.0,
+        }
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-    let al = unsafe { &mut *al };
-
-    // SAFETY: We can make `callback` outlive `ssl` because it is a callback
-    // stored in the original context with which `ssl` was built. That
-    // original context is always stored as the session context in
-    // `Ssl::new` so it is always guaranteed to outlive the lifetime of
-    // this function's scope.
-    let callback = unsafe { &*(arg as *const F) };
-
-    let mut alert = SslAlert(*al);
-
-    let r = callback(ssl, &mut alert);
-
-    *al = alert.0;
-
-    match r {
-        Ok(()) => ffi::SSL_TLSEXT_ERR_OK,
-        Err(e) => e.0,
-    }
+    unsafe { catch(ssl, ffi::SSL_TLSEXT_ERR_ALERT_FATAL, body) }
 }
 
 unsafe fn to_uninit<'a, T: 'a>(ptr: *mut T) -> &'a mut MaybeUninit<T> {
@@ -300,40 +394,45 @@ where
         + Sync
         + Send,
 {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+
+        let ssl_context = ssl.ssl_context().to_owned();
+        let callback = ssl_context
+            .ex_data::<F>(SslContext::cached_ex_index::<F>())
+            .expect("expected session resumption callback");
+
+        // SAFETY: the callback guarantees that key_name is 16 bytes
+        let key_name =
+            unsafe { to_uninit(key_name.cast::<[u8; ffi::SSL_TICKET_KEY_NAME_LEN as usize]>()) };
+
+        // SAFETY: the callback provides 16 bytes iv
+        //
+        // https://github.com/google/boringssl/blob/main/ssl/ssl_session.cc#L331
+        let iv = unsafe { to_uninit(iv.cast::<[u8; ffi::EVP_MAX_IV_LENGTH as usize]>()) };
+
+        // When encrypting a new ticket, encrypt will be one.
+        let encrypt = encrypt == 1;
+
+        // Zero-initialize the key_name and iv, since the application is expected to populate these
+        // fields in the encrypt mode.
+        if encrypt {
+            *key_name = MaybeUninit::zeroed();
+            *iv = MaybeUninit::zeroed();
+        }
+        let key_name = unsafe { key_name.assume_init_mut() };
+        let iv = unsafe { iv.assume_init_mut() };
+
+        // The EVP_CIPHER_CTX and HMAC_CTX are owned by boringSSL.
+        let evp_ctx = unsafe { CipherCtxRef::from_ptr_mut(evp_ctx) };
+        let hmac_ctx = unsafe { HmacCtxRef::from_ptr_mut(hmac_ctx) };
+
+        callback(ssl, key_name, iv, evp_ctx, hmac_ctx, encrypt).into()
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-
-    let ssl_context = ssl.ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data::<F>(SslContext::cached_ex_index::<F>())
-        .expect("expected session resumption callback");
-
-    // SAFETY: the callback guarantees that key_name is 16 bytes
-    let key_name =
-        unsafe { to_uninit(key_name.cast::<[u8; ffi::SSL_TICKET_KEY_NAME_LEN as usize]>()) };
-
-    // SAFETY: the callback provides 16 bytes iv
-    //
-    // https://github.com/google/boringssl/blob/main/ssl/ssl_session.cc#L331
-    let iv = unsafe { to_uninit(iv.cast::<[u8; ffi::EVP_MAX_IV_LENGTH as usize]>()) };
-
-    // When encrypting a new ticket, encrypt will be one.
-    let encrypt = encrypt == 1;
-
-    // Zero-initialize the key_name and iv, since the application is expected to populate these
-    // fields in the encrypt mode.
-    if encrypt {
-        *key_name = MaybeUninit::zeroed();
-        *iv = MaybeUninit::zeroed();
-    }
-    let key_name = unsafe { key_name.assume_init_mut() };
-    let iv = unsafe { iv.assume_init_mut() };
-
-    // The EVP_CIPHER_CTX and HMAC_CTX are owned by boringSSL.
-    let evp_ctx = unsafe { CipherCtxRef::from_ptr_mut(evp_ctx) };
-    let hmac_ctx = unsafe { HmacCtxRef::from_ptr_mut(hmac_ctx) };
-
-    callback(ssl, key_name, iv, evp_ctx, hmac_ctx, encrypt).into()
+    unsafe { catch(ssl, TicketKeyCallbackResult::Error.into(), body) }
 }
 
 pub(super) unsafe extern "C" fn raw_alpn_select<F>(
@@ -347,26 +446,31 @@ pub(super) unsafe extern "C" fn raw_alpn_select<F>(
 where
     F: for<'a> Fn(&mut SslRef, &'a [u8]) -> Result<&'a [u8], AlpnError> + 'static + Sync + Send,
 {
-    // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-    let protos = unsafe { slice::from_raw_parts(inbuf, inlen as usize) };
-    let out = unsafe { &mut *out };
-    let outlen = unsafe { &mut *outlen };
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+        let protos = unsafe { slice::from_raw_parts(inbuf, inlen as usize) };
+        let out = unsafe { &mut *out };
+        let outlen = unsafe { &mut *outlen };
 
-    let ssl_context = ssl.ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: alpn callback missing");
+        let ssl_context = ssl.ssl_context().to_owned();
+        let callback = ssl_context
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: alpn callback missing");
 
-    match callback(ssl, protos) {
-        Ok(proto) => {
-            *out = proto.as_ptr();
-            *outlen = proto.len() as c_uchar;
+        match callback(ssl, protos) {
+            Ok(proto) => {
+                *out = proto.as_ptr();
+                *outlen = proto.len() as c_uchar;
 
-            ffi::SSL_TLSEXT_ERR_OK
+                ffi::SSL_TLSEXT_ERR_OK
+            }
+            Err(e) => e.0,
         }
-        Err(e) => e.0,
-    }
+    };
+
+    // SAFETY: btls provides valid inputs.
+    unsafe { catch(ssl, ffi::SSL_TLSEXT_ERR_ALERT_FATAL, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_select_cert<F>(
@@ -376,57 +480,77 @@ where
     F: Fn(ClientHello<'_>) -> Result<SelectCertAction, SelectCertError> + Sync + Send + 'static,
 {
     // SAFETY: btls provides valid inputs.
-    let client_hello = ClientHello(unsafe { &*client_hello });
-    let ech_accepted = client_hello.ssl().ech_accepted();
+    let client_hello = unsafe { &*client_hello };
+    let body = || {
+        let client_hello = ClientHello(client_hello);
+        let ech_accepted = client_hello.ssl().ech_accepted();
 
-    let ssl_context = client_hello.ssl().ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: select cert callback missing");
+        let ssl_context = client_hello.ssl().ssl_context().to_owned();
+        let callback = ssl_context
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: select cert callback missing");
 
-    match callback(client_hello) {
-        Ok(SelectCertAction::Success) => ffi::ssl_select_cert_result_t::ssl_select_cert_success,
-        Ok(SelectCertAction::DisableEch) if ech_accepted => {
-            ffi::ssl_select_cert_result_t::ssl_select_cert_disable_ech
+        match callback(client_hello) {
+            Ok(SelectCertAction::Success) => ffi::ssl_select_cert_result_t::ssl_select_cert_success,
+            Ok(SelectCertAction::DisableEch) if ech_accepted => {
+                ffi::ssl_select_cert_result_t::ssl_select_cert_disable_ech
+            }
+            Ok(SelectCertAction::DisableEch) => {
+                ffi::ssl_select_cert_result_t::ssl_select_cert_error
+            }
+            Err(e) => e.0,
         }
-        Ok(SelectCertAction::DisableEch) => ffi::ssl_select_cert_result_t::ssl_select_cert_error,
-        Err(e) => e.0,
-    }
+    };
+    let failed = ffi::ssl_select_cert_result_t::ssl_select_cert_error;
+
+    // SAFETY: btls provides valid inputs.
+    unsafe { catch(client_hello.ssl, failed, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_tlsext_status<F>(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int
 where
     F: Fn(&mut SslRef) -> Result<bool, ErrorStack> + 'static + Sync + Send,
 {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+
+        let ssl_context = ssl.ssl_context().to_owned();
+        let callback = ssl_context
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: ocsp callback missing");
+
+        let ret = callback(ssl);
+
+        if ssl.is_server() {
+            match ret {
+                Ok(true) => ffi::SSL_TLSEXT_ERR_OK,
+                Ok(false) => ffi::SSL_TLSEXT_ERR_NOACK,
+                Err(e) => {
+                    e.put();
+                    ffi::SSL_TLSEXT_ERR_ALERT_FATAL
+                }
+            }
+        } else {
+            match ret {
+                Ok(true) => 1,
+                Ok(false) => 0,
+                Err(e) => {
+                    e.put();
+                    -1
+                }
+            }
+        }
+    };
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-
-    let ssl_context = ssl.ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: ocsp callback missing");
-
-    let ret = callback(ssl);
-
-    if ssl.is_server() {
-        match ret {
-            Ok(true) => ffi::SSL_TLSEXT_ERR_OK,
-            Ok(false) => ffi::SSL_TLSEXT_ERR_NOACK,
-            Err(e) => {
-                e.put();
-                ffi::SSL_TLSEXT_ERR_ALERT_FATAL
-            }
-        }
+    let failed = if unsafe { SslRef::from_ptr(ssl) }.is_server() {
+        ffi::SSL_TLSEXT_ERR_ALERT_FATAL
     } else {
-        match ret {
-            Ok(true) => 1,
-            Ok(false) => 0,
-            Err(e) => {
-                e.put();
-                -1
-            }
-        }
-    }
+        -1
+    };
+
+    // SAFETY: btls provides valid inputs.
+    unsafe { catch(ssl, failed, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_new_session<F>(
@@ -436,56 +560,66 @@ pub(super) unsafe extern "C" fn raw_new_session<F>(
 where
     F: Fn(&mut SslRef, SslSession) + 'static + Sync + Send,
 {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+        let session = unsafe { SslSession::from_ptr(session) };
+
+        let callback = ssl
+            .ex_data(*SESSION_CTX_INDEX)
+            .expect("BUG: session context missing")
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: new session callback missing");
+
+        // SAFETY: We can make `callback` outlive `ssl` because it is a callback
+        // stored in the session context set in `Ssl::new` so it is always
+        // guaranteed to outlive the lifetime of this function's scope.
+        let callback = unsafe { &*ptr::from_ref::<F>(callback) };
+
+        callback(ssl, session);
+
+        // the return code doesn't indicate error vs success, but whether or not we consumed the session
+        1
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-    let session = unsafe { SslSession::from_ptr(session) };
-
-    let callback = ssl
-        .ex_data(*SESSION_CTX_INDEX)
-        .expect("BUG: session context missing")
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: new session callback missing");
-
-    // SAFETY: We can make `callback` outlive `ssl` because it is a callback
-    // stored in the session context set in `Ssl::new` so it is always
-    // guaranteed to outlive the lifetime of this function's scope.
-    let callback = unsafe { &*ptr::from_ref::<F>(callback) };
-
-    callback(ssl, session);
-
-    // the return code doesn't indicate error vs success, but whether or not we consumed the session
-    1
+    unsafe { catch(ssl, 1, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_client_session(
     ssl: *mut ffi::SSL,
     session: *mut ffi::SSL_SESSION,
 ) -> c_int {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+        let session = unsafe { SslSession::from_ptr(session) };
+
+        // Sessions from connections not created by `ConnectConfiguration::into_ssl` have no recorded
+        // peer and are dropped.
+        let Some(peer) = ssl.ex_data(*SESSION_PEER_INDEX).cloned() else {
+            return 1;
+        };
+        let Some(callback) = ssl
+            .ex_data(*SESSION_CTX_INDEX)
+            .and_then(|context| context.ex_data(*CLIENT_SESSION_INDEX))
+        else {
+            return 1;
+        };
+        let session = ClientSession::new(session, peer, ssl);
+
+        // SAFETY: The callback is stored in the session context set in `Ssl::new`, which outlives
+        // this function's scope.
+        let callback = unsafe { &*std::ptr::from_ref(callback) };
+
+        (callback.callback)(ssl, session);
+
+        // The return value only reports that the session reference was consumed.
+        1
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-    let session = unsafe { SslSession::from_ptr(session) };
-
-    // Sessions from connections not created by `ConnectConfiguration::into_ssl` have no recorded
-    // peer and are dropped.
-    let Some(peer) = ssl.ex_data(*SESSION_PEER_INDEX).cloned() else {
-        return 1;
-    };
-    let Some(callback) = ssl
-        .ex_data(*SESSION_CTX_INDEX)
-        .and_then(|context| context.ex_data(*CLIENT_SESSION_INDEX))
-    else {
-        return 1;
-    };
-    let session = ClientSession::new(session, peer, ssl);
-
-    // SAFETY: The callback is stored in the session context set in `Ssl::new`, which outlives
-    // this function's scope.
-    let callback = unsafe { &*std::ptr::from_ref(callback) };
-
-    (callback.callback)(ssl, session);
-
-    // The return value only reports that the session reference was consumed.
-    1
+    unsafe { catch(ssl, 1, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_remove_session<F>(
@@ -519,49 +653,59 @@ where
         + Sync
         + Send,
 {
-    // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-    let data = unsafe { slice::from_raw_parts(data, len as usize) };
-    let copy = unsafe { &mut *copy };
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+        let data = unsafe { slice::from_raw_parts(data, len as usize) };
+        let copy = unsafe { &mut *copy };
 
-    let callback = ssl
-        .ex_data(*SESSION_CTX_INDEX)
-        .expect("BUG: session context missing")
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: get session callback missing");
+        let callback = ssl
+            .ex_data(*SESSION_CTX_INDEX)
+            .expect("BUG: session context missing")
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: get session callback missing");
 
-    // SAFETY: We can make `callback` outlive `ssl` because it is a callback
-    // stored in the session context set in `Ssl::new` so it is always
-    // guaranteed to outlive the lifetime of this function's scope.
-    let callback = unsafe { &*ptr::from_ref::<F>(callback) };
+        // SAFETY: We can make `callback` outlive `ssl` because it is a callback
+        // stored in the session context set in `Ssl::new` so it is always
+        // guaranteed to outlive the lifetime of this function's scope.
+        let callback = unsafe { &*ptr::from_ref::<F>(callback) };
 
-    match callback(ssl, data) {
-        Ok(Some(session)) => {
-            let p = session.into_ptr();
+        match callback(ssl, data) {
+            Ok(Some(session)) => {
+                let p = session.into_ptr();
 
-            *copy = 0;
+                *copy = 0;
 
-            p
+                p
+            }
+            Ok(None) => ptr::null_mut(),
+            Err(GetSessionPendingError) => unsafe { ffi::SSL_magic_pending_session_ptr() },
         }
-        Ok(None) => ptr::null_mut(),
-        Err(GetSessionPendingError) => unsafe { ffi::SSL_magic_pending_session_ptr() },
-    }
+    };
+
+    // SAFETY: btls provides valid inputs.
+    unsafe { catch(ssl, ptr::null_mut(), body) }
 }
 
 pub(super) unsafe extern "C" fn raw_keylog<F>(ssl: *const ffi::SSL, line: *const c_char)
 where
     F: Fn(&SslRef, &str) + 'static + Sync + Send,
 {
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr(ssl.cast_mut()) };
+        let line = unsafe { CStr::from_ptr(line).to_string_lossy() };
+
+        let callback = ssl
+            .ssl_context()
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: get session callback missing");
+
+        callback(ssl, &line);
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr(ssl.cast_mut()) };
-    let line = unsafe { CStr::from_ptr(line).to_string_lossy() };
-
-    let callback = ssl
-        .ssl_context()
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: get session callback missing");
-
-    callback(ssl, &line);
+    unsafe { catch(ssl.cast_mut(), (), body) }
 }
 
 pub(super) unsafe extern "C" fn raw_sign<M>(
@@ -632,26 +776,32 @@ unsafe fn raw_private_key_callback<M>(
 where
     M: PrivateKeyMethod,
 {
-    // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-    let output = unsafe { slice::from_raw_parts_mut(out, max_out) };
-    let out_len = unsafe { &mut *out_len };
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+        let output = unsafe { slice::from_raw_parts_mut(out, max_out) };
+        let out_len = unsafe { &mut *out_len };
 
-    let ssl_context = ssl.ssl_context().to_owned();
-    let method = ssl_context
-        .ex_data(SslContext::cached_ex_index::<M>())
-        .expect("BUG: private key method missing");
+        let ssl_context = ssl.ssl_context().to_owned();
+        let method = ssl_context
+            .ex_data(SslContext::cached_ex_index::<M>())
+            .expect("BUG: private key method missing");
 
-    match callback(method, ssl, output) {
-        Ok(written) => {
-            assert!(written <= max_out);
+        match callback(method, ssl, output) {
+            Ok(written) => {
+                assert!(written <= max_out);
 
-            *out_len = written;
+                *out_len = written;
 
-            ffi::ssl_private_key_result_t::ssl_private_key_success
+                ffi::ssl_private_key_result_t::ssl_private_key_success
+            }
+            Err(err) => err.0,
         }
-        Err(err) => err.0,
-    }
+    };
+    let failed = ffi::ssl_private_key_result_t::ssl_private_key_failure;
+
+    // SAFETY: btls provides valid inputs.
+    unsafe { catch(ssl, failed, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_info_callback<F>(
@@ -661,26 +811,31 @@ pub(super) unsafe extern "C" fn raw_info_callback<F>(
 ) where
     F: Fn(&SslRef, SslInfoCallbackMode, SslInfoCallbackValue) + Send + Sync + 'static,
 {
-    // Due to FFI signature requirements we have to pass a *const SSL into this function, but
-    // foreign-types requires a *mut SSL to get the Rust SslRef
-    let mut_ref = ssl.cast_mut();
+    let body = || {
+        // Due to FFI signature requirements we have to pass a *const SSL into this function, but
+        // foreign-types requires a *mut SSL to get the Rust SslRef
+        let mut_ref = ssl.cast_mut();
 
-    // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr(mut_ref) };
-    let ssl_context = ssl.ssl_context();
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr(mut_ref) };
+        let ssl_context = ssl.ssl_context();
 
-    let callback = ssl_context
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: info callback missing");
+        let callback = ssl_context
+            .ex_data(SslContext::cached_ex_index::<F>())
+            .expect("BUG: info callback missing");
 
-    let value = match mode {
-        ffi::SSL_CB_READ_ALERT | ffi::SSL_CB_WRITE_ALERT => {
-            SslInfoCallbackValue::Alert(SslInfoCallbackAlert(value))
-        }
-        _ => SslInfoCallbackValue::Unit,
+        let value = match mode {
+            ffi::SSL_CB_READ_ALERT | ffi::SSL_CB_WRITE_ALERT => {
+                SslInfoCallbackValue::Alert(SslInfoCallbackAlert(value))
+            }
+            _ => SslInfoCallbackValue::Unit,
+        };
+
+        callback(ssl, SslInfoCallbackMode(mode), value);
     };
 
-    callback(ssl, SslInfoCallbackMode(mode), value);
+    // SAFETY: btls provides valid inputs.
+    unsafe { catch(ssl.cast_mut(), (), body) }
 }
 
 pub(super) unsafe extern "C" fn raw_ssl_cert_compress<C>(
@@ -696,21 +851,26 @@ where
         assert!(C::CAN_COMPRESS);
     }
 
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+
+        let ssl_context = ssl.ssl_context();
+        let compressor = ssl_context
+            .ex_data(SslContext::cached_ex_index::<C>())
+            .expect("BUG: certificate compression missed");
+
+        let input_slice = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut writer = CryptoByteBuilder::from_ptr(out);
+        if compressor.compress(input_slice, &mut writer).is_err() {
+            return 0;
+        }
+
+        1
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-
-    let ssl_context = ssl.ssl_context();
-    let compressor = ssl_context
-        .ex_data(SslContext::cached_ex_index::<C>())
-        .expect("BUG: certificate compression missed");
-
-    let input_slice = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut writer = CryptoByteBuilder::from_ptr(out);
-    if compressor.compress(input_slice, &mut writer).is_err() {
-        return 0;
-    }
-
-    1
+    unsafe { catch(ssl, 0, body) }
 }
 
 pub(super) unsafe extern "C" fn raw_ssl_cert_decompress<C>(
@@ -727,33 +887,39 @@ where
         assert!(C::CAN_DECOMPRESS);
     }
 
+    let body = || {
+        // SAFETY: btls provides valid inputs.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+
+        let ssl_context = ssl.ssl_context();
+        let compressor = ssl_context
+            .ex_data(SslContext::cached_ex_index::<C>())
+            .expect("BUG: certificate compression missed");
+
+        let Ok(mut decompression_buffer) = CryptoBufferBuilder::with_capacity(uncompressed_len)
+        else {
+            return 0;
+        };
+
+        let input_slice = unsafe { slice::from_raw_parts(input, input_len) };
+
+        if compressor
+            .decompress(input_slice, decompression_buffer.as_writer())
+            .is_err()
+        {
+            return 0;
+        }
+
+        let Ok(crypto_buffer) = decompression_buffer.build() else {
+            return 0;
+        };
+
+        unsafe { *out = crypto_buffer };
+        1
+    };
+
     // SAFETY: btls provides valid inputs.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-
-    let ssl_context = ssl.ssl_context();
-    let compressor = ssl_context
-        .ex_data(SslContext::cached_ex_index::<C>())
-        .expect("BUG: certificate compression missed");
-
-    let Ok(mut decompression_buffer) = CryptoBufferBuilder::with_capacity(uncompressed_len) else {
-        return 0;
-    };
-
-    let input_slice = unsafe { slice::from_raw_parts(input, input_len) };
-
-    if compressor
-        .decompress(input_slice, decompression_buffer.as_writer())
-        .is_err()
-    {
-        return 0;
-    }
-
-    let Ok(crypto_buffer) = decompression_buffer.build() else {
-        return 0;
-    };
-
-    unsafe { *out = crypto_buffer };
-    1
+    unsafe { catch(ssl, 0, body) }
 }
 
 struct CryptoByteBuilder<'a>(*mut ffi::CBB, std::marker::PhantomData<&'a [u8]>);

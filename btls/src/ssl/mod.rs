@@ -4290,6 +4290,22 @@ impl SslRef {
         }
     }
 
+    /// Returns the signed certificate timestamps the server sent in its TLS extension, if any:
+    /// a `SignedCertificateTimestampList`
+    /// ([RFC 6962 §3.3](https://www.rfc-editor.org/rfc/rfc6962#section-3.3)).
+    ///
+    /// A client asks for them with [`SslContextBuilder::enable_signed_cert_timestamps`].
+    #[corresponds(SSL_get0_signed_cert_timestamp_list)]
+    #[must_use]
+    pub fn signed_cert_timestamp_list(&self) -> Option<&[u8]> {
+        let (mut list, mut len) = (ptr::null(), 0);
+        // SAFETY: `self` is a live `SSL`, and its session owns the list while it is borrowed.
+        unsafe {
+            ffi::SSL_get0_signed_cert_timestamp_list(self.as_ptr(), &mut list, &mut len);
+            (len != 0).then(|| slice::from_raw_parts(list, len))
+        }
+    }
+
     /// Returns the server's OCSP response, if present.
     #[corresponds(SSL_get_tlsext_status_ocsp_resp)]
     #[must_use]
@@ -4552,6 +4568,10 @@ impl SslRef {
             };
             if res == R::ssl_open_app_data_partial {
                 return Ok(Opened::Partial { needed: consumed });
+            }
+            // Only a record without application data runs callbacks.
+            if res != R::ssl_open_app_data_success || out_len == 0 {
+                self.resume_callback_panic();
             }
             if consumed > buf.len() {
                 return Err(ErrorStack::internal_error_str(
@@ -5152,6 +5172,7 @@ impl<S> MidHandshakeSslStream<S> {
     pub fn handshake(mut self) -> Result<SslStream<S>, HandshakeError<S>> {
         let ret = unsafe { ffi::SSL_do_handshake(self.stream.ssl.as_ptr()) };
         if ret > 0 {
+            self.stream.check_panic();
             Ok(self.stream)
         } else {
             self.error = self.stream.make_error(ret);
@@ -5288,6 +5309,7 @@ impl<S: Read + Write> SslStream<S> {
         let len = usize::min(c_int::MAX as usize, buf.len()) as c_int;
         let ret = unsafe { ffi::SSL_read(self.ssl().as_ptr(), buf.as_mut_ptr().cast(), len) };
         if ret > 0 {
+            self.check_panic();
             Ok(ret as usize)
         } else {
             Err(self.make_error(ret))
@@ -5307,6 +5329,7 @@ impl<S: Read + Write> SslStream<S> {
         let len = usize::min(c_int::MAX as usize, buf.len()) as c_int;
         let ret = unsafe { ffi::SSL_write(self.ssl().as_ptr(), buf.as_ptr().cast(), len) };
         if ret > 0 {
+            self.check_panic();
             Ok(ret as usize)
         } else {
             Err(self.make_error(ret))
@@ -5324,7 +5347,9 @@ impl<S: Read + Write> SslStream<S> {
     /// further communication in the future.
     #[corresponds(SSL_shutdown)]
     pub fn shutdown(&mut self) -> Result<ShutdownResult, Error> {
-        match unsafe { ffi::SSL_shutdown(self.ssl.as_ptr()) } {
+        let ret = unsafe { ffi::SSL_shutdown(self.ssl.as_ptr()) };
+        self.check_panic();
+        match ret {
             0 => Ok(ShutdownResult::Sent),
             1 => Ok(ShutdownResult::Received),
             n => Err(self.make_error(n)),
@@ -5354,6 +5379,7 @@ impl<S: Read + Write> SslStream<S> {
     pub fn connect(&mut self) -> Result<(), Error> {
         let ret = unsafe { ffi::SSL_connect(self.ssl.as_ptr()) };
         if ret > 0 {
+            self.check_panic();
             Ok(())
         } else {
             Err(self.make_error(ret))
@@ -5365,6 +5391,7 @@ impl<S: Read + Write> SslStream<S> {
     pub fn accept(&mut self) -> Result<(), Error> {
         let ret = unsafe { ffi::SSL_accept(self.ssl.as_ptr()) };
         if ret > 0 {
+            self.check_panic();
             Ok(())
         } else {
             Err(self.make_error(ret))
@@ -5376,6 +5403,7 @@ impl<S: Read + Write> SslStream<S> {
     pub fn do_handshake(&mut self) -> Result<(), Error> {
         let ret = unsafe { ffi::SSL_do_handshake(self.ssl.as_ptr()) };
         if ret > 0 {
+            self.check_panic();
             Ok(())
         } else {
             Err(self.make_error(ret))
@@ -5409,10 +5437,12 @@ impl<S> SslStream<S> {
         Error { code, cause }
     }
 
+    /// Resumes a panic caught in the stream or in a callback while BoringSSL ran.
     fn check_panic(&mut self) {
         if let Some(err) = self.state_mut().panic.take() {
             resume_unwind(err)
         }
+        self.ssl.resume_callback_panic();
     }
 
     fn get_bio_error(&mut self) -> Option<io::Error> {
@@ -5588,6 +5618,7 @@ where
         let mut stream = self.inner;
         let ret = unsafe { ffi::SSL_do_handshake(stream.ssl.as_ptr()) };
         if ret > 0 {
+            stream.check_panic();
             Ok(stream)
         } else {
             let error = stream.make_error(ret);
