@@ -5028,7 +5028,8 @@ pub enum Opened {
         consumed: usize,
         plaintext: Range<usize>,
     },
-    /// `buf` holds no complete record; the next one needs `needed` bytes.
+    /// `buf` holds no complete record. `needed` is the length it must reach before the next
+    /// attempt: a record header's while the header is incomplete, then the whole record's.
     Partial { needed: usize },
     /// Drop the first `consumed` bytes of `buf` and read through [`SslStream::ssl_read`].
     Declined { consumed: usize },

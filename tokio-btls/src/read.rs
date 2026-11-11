@@ -11,8 +11,8 @@ use crate::{bio::StreamWrapper, transport::Transport};
 /// Capacity of the ciphertext read buffer, enough for a record header plus the largest
 /// ciphertext BoringSSL accepts (`SSL3_RT_MAX_ENCRYPTED_LENGTH`).
 ///
-/// BoringSSL may request record headers and bodies in separate BIO reads. Buffering lets these
-/// reads share data from one underlying read. Larger bursts may require multiple refills.
+/// Records are opened in place here, so one must fit whole. Reads through the BIO, which ask for
+/// headers and bodies separately, share one underlying read. Larger bursts take several refills.
 const READ_BUF_CAPACITY: usize = 17 * 1024;
 
 thread_local! {
@@ -45,7 +45,7 @@ pub(crate) struct ReadBuffer {
 pub(crate) enum Open {
     /// A record was opened; its plaintext, if any, waits in the buffer.
     Record,
-    /// No complete record is buffered; the next one needs this many bytes.
+    /// No complete record is buffered; opening one needs the buffer to reach this length.
     Partial(usize),
     /// BoringSSL declined; read through `SSL_read`.
     Declined,

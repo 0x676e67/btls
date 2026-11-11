@@ -27,19 +27,19 @@ The bssl_shim flag -open-app-data reads through it. A filter BIO holds
 the input the shim pulled ahead of BoringSSL, so SSL_read continues
 where opening stops, and the runner suite passes with the flag.
 ---
- include/openssl/ssl.h   |  37 ++++
+ include/openssl/ssl.h   |  38 ++++
  ssl/ssl_lib.cc          |  73 ++++++++
  ssl/ssl_test.cc         | 448 ++++++++++++++++++++++++++++++++++++++++++++++++
  ssl/test/bssl_shim.cc   | 202 ++++++++++++++++++++++
  ssl/test/test_config.cc |   1 +
  ssl/test/test_config.h  |   1 +
- 6 files changed, 762 insertions(+)
+ 6 files changed, 763 insertions(+)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 index 6f5d90f..2140c9b 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -392,6 +392,43 @@ OPENSSL_EXPORT enum ssl_seal_app_data_result_t SSL_seal_app_data(
+@@ -392,6 +392,44 @@ OPENSSL_EXPORT enum ssl_seal_app_data_result_t SSL_seal_app_data(
      SSL *ssl, uint8_t *out, size_t *out_len, size_t max_out,
      const CRYPTO_IVEC *in, size_t num_in, size_t max_in, size_t *out_consumed);
  
@@ -61,8 +61,9 @@ index 6f5d90f..2140c9b 100644
 +  // application data, such as a post-handshake message, which has been
 +  // processed.
 +  ssl_open_app_data_success,
-+  // ssl_open_app_data_partial means `in` holds no complete record, and
-+  // `*out_consumed` is the length the next record needs.
++  // ssl_open_app_data_partial means `in` holds no complete record.
++  // `*out_consumed` is the length it must reach before the next attempt: a
++  // record header's while the header is incomplete, then the whole record's.
 +  ssl_open_app_data_partial,
 +  // ssl_open_app_data_declined means the caller must read with `SSL_read`
 +  // after dropping the first `*out_consumed` bytes of `in`. It is zero, and
