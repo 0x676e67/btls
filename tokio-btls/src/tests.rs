@@ -15,7 +15,9 @@ use btls::ssl::{
     SslRef, SslSessionCacheMode, SslVersion,
 };
 use foreign_types::ForeignTypeRef;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+};
 
 use crate::{
     write::{self, MAX_RECORD, RECORD_OVERHEAD, SEAL_STACK_LEN, WRITE_BUF_CAPACITY},
@@ -913,4 +915,49 @@ async fn early_data_budget_keeps_full_records() {
     let mut received = vec![0; early.len() - 2000 + data.len()];
     server.read_exact(&mut received).await.unwrap();
     assert_eq!(received, [&early[2000..], &data].concat());
+}
+
+#[tokio::test]
+async fn fill_buf_lends_one_record_at_a_time() {
+    let (mut client, mut server) = tls_pair_with(SslVersion::TLS1_3, None).await;
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut send = async |record: &[u8]| {
+        server.write_all(record).await.unwrap();
+        server.flush().await.unwrap();
+    };
+
+    // The tickets ahead of the first record lend nothing, and a partial `consume` keeps the
+    // rest of a record.
+    send(b"one\ntw").await;
+    assert_eq!(client.fill_buf().await.unwrap(), b"one\ntw");
+    client.consume(4);
+    assert_eq!(client.fill_buf().await.unwrap(), b"tw");
+
+    // A plain read takes what was lent first, so a line crosses records.
+    send(b"o\n").await;
+    let mut line = String::new();
+    client.read_line(&mut line).await.unwrap();
+    assert_eq!(line, "two\n");
+
+    // A record BoringSSL holds goes through `SSL_read`. Its plaintext takes the room of its
+    // ciphertext ahead of the next record, which is then opened in place.
+    send(b"held").await;
+    send(b"next").await;
+    let read = client.with_context(&mut cx, |s| s.ssl_read(&mut [0; 1]));
+    assert_eq!(read.unwrap(), 1);
+    assert_eq!(client.fill_buf().await.unwrap(), b"eld");
+    client.consume(3);
+    assert_eq!(client.fill_buf().await.unwrap(), b"next");
+    client.consume(4);
+
+    // The same with nothing else buffered, where the room was released with the buffer.
+    send(b"last").await;
+    let read = client.with_context(&mut cx, |s| s.ssl_read(&mut [0; 1]));
+    assert_eq!(read.unwrap(), 1);
+    assert_eq!(client.fill_buf().await.unwrap(), b"ast");
+    client.consume(3);
+
+    // The end lends nothing.
+    server.shutdown().await.unwrap();
+    assert!(client.fill_buf().await.unwrap().is_empty());
 }

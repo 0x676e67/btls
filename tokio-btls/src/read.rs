@@ -1,12 +1,19 @@
-use std::{cell::Cell, io, mem, ops::Range, task::Poll};
+use std::{
+    cell::Cell,
+    io, iter,
+    mem::{self, MaybeUninit},
+    ops::Range,
+    slice,
+    task::{ready, Poll},
+};
 
 use btls::{
     error::ErrorStack,
     ssl::{Opened, SslRef, SslStream as SslStreamCore},
 };
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{bio::StreamWrapper, transport::Transport};
+use crate::{bio::StreamWrapper, error::cvt, transport::Transport, write::MAX_RECORD};
 
 /// Capacity of the ciphertext read buffer, enough for a record header plus the largest
 /// ciphertext BoringSSL accepts (`SSL3_RT_MAX_ENCRYPTED_LENGTH`).
@@ -49,6 +56,17 @@ pub(crate) enum Open {
     Partial(usize),
     /// BoringSSL declined; read through `SSL_read`.
     Declined,
+}
+
+/// Outcome of one [`step`] towards the next record's plaintext.
+enum Step {
+    /// A record was opened, or more of one was read from the transport.
+    Progress,
+    /// The read must go through `SSL_read`.
+    Declined,
+    /// The transport has no more input for now.
+    Pending,
+    Failed(io::Error),
 }
 
 impl ReadBuffer {
@@ -142,6 +160,36 @@ impl ReadBuffer {
         buf.put_slice(&self.bytes[self.plain.start..self.plain.start + n]);
         self.plain.start += n;
         self.has_plain()
+    }
+
+    /// The plaintext waiting for delivery.
+    #[inline]
+    pub(crate) fn plain(&self) -> &[u8] {
+        &self.bytes[self.plain.clone()]
+    }
+
+    /// Marks up to `amt` bytes of the waiting plaintext as delivered.
+    #[inline]
+    pub(crate) fn consume_plain(&mut self, amt: usize) {
+        self.plain.start += amt.min(self.plain.len());
+        self.release_drained();
+    }
+
+    /// Keeps plaintext read through `SSL_read` for delivery, ahead of the unread ciphertext,
+    /// where the ciphertext BoringSSL consumed for it leaves room.
+    fn store_plain(&mut self, plain: &[u8]) {
+        debug_assert!(!self.has_plain(), "storing over undelivered plaintext");
+        if self.pos < plain.len() {
+            // Its record came from an earlier refill, or the buffer was released since.
+            if self.bytes.capacity() == 0 {
+                self.bytes = SPARE.try_with(Cell::take).unwrap_or_default();
+            }
+            let short = plain.len() - self.pos;
+            self.bytes.splice(..0, iter::repeat_n(0, short));
+            self.pos += short;
+        }
+        self.plain = self.pos - plain.len()..self.pos;
+        self.bytes[self.plain.clone()].copy_from_slice(plain);
     }
 
     /// Opens the next buffered record in place once its plaintext is delivered.
@@ -258,30 +306,17 @@ where
         if buf.filled().len() > start && read_buf.is_empty() {
             break;
         }
-        let needed = match read_buf.open(s.ssl_mut()) {
-            Ok(Open::Record) => continue,
-            Ok(Open::Partial(needed)) => needed,
-            Ok(Open::Declined) => {
+        match step(&mut read_buf, s) {
+            Step::Progress => {}
+            Step::Declined => {
                 declined = true;
                 break;
             }
-            Err(err) => {
-                end = Some(Err(io::Error::other(err)));
-                break;
-            }
-        };
-        match read_buf.fill_partial(&mut s.get_mut().transport, needed) {
-            Ok(0) => {
-                // `SSL_read` reports the end, or the truncated record before it.
-                declined = true;
-                break;
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            Step::Pending => {
                 pending = true;
                 break;
             }
-            Err(err) => {
+            Step::Failed(err) => {
                 end = Some(Err(err));
                 break;
             }
@@ -299,6 +334,74 @@ where
     }
     debug_assert!(pending || end.is_some(), "an empty read must wait or end");
     Some(end.map_or(Poll::Pending, Poll::Ready))
+}
+
+/// Makes plaintext wait in the read buffer for `poll_fill_buf` to lend out; none waits at the
+/// end of the stream.
+pub(crate) fn fill_plain<S>(s: &mut SslStreamCore<StreamWrapper<S>>) -> Poll<io::Result<()>>
+where
+    S: AsyncRead + AsyncWrite,
+{
+    let wrapper = s.get_mut();
+    if wrapper.read_buf.has_plain() {
+        return Poll::Ready(Ok(()));
+    }
+    if let Some(end) = wrapper.read_end.take() {
+        return Poll::Ready(end);
+    }
+    // The buffer lives behind the BIO; move it out while the `SslRef` is borrowed mutably.
+    let mut read_buf = mem::take(&mut wrapper.read_buf);
+    let step = loop {
+        match step(&mut read_buf, s) {
+            // A record without application data leaves nothing to lend.
+            Step::Progress if !read_buf.has_plain() => {}
+            step => break step,
+        }
+    };
+    read_buf.release_drained();
+    s.get_mut().read_buf = read_buf;
+    match step {
+        Step::Progress => Poll::Ready(Ok(())),
+        Step::Declined => read_plain(s),
+        Step::Pending => Poll::Pending,
+        Step::Failed(err) => Poll::Ready(Err(err)),
+    }
+}
+
+/// Opens the next buffered record in place, or reads more of it from the transport.
+#[inline]
+fn step<S>(read_buf: &mut ReadBuffer, s: &mut SslStreamCore<StreamWrapper<S>>) -> Step
+where
+    S: AsyncRead,
+{
+    let needed = match read_buf.open(s.ssl_mut()) {
+        Ok(Open::Record) => return Step::Progress,
+        Ok(Open::Partial(needed)) => needed,
+        Ok(Open::Declined) => return Step::Declined,
+        Err(err) => return Step::Failed(io::Error::other(err)),
+    };
+    match read_buf.fill_partial(&mut s.get_mut().transport, needed) {
+        // `SSL_read` reports the end, or the truncated record before it.
+        Ok(0) => Step::Declined,
+        Ok(_) => Step::Progress,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Step::Pending,
+        Err(err) => Step::Failed(err),
+    }
+}
+
+/// Reads one record through `SSL_read`, which handles what `open` declines, and keeps its
+/// plaintext in the read buffer.
+#[inline(never)] // keep the 16 KiB frame out of `fill_plain`
+fn read_plain<S>(s: &mut SslStreamCore<StreamWrapper<S>>) -> Poll<io::Result<()>>
+where
+    S: AsyncRead + AsyncWrite,
+{
+    let mut plain = [MaybeUninit::<u8>::uninit(); MAX_RECORD];
+    let n = ready!(cvt(s.read_uninit(&mut plain)))?;
+    // SAFETY: `read_uninit` initialized the first `n` bytes of `plain`.
+    let plain = unsafe { slice::from_raw_parts(plain.as_ptr().cast::<u8>(), n) };
+    s.get_mut().read_buf.store_plain(plain);
+    Poll::Ready(Ok(()))
 }
 
 #[cfg(test)]
