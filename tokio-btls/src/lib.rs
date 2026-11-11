@@ -49,7 +49,7 @@ use btls::{
     },
     x509::X509VerifyError,
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     bio::StreamWrapper,
@@ -117,6 +117,9 @@ mod sealed {
 ///
 /// Writes may stay buffered after they complete; call `flush` or `shutdown` before waiting on a
 /// reply or dropping the stream.
+///
+/// As an [`AsyncBufRead`], it lends out the plaintext of one record at a time, without copying
+/// it where BoringSSL opened the record in place.
 ///
 /// The stream is `Unpin` whatever its transport is: the transport stays in an allocation of its
 /// own until the stream is dropped.
@@ -387,6 +390,21 @@ where
             s.get_mut().read_end = end;
             Poll::Ready(Ok(()))
         })
+    }
+}
+
+impl<S> AsyncBufRead for SslStream<S>
+where
+    S: AsyncRead + AsyncWrite,
+{
+    fn poll_fill_buf(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let this = self.get_mut();
+        ready!(this.with_context(ctx, read::fill_plain))?;
+        Poll::Ready(Ok(this.0.get_ref().read_buf.plain()))
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        self.get_mut().0.get_mut().read_buf.consume_plain(amt);
     }
 }
 
