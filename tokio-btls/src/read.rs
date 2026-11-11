@@ -218,13 +218,19 @@ impl ReadBuffer {
         self.bytes.reserve_exact(capacity.saturating_sub(len));
 
         let mut buf = ReadBuf::uninit(self.bytes.spare_capacity_mut());
+        let spare = buf.filled().as_ptr();
         let read = match stream.poll_read(cx, &mut buf) {
+            // A stream may assign `buf` another buffer, whose filled length says nothing here.
+            Poll::Ready(Ok(())) if buf.filled().as_ptr() != spare => {
+                Err(io::Error::other("the stream replaced its read buffer"))
+            }
             Poll::Ready(Ok(())) => Ok(buf.filled().len()),
             Poll::Ready(Err(err)) => Err(err),
             Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
         };
         if let Ok(filled) = read {
-            // SAFETY: `ReadBuf` guarantees its first `filled` bytes are initialized.
+            // SAFETY: `buf` still covers the spare capacity, and `ReadBuf` guarantees its first
+            // `filled` bytes are initialized.
             unsafe { self.bytes.set_len(len + filled) };
         }
         if self.bytes.is_empty() {
@@ -345,5 +351,32 @@ mod tests {
         other.transport.set_noop_context();
         assert_eq!(other.read(&mut buf).unwrap(), 60);
         assert_eq!(other.read_buf.bytes.as_ptr(), allocation);
+    }
+
+    /// Fills a buffer of its own and leaves it in place of the caller's.
+    struct Swap;
+
+    impl AsyncRead for Swap {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let mut own = ReadBuf::new(Box::leak(Box::new([0; 8])));
+            own.put_slice(&[1; 8]);
+            *buf = own;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn replaced_read_buf_is_rejected() {
+        let mut wrapper = StreamWrapper::new(Swap);
+        wrapper.transport.set_noop_context();
+
+        // The foreign buffer's length must not be taken for bytes read into this one.
+        let err = wrapper.read(&mut [0; 8]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(wrapper.read_buf.is_empty());
     }
 }
