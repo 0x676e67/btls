@@ -889,7 +889,7 @@ async fn early_data_budget_keeps_full_records() {
     let mut cx = Context::from_waker(Waker::noop());
     let res = Pin::new(&mut client).poll_connect(&mut cx);
     assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
-    let early = vec![1; 14000];
+    let early: Vec<u8> = (0..14000).map(|i| i as u8).collect();
     client.write_all(&early).await.unwrap();
     client.flush().await.unwrap();
 
@@ -899,11 +899,11 @@ async fn early_data_budget_keeps_full_records() {
     assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
     // Early data read in pieces stays in BoringSSL once the read buffer is drained.
     let mut piece = [0; 1000];
-    for _ in 0..2 {
+    for part in early[..2000].chunks(1000) {
         let mut read = ReadBuf::new(&mut piece);
         let res = Pin::new(&mut server).poll_read(&mut cx, &mut read);
         assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
-        assert_eq!(read.filled(), &early[..1000]);
+        assert_eq!(read.filled(), part);
     }
     client.get_mut().tap.clear();
     let data: Vec<u8> = (0..2 * MAX_RECORD).map(|i| i as u8).collect();
