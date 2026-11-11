@@ -5,6 +5,7 @@ use std::{ptr, slice};
 use foreign_types::ForeignTypeRef;
 use openssl_macros::corresponds;
 
+use super::callbacks::catch;
 use super::{ExtensionType, Ssl, SslContext, SslContextBuilder, SslRef};
 use crate::error::ErrorStack;
 use crate::rand::rand_bytes;
@@ -340,33 +341,37 @@ where
     // while it runs, so the closure cannot be replaced from inside, and the
     // shared SSL setters still callable do not affect the extension being built.
     let info = unsafe { &*info };
-    let ssl = unsafe { SslRef::from_ptr(info.ssl.cast_mut()) };
-    let callback = if CONTEXT {
-        ssl.ssl_context()
-            .ex_data(SslContext::cached_ex_index::<Option<Callback<F>>>())
-    } else {
-        ssl.ex_data(Ssl::cached_ex_index::<Option<Callback<F>>>())
-    };
-    let Some(Some(callback)) = callback else {
-        return 0;
-    };
-    // Like the other SSL callbacks, a panic aborts at this extern "C" boundary.
-    match (callback.0)(ssl, EchGreaseSizeInfo(info)) {
-        Ok(parameters) => {
-            unsafe {
-                *out = ffi::SSL_ECH_GREASE_PARAMETERS {
-                    aead_id: parameters.aead.0,
-                    payload_length: usize::from(parameters.payload_length.get()),
-                    random_enc: libc::c_int::from(parameters.random_enc),
-                }
-            };
-            1
+    let body = || {
+        let ssl = unsafe { SslRef::from_ptr(info.ssl.cast_mut()) };
+        let callback = if CONTEXT {
+            ssl.ssl_context()
+                .ex_data(SslContext::cached_ex_index::<Option<Callback<F>>>())
+        } else {
+            ssl.ex_data(Ssl::cached_ex_index::<Option<Callback<F>>>())
+        };
+        let Some(Some(callback)) = callback else {
+            return 0;
+        };
+        match (callback.0)(ssl, EchGreaseSizeInfo(info)) {
+            Ok(parameters) => {
+                unsafe {
+                    *out = ffi::SSL_ECH_GREASE_PARAMETERS {
+                        aead_id: parameters.aead.0,
+                        payload_length: usize::from(parameters.payload_length.get()),
+                        random_enc: libc::c_int::from(parameters.random_enc),
+                    }
+                };
+                1
+            }
+            Err(error) => {
+                error.put();
+                0
+            }
         }
-        Err(error) => {
-            error.put();
-            0
-        }
-    }
+    };
+
+    // SAFETY: BoringSSL passes the `SSL` the callback runs for.
+    unsafe { catch(info.ssl.cast_mut(), 0, body) }
 }
 
 impl SslContextBuilder {
@@ -377,8 +382,8 @@ impl SslContextBuilder {
     /// Does not enable [`GREASE`](SslRef::set_enable_ech_grease) or change real
     /// ECH or TLS cipher preferences. An installed policy decides every GREASE ClientHello: it
     /// can neither skip one nor defer to BoringSSL's random draw. Errors or
-    /// oversized output fail the handshake; panics abort, as with other SSL
-    /// callbacks.
+    /// oversized output fail the handshake; so does a panic, which resumes in
+    /// the call driving the handshake, as with other SSL callbacks.
     /// See [`EchGreaseSizeInfo::max_payload_length`] for sizing limits. Arbitrary
     /// lengths need not follow [RFC 9849]'s recommended distribution;
     /// [`EchGreaseSizeInfo::boringssl_parameters`] reproduces BoringSSL's draw and

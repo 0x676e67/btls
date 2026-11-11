@@ -7,6 +7,7 @@
 //! Handshake input, role selection and driving methods require an owned [`Ssl`]. Callbacks
 //! only receive [`SslRef`], so they cannot reenter the handshake or invalidate its input.
 
+use super::callbacks::catch;
 use super::{ErrorCode, Ssl, SslAlert, SslCipherRef, SslContext, SslContextBuilder, SslRef};
 use crate::error::ErrorStack;
 use crate::{cvt, ffi};
@@ -163,6 +164,7 @@ impl Ssl {
     #[corresponds(SSL_do_handshake)]
     pub fn do_handshake(&mut self) -> Result<(), ErrorCode> {
         let ret = unsafe { ffi::SSL_do_handshake(self.as_ptr()) };
+        self.resume_callback_panic();
         if ret == 1 {
             Ok(())
         } else {
@@ -215,6 +217,7 @@ impl Ssl {
     #[corresponds(SSL_process_quic_post_handshake)]
     pub fn process_quic_post_handshake(&mut self) -> Result<(), ErrorCode> {
         let ret = unsafe { ffi::SSL_process_quic_post_handshake(self.as_ptr()) };
+        self.resume_callback_panic();
         if ret == 1 {
             Ok(())
         } else {
@@ -309,13 +312,18 @@ fn with_method<M: QuicMethod>(
     ssl: *mut ffi::SSL,
     f: impl FnOnce(&M, &mut SslRef) -> Result<(), QuicMethodError>,
 ) -> c_int {
-    // SAFETY: BoringSSL passes the callbacks the `SSL` they run for.
-    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-    let ssl_context = ssl.ssl_context().to_owned();
-    let Some(method) = ssl_context.ex_data(SslContext::cached_ex_index::<M>()) else {
-        return 0;
+    let body = || {
+        // SAFETY: BoringSSL passes the callbacks the `SSL` they run for.
+        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+        let ssl_context = ssl.ssl_context().to_owned();
+        let Some(method) = ssl_context.ex_data(SslContext::cached_ex_index::<M>()) else {
+            return 0;
+        };
+        f(method, ssl).is_ok().into()
     };
-    f(method, ssl).is_ok().into()
+
+    // SAFETY: BoringSSL passes the callbacks the `SSL` they run for.
+    unsafe { catch(ssl, 0, body) }
 }
 
 /// Pushes `SSL_R_QUIC_INTERNAL_ERROR` for a failed secret callback. BoringSSL does so for the
