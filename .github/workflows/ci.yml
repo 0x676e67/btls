@@ -438,6 +438,7 @@ jobs:
           0011-boringssl-seal-app-data.patch \
           0012-boringssl-cheap-error-reset.patch \
           0013-ech-grease-payload-policy.patch \
+          0014-boringssl-open-app-data.patch \
           boringssl-rand-double-free.patch \
           boringssl-loongarch.patch \
           underscore-wildcards.patch \
@@ -467,6 +468,9 @@ jobs:
       run: >-
         go test -shim-extra-flags=-seal-app-data
         -test='Basic-*;TLS-*;*KeyUpdate*;*CBCRecordSplitting*;*MaxSendFragment*;Renegotiate-*;*Shutdown*;*EarlyData*;*FalseStart*;*Alert*'
+    - name: Run BoringSSL SSL runner tests through SSL_open_app_data
+      working-directory: btls-sys/deps/boringssl/ssl/test/runner
+      run: go test -shim-extra-flags=-open-app-data
 
   cross-build:
     name: Cross build from macOS to Linux
