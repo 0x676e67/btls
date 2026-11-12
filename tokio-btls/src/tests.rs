@@ -205,10 +205,7 @@ async fn tls_pair_from(
     }
     let mut client = SslStream::new(ssl, Gate::new(client_io)).unwrap();
 
-    let (connected, accepted) = tokio::join!(
-        Pin::new(&mut client).connect(),
-        Pin::new(&mut server).accept()
-    );
+    let (connected, accepted) = tokio::join!(client.connect(), server.accept());
     connected.unwrap();
     accepted.unwrap();
     client.get_mut().polls = 0;
@@ -901,7 +898,7 @@ fn handshake_reports_not_connected() {
         .unwrap();
     let mut client = SslStream::new(ssl, Unconnected).unwrap();
     let mut cx = Context::from_waker(Waker::noop());
-    match Pin::new(&mut client).poll_connect(&mut cx) {
+    match client.poll_connect(&mut cx) {
         Poll::Ready(Err(e)) => {
             assert_eq!(
                 e.io_error().map(io::Error::kind),
@@ -941,10 +938,7 @@ async fn early_data_budget_keeps_full_records() {
         .unwrap();
     let mut client = SslStream::new(ssl, client_io).unwrap();
     let mut server = SslStream::new(Ssl::new(acceptor.context()).unwrap(), server_io).unwrap();
-    let (connected, accepted) = tokio::join!(
-        Pin::new(&mut client).connect(),
-        Pin::new(&mut server).accept()
-    );
+    let (connected, accepted) = tokio::join!(client.connect(), server.accept());
     connected.unwrap();
     accepted.unwrap();
     server.write_all(b"x").await.unwrap();
@@ -964,7 +958,7 @@ async fn early_data_budget_keeps_full_records() {
     let mut client = SslStream::new(ssl, Gate::new(client_io)).unwrap();
     let mut server = SslStream::new(Ssl::new(acceptor.context()).unwrap(), server_io).unwrap();
     let mut cx = Context::from_waker(Waker::noop());
-    let res = Pin::new(&mut client).poll_connect(&mut cx);
+    let res = client.poll_connect(&mut cx);
     assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
     let early: Vec<u8> = (0..14000).map(|i| i as u8).collect();
     client.write_all(&early).await.unwrap();
@@ -972,7 +966,7 @@ async fn early_data_budget_keeps_full_records() {
 
     // The server accepts early data and sends its flight, so the next write finishes the
     // handshake on the way.
-    let res = Pin::new(&mut server).poll_accept(&mut cx);
+    let res = server.poll_accept(&mut cx);
     assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
     // Early data read in pieces stays in BoringSSL once the read buffer is drained.
     let mut piece = [0; 1000];
