@@ -135,13 +135,12 @@ impl ReadBuffer {
         !self.plain.is_empty()
     }
 
-    /// Copies opened plaintext into `buf`; returns whether some is left.
+    /// Copies opened plaintext into `buf`.
     #[inline]
-    pub(crate) fn take_plain(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+    pub(crate) fn take_plain(&mut self, buf: &mut ReadBuf<'_>) {
         let n = self.plain.len().min(buf.remaining());
         buf.put_slice(&self.bytes[self.plain.start..self.plain.start + n]);
         self.plain.start += n;
-        self.has_plain()
     }
 
     /// Opens the next buffered record in place once its plaintext is delivered.
@@ -240,6 +239,18 @@ impl ReadBuffer {
     }
 }
 
+struct RestoreReadBuffer<'a> {
+    pending: &'a mut ReadBuffer,
+    slot: &'a mut ReadBuffer,
+}
+
+impl Drop for RestoreReadBuffer<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        *self.slot = mem::take(self.pending);
+    }
+}
+
 /// Delivers application data opened in place in the read buffer, or returns `None`, having
 /// delivered nothing, when the read must go through `SSL_read`.
 ///
@@ -257,7 +268,10 @@ where
     let mut read_buf = mem::take(&mut s.get_mut().read_buf);
     let (mut declined, mut pending, mut end) = (false, false, None);
     loop {
-        if (read_buf.has_plain() && read_buf.take_plain(buf)) || buf.remaining() == 0 {
+        if read_buf.has_plain() {
+            read_buf.take_plain(buf);
+        }
+        if buf.remaining() == 0 {
             break;
         }
         // Without buffered ciphertext, another record needs a transport poll.
@@ -276,7 +290,15 @@ where
                 break;
             }
         };
-        match read_buf.fill_partial(&mut s.get_mut().transport, needed) {
+        let wrapper = s.get_mut();
+        let restore = RestoreReadBuffer {
+            pending: &mut read_buf,
+            slot: &mut wrapper.read_buf,
+        };
+        let filled = restore.pending.fill_partial(&mut wrapper.transport, needed);
+        // The guard only borrows the buffers. Disarm it after a normal transport return.
+        mem::forget(restore);
+        match filled {
             Ok(0) => {
                 // `SSL_read` reports the end, or the truncated record before it.
                 declined = true;

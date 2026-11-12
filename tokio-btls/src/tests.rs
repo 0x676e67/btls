@@ -2,6 +2,7 @@
 
 use std::{
     io, mem,
+    panic::{catch_unwind, panic_any, AssertUnwindSafe},
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -22,6 +23,16 @@ use crate::{
     SslStream,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadFault {
+    Off,
+    Prefix,
+    Paused,
+    Unwind,
+}
+
+struct InjectedReadPanic;
+
 /// Duplex transport whose writes can stall, fail once, or keep returning `BrokenPipe`.
 ///
 /// A spent `budget` stalls writes, or fails them with `TimedOut` if `fail_when_spent` is set.
@@ -38,6 +49,7 @@ struct Gate {
     polls: usize,
     tap: Vec<u8>,
     read_chunk: usize,
+    read_fault: ReadFault,
     // Returned once instead of `Pending` when no data is left: EOF or an error.
     drained: Option<io::Result<()>>,
 }
@@ -55,6 +67,7 @@ impl Gate {
             polls: 0,
             tap: Vec::new(),
             read_chunk: usize::MAX,
+            read_fault: ReadFault::Off,
             drained: None,
         }
     }
@@ -66,6 +79,18 @@ impl AsyncRead for Gate {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        match self.read_fault {
+            ReadFault::Paused => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            ReadFault::Unwind => {
+                self.read_fault = ReadFault::Off;
+                panic_any(InjectedReadPanic);
+            }
+            ReadFault::Off | ReadFault::Prefix => {}
+        }
+        let before = buf.filled().len();
         let read = if self.read_chunk < buf.remaining() {
             let chunk = self.read_chunk;
             let mut part = ReadBuf::new(buf.initialize_unfilled_to(chunk));
@@ -76,6 +101,10 @@ impl AsyncRead for Gate {
         } else {
             Pin::new(&mut self.io).poll_read(cx, buf)
         };
+        if self.read_fault == ReadFault::Prefix && matches!(read, Poll::Ready(Ok(()))) {
+            assert_eq!(buf.filled().len() - before, self.read_chunk);
+            self.read_fault = ReadFault::Paused;
+        }
         match read {
             Poll::Pending => self.drained.take().map_or(Poll::Pending, Poll::Ready),
             read => read,
@@ -239,6 +268,54 @@ async fn read_ends_after_quiet_shutdown() {
     let res = Pin::new(&mut client).poll_read(&mut cx, &mut read);
     assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
     assert!(read.filled().is_empty());
+}
+
+async fn assert_read_recovers_after_transport_unwinds(version: SslVersion) {
+    let (mut client, mut server) = tls_pair_with(version, None).await;
+    server.write_all(b"warmup").await.unwrap();
+    server.flush().await.unwrap();
+    client.read_exact(&mut [0; 6]).await.unwrap();
+
+    let payload = b"the complete record";
+    server.write_all(payload).await.unwrap();
+    server.flush().await.unwrap();
+
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut bytes = [0; 64];
+    let mut read = ReadBuf::new(&mut bytes);
+    client.get_mut().read_chunk = 8;
+    client.get_mut().read_fault = ReadFault::Prefix;
+    assert!(Pin::new(&mut client)
+        .poll_read(&mut cx, &mut read)
+        .is_pending());
+    assert_eq!(client.get_mut().read_fault, ReadFault::Paused);
+    assert!(read.filled().is_empty());
+
+    client.get_mut().read_chunk = usize::MAX;
+    client.get_mut().read_fault = ReadFault::Unwind;
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        Pin::new(&mut client).poll_read(&mut cx, &mut read)
+    }))
+    .expect_err("the transport must unwind once");
+    assert!(unwind.is::<InjectedReadPanic>());
+    assert!(read.filled().is_empty());
+
+    let result = Pin::new(&mut client).poll_read(&mut cx, &mut read);
+    assert!(
+        matches!(result, Poll::Ready(Ok(()))),
+        "read did not recover: {result:?}"
+    );
+    assert_eq!(read.filled(), payload);
+}
+
+#[tokio::test]
+async fn tls12_read_recovers_after_transport_unwinds() {
+    assert_read_recovers_after_transport_unwinds(SslVersion::TLS1_2).await;
+}
+
+#[tokio::test]
+async fn tls13_read_recovers_after_transport_unwinds() {
+    assert_read_recovers_after_transport_unwinds(SslVersion::TLS1_3).await;
 }
 
 #[tokio::test]
