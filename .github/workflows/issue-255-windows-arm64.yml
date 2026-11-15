@@ -1,0 +1,83 @@
+name: Windows ARM64 build comparison (#255)
+
+on:
+  push:
+    branches: [ci/issue-255-windows-arm64]
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: windows-11-arm
+    timeout-minutes: 35
+    env:
+      CMAKE_GENERATOR: Visual Studio 18 2026
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out main before the fix
+        uses: actions/checkout@v7
+        with:
+          ref: 2acfbfe3240d799112eed51637cf9b01eec5ad25
+          submodules: recursive
+          path: before
+          persist-credentials: false
+      - name: Check out the fix
+        uses: actions/checkout@v7
+        with:
+          ref: 4df72ef32e69558d6952d14c442512dbcec603b7
+          submodules: recursive
+          path: after
+          persist-credentials: false
+      - name: Check native toolchain and lock dependencies
+        shell: pwsh
+        run: |
+          $target = 'aarch64-pc-windows-msvc'
+          rustup default "stable-$target"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $rust = rustc -vV
+          $rust
+          if ($rust -notcontains "host: $target") { throw "Expected a native $target compiler" }
+
+          $cmake = Get-Command cmake.exe
+          $cmake.Source
+          & $cmake.Source --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $clang = Get-Command clang.exe
+          & $clang.Source --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $clangDirectory = Split-Path $clang.Source
+          if (-not (Test-Path -LiteralPath (Join-Path $clangDirectory 'libclang.dll'))) {
+            throw "libclang.dll is missing from $clangDirectory"
+          }
+          "LIBCLANG_PATH=$clangDirectory" >> $env:GITHUB_ENV
+
+          $beforeBssl = git -C before rev-parse HEAD:btls-sys/deps/boringssl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $afterBssl = git -C after rev-parse HEAD:btls-sys/deps/boringssl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($beforeBssl -ne $afterBssl) { throw 'The BoringSSL revisions differ' }
+          "BoringSSL: $beforeBssl"
+
+          cargo generate-lockfile --manifest-path before/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath before/Cargo.lock -Destination after/Cargo.lock
+      - name: Compare ARM64 builds
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $buildArguments = @('build', '--locked', '--release', '--target', 'aarch64-pc-windows-msvc', '-p', 'btls-sys', '-p', 'btls', '--tests', '-vv')
+          New-Item -ItemType Directory -Path before/target -Force | Out-Null
+          Write-Output 'Building main before the fix'
+          & cargo @buildArguments --manifest-path before/Cargo.toml 2>&1 | Tee-Object -FilePath before/target/build.log
+          $beforeExit = $LASTEXITCODE
+
+          Write-Output 'Building and linking the fixed test binaries'
+          & cargo @buildArguments --manifest-path after/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($beforeExit -eq 0) { throw 'The main baseline unexpectedly built successfully' }
+          if (-not (Select-String -LiteralPath before/target/build.log -Pattern 'LNK1181.*fipsmodule\.dir.*\.obj.*crypto\.vcxproj' -Quiet)) {
+            throw 'The baseline failed for a reason other than the #255 missing object'
+          }
+          'The baseline hit LNK1181 and the fixed test binaries linked successfully.'
