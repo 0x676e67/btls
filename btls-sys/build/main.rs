@@ -265,6 +265,10 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     }
 
     if config.host == config.target {
+        if config.target == "aarch64-pc-windows-msvc" {
+            // MSVC cannot assemble BoringSSL's Arm64 .S sources.
+            boringssl_cmake.define("OPENSSL_NO_ASM", "YES");
+        }
         return boringssl_cmake;
     }
 
