@@ -1,0 +1,705 @@
+diff --git a/crypto/obj/obj_dat.h b/crypto/obj/obj_dat.h
+index 8562090..839e895 100644
+--- a/crypto/obj/obj_dat.h
++++ b/crypto/obj/obj_dat.h
+@@ -16,7 +16,7 @@
+ 
+ 
+ BSSL_NAMESPACE_BEGIN
+-#define NUM_NID 985
++#define NUM_NID 987
+ 
+ static const uint8_t kObjectData[] = {
+     /* NID_rsadsi */
+@@ -8884,6 +8884,10 @@ static const ASN1_OBJECT kObjects[NUM_NID] = {
+     {"ffdhe2048", "ffdhe2048", NID_ffdhe2048, 0, NULL, 0},
+     {"ffdhe3072", "ffdhe3072", NID_ffdhe3072, 0, NULL, 0},
+     {"KxDHE", "kx-dhe", NID_kx_dhe, 0, NULL, 0},
++    {"SecP256r1MLKEM768", "SecP256r1MLKEM768", NID_SecP256r1MLKEM768, 0, NULL,
++     0},
++    {"SecP384r1MLKEM1024", "SecP384r1MLKEM1024", NID_SecP384r1MLKEM1024, 0,
++     NULL, 0},
+ };
+ 
+ static const uint16_t kNIDsInShortNameOrder[] = {
+@@ -9081,6 +9085,8 @@ static const uint16_t kNIDsInShortNameOrder[] = {
+     100 /* SN */,
+     16 /* ST */,
+     143 /* SXNetID */,
++    985 /* SecP256r1MLKEM768 */,
++    986 /* SecP384r1MLKEM1024 */,
+     458 /* UID */,
+     972 /* X-Wing */,
+     948 /* X25519 */,
+@@ -9968,6 +9974,8 @@ static const uint16_t kNIDsInLongNameOrder[] = {
+     981 /* SLH-DSA-SHA2-128s-WITH-SHA256 */,
+     980 /* SLH-DSA-SHAKE-256f */,
+     387 /* SNMPv2 */,
++    985 /* SecP256r1MLKEM768 */,
++    986 /* SecP384r1MLKEM1024 */,
+     512 /* Secure Electronic Transactions */,
+     386 /* Security */,
+     394 /* Selected Attribute Types */,
+diff --git a/crypto/obj/obj_mac.num b/crypto/obj/obj_mac.num
+index cf0fcbf..15d0a21 100644
+--- a/crypto/obj/obj_mac.num
++++ b/crypto/obj/obj_mac.num
+@@ -969,3 +969,5 @@ SLH_DSA_SHA2_128s_WITH_SHA256		981
+ ffdhe2048		982
+ ffdhe3072		983
+ kx_dhe		984
++SecP256r1MLKEM768		985
++SecP384r1MLKEM1024		986
+diff --git a/crypto/obj/objects.txt b/crypto/obj/objects.txt
+index d4c62bb..d8b2786 100644
+--- a/crypto/obj/objects.txt
++++ b/crypto/obj/objects.txt
+@@ -1386,3 +1386,6 @@ secg-scheme 14 3 : dhSinglePass-cofactorDH-sha512kdf-scheme
+ 1 3 6 1 4 1 44363 47 1 : rdna-trustAnchorID-draft
+ # id-pe TBD : pe-mtcCertificationAuthority
+ 1 3 6 1 4 1 44363 47 2 : pe-mtcCertificationAuthority-draft
++
++ : SecP256r1MLKEM768
++ : SecP384r1MLKEM1024
+diff --git a/include/openssl/nid.h b/include/openssl/nid.h
+index 8f45c6a..16cc638 100644
+--- a/include/openssl/nid.h
++++ b/include/openssl/nid.h
+@@ -5566,6 +5566,12 @@ extern "C" {
+ #define LN_kx_dhe "kx-dhe"
+ #define NID_kx_dhe 984
+ 
++#define SN_SecP256r1MLKEM768 "SecP256r1MLKEM768"
++#define NID_SecP256r1MLKEM768 985
++
++#define SN_SecP384r1MLKEM1024 "SecP384r1MLKEM1024"
++#define NID_SecP384r1MLKEM1024 986
++
+ 
+ #if defined(__cplusplus)
+ } /* extern C */
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 6f5d90f..d04ee51 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -2828,6 +2828,8 @@ OPENSSL_EXPORT size_t SSL_CTX_get_num_tickets(const SSL_CTX *ctx);
+ #define SSL_GROUP_SECP521R1 25
+ #define SSL_GROUP_X25519 29
+ #define SSL_GROUP_X25519_MLKEM768 0x11ec
++#define SSL_GROUP_SECP256R1_MLKEM768 0x11eb
++#define SSL_GROUP_SECP384R1_MLKEM1024 0x11ed
+ #define SSL_GROUP_X25519_KYBER768_DRAFT00 0x6399
+ #define SSL_GROUP_MLKEM1024 0x0202
+ #define SSL_GROUP_P256_KYBER768_DRAFT00 0xfe32
+@@ -3323,6 +3325,24 @@ OPENSSL_EXPORT int SSL_set0_verify_cert_store(SSL *ssl, X509_STORE *store);
+ // reference to `store` will be taken.
+ OPENSSL_EXPORT int SSL_set1_verify_cert_store(SSL *ssl, X509_STORE *store);
+ 
++// SSL_CTX_set_tls13_ciphers_last places TLS 1.3 suites after older suites in
++// ClientHello. The default is false. The enabled suites and their order within
++// each protocol version are unchanged.
++OPENSSL_EXPORT void SSL_CTX_set_tls13_ciphers_last(SSL_CTX *ctx, int enabled);
++
++// SSL_CTX_set_cert_signature_algorithms configures the signature_algorithms_cert
++// extension advertised by clients. An empty list disables the extension. This
++// does not change certificate verification or signature_algorithms. Applications
++// must configure their certificate verifier consistently with the advertised
++// algorithms. Returns one on success and zero on failure.
++OPENSSL_EXPORT int SSL_CTX_set_cert_signature_algorithms(
++    SSL_CTX *ctx, const uint16_t *prefs, size_t num_prefs);
++
++// SSL_set_cert_signature_algorithms overrides the context's advertised
++// certificate signature algorithms for this connection.
++OPENSSL_EXPORT int SSL_set_cert_signature_algorithms(
++    SSL *ssl, const uint16_t *prefs, size_t num_prefs);
++
+ // SSL_CTX_set_verify_algorithm_prefs configures `ctx` to use `prefs` as the
+ // preference list when verifying signatures from the peer's long-term key in
+ // TLS 1.2 and up. It returns one on zero on error. `prefs` should not include
+diff --git a/ssl/delegated_credentials_test.cc b/ssl/delegated_credentials_test.cc
+index 5cad98d..4f4725a 100644
+--- a/ssl/delegated_credentials_test.cc
++++ b/ssl/delegated_credentials_test.cc
+@@ -226,7 +226,7 @@ static bool MakeTestCredential(const CredentialOptions &options,
+       options.expires_from_now >
+           std::numeric_limits<int64_t>::max() - kCurrentTime ||
+       kCurrentTime + options.expires_from_now < not_before ||
+-      kCurrentTime + options.expires_from_now - not_before > UINT32_MAX) {
++      kCurrentTime + options.expires_from_now - not_before > UINT64_MAX) {
+     return false;
+   }
+   const uint32_t valid_time = static_cast<uint32_t>(
+@@ -429,7 +429,7 @@ static bool ParseCredential(const TestCredential &test_credential,
+   ssl_impl->s3->version = TLS1_3_VERSION;
+   SSL_HANDSHAKE hs(ssl_impl);
+   hs.config = ssl_impl->config.get();
+-  hs.extensions.sent = UINT32_MAX;
++  hs.extensions.sent = UINT64_MAX;
+ 
+   CBS contents;
+   CRYPTO_BUFFER_init_CBS(test_credential.delegated_credential.get(), &contents);
+@@ -454,7 +454,7 @@ static bool VerifyCredential(const TestCredential &test_credential,
+   ssl_impl->s3->version = TLS1_3_VERSION;
+   SSL_HANDSHAKE hs(ssl_impl);
+   hs.config = ssl_impl->config.get();
+-  hs.extensions.sent = UINT32_MAX;
++  hs.extensions.sent = UINT64_MAX;
+   hs.new_session = ssl_session_new(ssl_impl->ctx->x509_method);
+   if (hs.new_session == nullptr) {
+     return false;
+@@ -494,7 +494,7 @@ static bool ProcessCertificateMessage(const TestCredential &test_credential,
+   ssl_impl->s3->version = TLS1_3_VERSION;
+   SSL_HANDSHAKE hs(ssl_impl);
+   hs.config = ssl_impl->config.get();
+-  hs.extensions.sent = offered ? UINT32_MAX : 0;
++  hs.extensions.sent = offered ? UINT64_MAX : 0;
+   hs.new_session = ssl_session_new(ssl_impl->ctx->x509_method);
+   if (hs.new_session == nullptr) {
+     return false;
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 1c115b8..bf2bc71 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -112,6 +112,8 @@ static bool is_post_quantum_group(uint16_t id) {
+     case SSL_GROUP_P256_KYBER768_DRAFT00:
+     case SSL_GROUP_X25519_MLKEM768:
+     case SSL_GROUP_MLKEM1024:
++    case SSL_GROUP_SECP256R1_MLKEM768:
++    case SSL_GROUP_SECP384R1_MLKEM1024:
+       return true;
+     default:
+       return false;
+@@ -1020,6 +1022,28 @@ static bool ext_ticket_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+ //
+ // https://tools.ietf.org/html/rfc5246#section-7.4.1.4.1
+ 
++static bool ext_cert_sigalgs_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
++                                             CBB *out_compressible,
++                                             ssl_client_hello_type_t type) {
++  const auto &sigalgs = hs->config->cert_sigalgs;
++  if (hs->max_version < TLS1_2_VERSION || sigalgs.empty() ||
++      !ssl_accepts_server_certificate_auth(hs)) {
++    return true;
++  }
++  CBB contents, list;
++  if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_signature_algorithms_cert) ||
++      !CBB_add_u16_length_prefixed(out_compressible, &contents) ||
++      !CBB_add_u16_length_prefixed(&contents, &list)) {
++    return false;
++  }
++  for (uint16_t sigalg : sigalgs) {
++    if (!CBB_add_u16(&list, sigalg)) {
++      return false;
++    }
++  }
++  return CBB_flush(out_compressible);
++}
++
+ static bool ext_sigalgs_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+                                         CBB *out_compressible,
+                                         ssl_client_hello_type_t type) {
+@@ -4187,6 +4211,13 @@ static const struct tls_extension kExtensions[] = {
+         ext_ocsp_parse_clienthello,
+         ext_ocsp_add_serverhello,
+     },
++    {
++        TLSEXT_TYPE_signature_algorithms_cert,
++        ext_cert_sigalgs_add_clienthello,
++        forbid_parse_serverhello,
++        ignore_parse_clienthello,
++        dont_add_serverhello,
++    },
+     {
+         TLSEXT_TYPE_signature_algorithms,
+         ext_sigalgs_add_clienthello,
+@@ -4507,7 +4538,7 @@ bool ssl_client_hello_extension_was_sent(const SSL_HANDSHAKE *hs,
+                                          uint16_t value) {
+   uint32_t index;
+   return tls_extension_find(&index, value) != nullptr &&
+-         (hs->extensions.sent & (1u << index)) != 0;
++         (hs->extensions.sent & (uint64_t{1} << index)) != 0;
+ }
+ 
+ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
+@@ -4574,7 +4605,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+     // The callback may write to at most one output.
+     assert(bytes_written == 0 || bytes_written_compressed == 0);
+     if (bytes_written != 0 || bytes_written_compressed != 0) {
+-      hs->inner_extensions_sent |= (1u << i);
++      hs->inner_extensions_sent |= (uint64_t{1} << i);
+     }
+     // If compressed, update the running ech_outer_extensions extension.
+     if (bytes_written_compressed != 0 &&
+@@ -4704,7 +4735,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+ 
+     const size_t bytes_written = CBB_len(&extensions) - len_before;
+     if (bytes_written != 0) {
+-      hs->extensions.sent |= (1u << i);
++      hs->extensions.sent |= (uint64_t{1} << i);
+     }
+     // If the difference in lengths is only four bytes then the extension had
+     // an empty body.
+@@ -4752,7 +4783,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+     if (new_len != old_len) {
+       uint8_t *data = CBB_data(&extensions);
+       std::rotate(data + ech_offset, data + old_len, data + new_len);
+-      hs->extensions.sent |= (1u << ech_index);
++      hs->extensions.sent |= (uint64_t{1} << ech_index);
+     }
+   }
+   if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
+@@ -4817,7 +4848,7 @@ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out) {
+   }
+ 
+   for (unsigned i = 0; i < kNumExtensions; i++) {
+-    if (!(hs->extensions.received & (1u << i))) {
++    if (!(hs->extensions.received & (uint64_t{1} << i))) {
+       // Don't send extensions that were not received.
+       continue;
+     }
+@@ -4866,7 +4897,7 @@ static bool ssl_scan_clienthello_tlsext(SSL_HANDSHAKE *hs,
+       continue;
+     }
+ 
+-    hs->extensions.received |= (1u << ext_index);
++    hs->extensions.received |= (uint64_t{1} << ext_index);
+     uint8_t alert = SSL_AD_DECODE_ERROR;
+     if (!ext->parse_clienthello(hs, &alert, &extension)) {
+       *out_alert = alert;
+@@ -4877,7 +4908,7 @@ static bool ssl_scan_clienthello_tlsext(SSL_HANDSHAKE *hs,
+   }
+ 
+   for (size_t i = 0; i < kNumExtensions; i++) {
+-    if (hs->extensions.received & (1u << i)) {
++    if (hs->extensions.received & (uint64_t{1} << i)) {
+       continue;
+     }
+ 
+@@ -4891,7 +4922,7 @@ static bool ssl_scan_clienthello_tlsext(SSL_HANDSHAKE *hs,
+       CBS_init(&fake_contents, kFakeRenegotiateExtension,
+                sizeof(kFakeRenegotiateExtension));
+       contents = &fake_contents;
+-      hs->extensions.received |= (1u << i);
++      hs->extensions.received |= (uint64_t{1} << i);
+     }
+ 
+     // Extension wasn't observed so call the callback with a NULL
+@@ -4933,7 +4964,7 @@ static bool ssl_scan_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *cbs,
+     return false;
+   }
+ 
+-  uint32_t received = 0;
++  uint64_t received = 0;
+   while (CBS_len(&extensions) != 0) {
+     uint16_t type;
+     CBS extension;
+@@ -4959,7 +4990,7 @@ static bool ssl_scan_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *cbs,
+     static_assert(kNumExtensions <= sizeof(hs->extensions.sent) * 8,
+                   "too many bits");
+ 
+-    if (!(hs->extensions.sent & (1u << ext_index))) {
++    if (!(hs->extensions.sent & (uint64_t{1} << ext_index))) {
+       // If the extension was never sent then it is illegal.
+       OPENSSL_PUT_ERROR(SSL, SSL_R_UNEXPECTED_EXTENSION);
+       ERR_add_error_dataf("extension %u", (unsigned)type);
+@@ -4967,7 +4998,7 @@ static bool ssl_scan_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *cbs,
+       return false;
+     }
+ 
+-    received |= (1u << ext_index);
++    received |= (uint64_t{1} << ext_index);
+ 
+     uint8_t alert = SSL_AD_DECODE_ERROR;
+     if (!ext->parse_serverhello(hs, &alert, &extension)) {
+@@ -4979,7 +5010,7 @@ static bool ssl_scan_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *cbs,
+   }
+ 
+   for (size_t i = 0; i < kNumExtensions; i++) {
+-    if (!(received & (1u << i))) {
++    if (!(received & (uint64_t{1} << i))) {
+       // Extension wasn't observed so call the callback with a NULL
+       // parameter.
+       uint8_t alert = SSL_AD_DECODE_ERROR;
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 5a300f1..24b4336 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -102,13 +102,18 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+     return false;
+   }
+ 
+-  // Add TLS 1.3 ciphers in configured preference order.
+-  if (hs->max_version >= TLS1_3_VERSION) {
+-    for (const SSL_CIPHER *cipher : hs->config->tls13_cipher_list.ciphers()) {
+-      if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
+-        return false;
++  auto add_tls13_ciphers = [&] {
++    if (hs->max_version >= TLS1_3_VERSION) {
++      for (const SSL_CIPHER *cipher : hs->config->tls13_cipher_list.ciphers()) {
++        if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++          return false;
++        }
+       }
+     }
++    return true;
++  };
++  if (!hs->config->tls13_ciphers_last && !add_tls13_ciphers()) {
++    return false;
+   }
+ 
+   if (hs->min_version < TLS1_3_VERSION && type != ssl_client_hello_inner) {
+@@ -136,6 +141,10 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+     }
+   }
+ 
++  if (hs->config->tls13_ciphers_last && !add_tls13_ciphers()) {
++    return false;
++  }
++
+   if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV) {
+     if (!CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
+       return false;
+diff --git a/ssl/internal.h b/ssl/internal.h
+index db4d555..db42530 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -989,7 +989,7 @@ struct NamedGroup {
+ Span<const NamedGroup> NamedGroups();
+ 
+ // kNumNamedGroups is the number of supported groups.
+-constexpr size_t kNumNamedGroups = 10u;
++constexpr size_t kNumNamedGroups = 12u;
+ 
+ // DefaultSupportedGroupIds returns the list of IDs for the default groups that
+ // are supported when the caller hasn't explicitly configured supported groups.
+@@ -1937,15 +1937,15 @@ struct SSL_HANDSHAKE {
+     // sent is a bitset where the bits correspond to elements of kExtensions
+     // in extensions.cc. Each bit is set if that extension was sent in a
+     // ClientHello. It's not used by servers.
+-    uint32_t sent = 0;
++    uint64_t sent = 0;
+     // received is a bitset, like `sent`, but is used by servers to record
+     // which extensions were received from a client.
+-    uint32_t received;
++    uint64_t received;
+   } extensions;
+ 
+   // inner_extensions_sent, on clients that offer ECH, is `extensions.sent` for
+   // the ClientHelloInner.
+-  uint32_t inner_extensions_sent = 0;
++  uint64_t inner_extensions_sent = 0;
+ 
+   // early_data_written is the amount of early data that has been written by the
+   // record layer.
+@@ -3669,6 +3669,8 @@ struct SSL_CONFIG {
+   // verify_sigalgs, if not empty, is the set of signature algorithms
+   // accepted from the peer in decreasing order of preference.
+   Array<uint16_t> verify_sigalgs;
++  Array<uint16_t> cert_sigalgs;
++  bool tls13_ciphers_last = false;
+ 
+   // srtp_profiles is the list of configured SRTP protection profiles for
+   // DTLS-SRTP.
+@@ -4462,6 +4464,8 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+   // verify_sigalgs, if not empty, is the set of signature algorithms
+   // accepted from the peer in decreasing order of preference.
+   Array<uint16_t> verify_sigalgs;
++  Array<uint16_t> cert_sigalgs;
++  bool tls13_ciphers_last = false;
+ 
+   // accepted_peer_cert_types inherited by SSL struct.
+   InplaceVector<uint8_t, kNumCertTypes> accepted_peer_cert_types;
+diff --git a/ssl/ssl_key_share.cc b/ssl/ssl_key_share.cc
+index 6dc9f8f..d14ab78 100644
+--- a/ssl/ssl_key_share.cc
++++ b/ssl/ssl_key_share.cc
+@@ -758,7 +758,155 @@ class MLKEM1024KeyShare : public SSLKeyShare {
+   MLKEM1024_private_key private_key_;
+ };
+ 
++class SecP256r1MLKEM768KeyShare : public SSLKeyShare {
++ public:
++  SecP256r1MLKEM768KeyShare() : ec_(EC_group_p256(), SSL_GROUP_SECP256R1) {}
++
++  uint16_t GroupID() const override { return SSL_GROUP_SECP256R1_MLKEM768; }
++
++  bool Generate(CBB *out) override {
++    uint8_t public_key[MLKEM768_PUBLIC_KEY_BYTES];
++    MLKEM768_generate_key(public_key, nullptr, &private_key_);
++    return ec_.Generate(out) &&
++           CBB_add_bytes(out, public_key, sizeof(public_key));
++  }
++
++  bool Encap(CBB *out_ciphertext, Array<uint8_t> *out_secret,
++             uint8_t *out_alert, Span<const uint8_t> peer_key) override {
++    *out_alert = SSL_AD_INTERNAL_ERROR;
++    if (peer_key.size() != 65 + MLKEM768_PUBLIC_KEY_BYTES) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_ECPOINT);
++      return false;
++    }
++    CBS input;
++    CBS_init(&input, peer_key.data() + 65, MLKEM768_PUBLIC_KEY_BYTES);
++    MLKEM768_public_key public_key;
++    if (!MLKEM768_parse_public_key(&public_key, &input)) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_ECPOINT);
++      return false;
++    }
++    Array<uint8_t> ec_secret;
++    if (!ec_.Encap(out_ciphertext, &ec_secret, out_alert,
++                    peer_key.first(65)) ||
++        !out_secret->InitForOverwrite(ec_secret.size() +
++                                      MLKEM_SHARED_SECRET_BYTES)) {
++      return false;
++    }
++    OPENSSL_memcpy(out_secret->data(), ec_secret.data(), ec_secret.size());
++    uint8_t ciphertext[MLKEM768_CIPHERTEXT_BYTES];
++    MLKEM768_encap(ciphertext, out_secret->data() + ec_secret.size(),
++                    &public_key);
++    return CBB_add_bytes(out_ciphertext, ciphertext, sizeof(ciphertext));
++  }
++
++  bool Decap(Array<uint8_t> *out_secret, uint8_t *out_alert,
++             Span<const uint8_t> ciphertext) override {
++    *out_alert = SSL_AD_INTERNAL_ERROR;
++    if (ciphertext.size() != 65 + MLKEM768_CIPHERTEXT_BYTES) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_ECPOINT);
++      return false;
++    }
++    Array<uint8_t> ec_secret;
++    if (!ec_.Decap(&ec_secret, out_alert, ciphertext.first(65)) ||
++        !out_secret->InitForOverwrite(ec_secret.size() +
++                                      MLKEM_SHARED_SECRET_BYTES)) {
++      return false;
++    }
++    OPENSSL_memcpy(out_secret->data(), ec_secret.data(), ec_secret.size());
++    if (!MLKEM768_decap(out_secret->data() + ec_secret.size(),
++                        ciphertext.data() + 65, MLKEM768_CIPHERTEXT_BYTES,
++                        &private_key_)) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_ECPOINT);
++      return false;
++    }
++    return true;
++  }
++
++ private:
++  ECKeyShare ec_;
++  MLKEM768_private_key private_key_;
++};
++
++class SecP384r1MLKEM1024KeyShare : public SSLKeyShare {
++ public:
++  SecP384r1MLKEM1024KeyShare() : ec_(EC_group_p384(), SSL_GROUP_SECP384R1) {}
++
++  uint16_t GroupID() const override { return SSL_GROUP_SECP384R1_MLKEM1024; }
++
++  bool Generate(CBB *out) override {
++    uint8_t public_key[MLKEM1024_PUBLIC_KEY_BYTES];
++    MLKEM1024_generate_key(public_key, nullptr, &private_key_);
++    return ec_.Generate(out) &&
++           CBB_add_bytes(out, public_key, sizeof(public_key));
++  }
++
++  bool Encap(CBB *out_ciphertext, Array<uint8_t> *out_secret,
++             uint8_t *out_alert, Span<const uint8_t> peer_key) override {
++    *out_alert = SSL_AD_INTERNAL_ERROR;
++    if (peer_key.size() != 97 + MLKEM1024_PUBLIC_KEY_BYTES) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_ECPOINT);
++      return false;
++    }
++    CBS input;
++    CBS_init(&input, peer_key.data() + 97, MLKEM1024_PUBLIC_KEY_BYTES);
++    MLKEM1024_public_key public_key;
++    if (!MLKEM1024_parse_public_key(&public_key, &input)) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_ECPOINT);
++      return false;
++    }
++    Array<uint8_t> ec_secret;
++    if (!ec_.Encap(out_ciphertext, &ec_secret, out_alert,
++                    peer_key.first(97)) ||
++        !out_secret->InitForOverwrite(ec_secret.size() +
++                                      MLKEM_SHARED_SECRET_BYTES)) {
++      return false;
++    }
++    OPENSSL_memcpy(out_secret->data(), ec_secret.data(), ec_secret.size());
++    uint8_t ciphertext[MLKEM1024_CIPHERTEXT_BYTES];
++    MLKEM1024_encap(ciphertext, out_secret->data() + ec_secret.size(),
++                    &public_key);
++    return CBB_add_bytes(out_ciphertext, ciphertext, sizeof(ciphertext));
++  }
++
++  bool Decap(Array<uint8_t> *out_secret, uint8_t *out_alert,
++             Span<const uint8_t> ciphertext) override {
++    *out_alert = SSL_AD_INTERNAL_ERROR;
++    if (ciphertext.size() != 97 + MLKEM1024_CIPHERTEXT_BYTES) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_ECPOINT);
++      return false;
++    }
++    Array<uint8_t> ec_secret;
++    if (!ec_.Decap(&ec_secret, out_alert, ciphertext.first(97)) ||
++        !out_secret->InitForOverwrite(ec_secret.size() +
++                                      MLKEM_SHARED_SECRET_BYTES)) {
++      return false;
++    }
++    OPENSSL_memcpy(out_secret->data(), ec_secret.data(), ec_secret.size());
++    if (!MLKEM1024_decap(out_secret->data() + ec_secret.size(),
++                        ciphertext.data() + 97, MLKEM1024_CIPHERTEXT_BYTES,
++                        &private_key_)) {
++      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_ECPOINT);
++      return false;
++    }
++    return true;
++  }
++
++ private:
++  ECKeyShare ec_;
++  MLKEM1024_private_key private_key_;
++};
++
+ constexpr NamedGroup kNamedGroups[] = {
++    {NID_SecP256r1MLKEM768, SSL_GROUP_SECP256R1_MLKEM768, "SecP256r1MLKEM768", ""},
++    {NID_SecP384r1MLKEM1024, SSL_GROUP_SECP384R1_MLKEM1024, "SecP384r1MLKEM1024", ""},
+     {NID_X9_62_prime256v1, SSL_GROUP_SECP256R1, "P-256", "prime256v1"},
+     {NID_secp384r1, SSL_GROUP_SECP384R1, "P-384", "secp384r1"},
+     {NID_secp521r1, SSL_GROUP_SECP521R1, "P-521", "secp521r1"},
+@@ -793,6 +941,10 @@ Span<const uint16_t> DefaultSupportedGroupIds() {
+ 
+ UniquePtr<SSLKeyShare> SSLKeyShare::Create(uint16_t group_id) {
+   switch (group_id) {
++    case SSL_GROUP_SECP256R1_MLKEM768:
++      return MakeUnique<SecP256r1MLKEM768KeyShare>();
++    case SSL_GROUP_SECP384R1_MLKEM1024:
++      return MakeUnique<SecP384r1MLKEM1024KeyShare>();
+     case SSL_GROUP_SECP256R1:
+       return MakeUnique<ECKeyShare>(EC_group_p256(), SSL_GROUP_SECP256R1);
+     case SSL_GROUP_SECP384R1:
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 3b652af..1fa8402 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -521,6 +521,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
+   ssl->config->permute_extensions = ctx_impl->permute_extensions;
+   ssl->config->disable_second_keyshare = ctx_impl->disable_second_keyshare;
+   ssl->config->compliance_policy = ctx_impl->compliance_policy;
++  ssl->config->tls13_ciphers_last = ctx_impl->tls13_ciphers_last;
+ 
+   if (!ssl->config->tls13_cipher_list.CopyFrom(ctx_impl->tls13_cipher_list)) {
+     return nullptr;
+@@ -533,6 +534,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
+       !ssl->config->alpn_client_proto_list.CopyFrom(
+           ctx_impl->alpn_client_proto_list) ||
+       !ssl->config->verify_sigalgs.CopyFrom(ctx_impl->verify_sigalgs) ||
++      !ssl->config->cert_sigalgs.CopyFrom(ctx_impl->cert_sigalgs) ||
+       !ssl->config->delegated_credentials.CopyFrom(
+           ctx_impl->delegated_credentials) ||
+       !ssl->config->accepted_peer_cert_types.TryCopyFrom(
+diff --git a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
+index af40dd5..dc0c336 100644
+--- a/ssl/ssl_privkey.cc
++++ b/ssl/ssl_privkey.cc
+@@ -939,6 +939,34 @@ int SSL_set1_sigalgs_list(SSL *ssl, const char *str) {
+   return 1;
+ }
+ 
++void SSL_CTX_set_tls13_ciphers_last(SSL_CTX *ctx, int enabled) {
++  FromOpaque(ctx)->tls13_ciphers_last = enabled != 0;
++}
++
++static bool set_cert_sigalgs(Array<uint16_t> *out, const uint16_t *prefs,
++                             size_t num_prefs) {
++  if (num_prefs > (0xffff - 2) / 2 || (num_prefs != 0 && prefs == nullptr)) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_INVALID_SIGNATURE_ALGORITHM);
++    return false;
++  }
++  return out->CopyFrom(Span(prefs, num_prefs));
++}
++
++int SSL_CTX_set_cert_signature_algorithms(SSL_CTX *ctx, const uint16_t *prefs,
++                                           size_t num_prefs) {
++  return set_cert_sigalgs(&FromOpaque(ctx)->cert_sigalgs, prefs, num_prefs);
++}
++
++int SSL_set_cert_signature_algorithms(SSL *ssl, const uint16_t *prefs,
++                                       size_t num_prefs) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++  return set_cert_sigalgs(&ssl_impl->config->cert_sigalgs, prefs, num_prefs);
++}
++
+ int SSL_CTX_set_verify_algorithm_prefs(SSL_CTX *ctx, const uint16_t *prefs,
+                                        size_t num_prefs) {
+   return set_sigalg_prefs(&FromOpaque(ctx)->verify_sigalgs,
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index ced8b9a..9310721 100644
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -13401,5 +13401,59 @@ TEST(SSLTest, SessionCrossContextCache) {
+   EXPECT_FALSE(SSL_CTX_add_session(ctx_b.get(), session.get()));
+ }
+ 
++TEST(SSLTest, NistMLKEMRejectsMalformedKeyShares) {
++  for (auto group : {SSL_GROUP_SECP256R1_MLKEM768,
++                     SSL_GROUP_SECP384R1_MLKEM1024}) {
++    auto client = SSLKeyShare::Create(group);
++    auto server = SSLKeyShare::Create(group);
++    ASSERT_TRUE(client);
++    ASSERT_TRUE(server);
++    ScopedCBB public_key, ciphertext;
++    ASSERT_TRUE(CBB_init(public_key.get(), 2048));
++    ASSERT_TRUE(CBB_init(ciphertext.get(), 2048));
++    ASSERT_TRUE(client->Generate(public_key.get()));
++    Span<const uint8_t> key(CBB_data(public_key.get()), CBB_len(public_key.get()));
++    Array<uint8_t> server_secret, client_secret;
++    uint8_t alert;
++    ASSERT_TRUE(server->Encap(ciphertext.get(), &server_secret, &alert, key));
++    Span<const uint8_t> ct(CBB_data(ciphertext.get()), CBB_len(ciphertext.get()));
++    ASSERT_TRUE(client->Decap(&client_secret, &alert, ct));
++    EXPECT_EQ(Bytes(server_secret), Bytes(client_secret));
++    for (int change : {-1, 1, 0}) {
++      std::vector<uint8_t> bad_key(key.begin(), key.end());
++      std::vector<uint8_t> bad_ct(ct.begin(), ct.end());
++      if (change == -1) {
++        bad_key.pop_back();
++        bad_ct.pop_back();
++      } else if (change == 1) {
++        bad_key.push_back(0);
++        bad_ct.push_back(0);
++      } else {
++        bad_key[0] = 0;
++        bad_ct[0] = 0;
++      }
++      auto peer = SSLKeyShare::Create(group);
++      ScopedCBB output;
++      ASSERT_TRUE(CBB_init(output.get(), 2048));
++      EXPECT_FALSE(peer->Encap(output.get(), &server_secret, &alert, bad_key));
++      EXPECT_EQ(alert, SSL_AD_ILLEGAL_PARAMETER);
++      ERR_clear_error();
++      EXPECT_FALSE(client->Decap(&client_secret, &alert, bad_ct));
++      EXPECT_EQ(alert, SSL_AD_ILLEGAL_PARAMETER);
++      ERR_clear_error();
++    }
++    std::vector<uint8_t> bad_kem(key.begin(), key.end());
++    size_t ec_size = group == SSL_GROUP_SECP256R1_MLKEM768 ? 65 : 97;
++    bad_kem[ec_size] = 0xff;
++    bad_kem[ec_size + 1] |= 0x0f;
++    auto peer = SSLKeyShare::Create(group);
++    ScopedCBB output;
++    ASSERT_TRUE(CBB_init(output.get(), 2048));
++    EXPECT_FALSE(peer->Encap(output.get(), &server_secret, &alert, bad_kem));
++    EXPECT_EQ(alert, SSL_AD_ILLEGAL_PARAMETER);
++    ERR_clear_error();
++  }
++}
++
+ }  // namespace
+ BSSL_NAMESPACE_END

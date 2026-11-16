@@ -912,6 +912,12 @@ impl KeyShare {
 
     pub const X25519_MLKEM768: KeyShare = KeyShare(ffi::SSL_GROUP_X25519_MLKEM768 as _);
 
+    #[cfg(not(feature = "fips"))]
+    pub const P256_MLKEM768: KeyShare = KeyShare(ffi::SSL_GROUP_SECP256R1_MLKEM768 as _);
+
+    #[cfg(not(feature = "fips"))]
+    pub const P384_MLKEM1024: KeyShare = KeyShare(ffi::SSL_GROUP_SECP384R1_MLKEM1024 as _);
+
     pub const X25519_KYBER768_DRAFT00: KeyShare =
         KeyShare(ffi::SSL_GROUP_X25519_KYBER768_DRAFT00 as _);
 
@@ -2328,6 +2334,15 @@ impl SslContextBuilder {
         }
     }
 
+    /// Places TLS 1.3 cipher suites after older suites in ClientHello.
+    ///
+    /// Defaults to false. Does not change which suites are enabled.
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_CTX_set_tls13_ciphers_last)]
+    pub fn set_tls13_ciphers_last(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_CTX_set_tls13_ciphers_last(self.as_ptr(), enabled as _) }
+    }
+
     /// Sets the ClientHello extension order.
     ///
     /// Known extensions stay in the configured order. Unlisted extensions are
@@ -2352,6 +2367,27 @@ impl SslContextBuilder {
     #[corresponds(SSL_CTX_set_permute_extensions)]
     pub fn set_permute_extensions(&mut self, enabled: bool) {
         unsafe { ffi::SSL_CTX_set_permute_extensions(self.as_ptr(), enabled as _) }
+    }
+
+    /// Sets the certificate signature algorithms advertised in ClientHello.
+    ///
+    /// An empty list disables `signature_algorithms_cert`. This does not change
+    /// certificate verification or `signature_algorithms`; configure the
+    /// certificate verifier consistently with this list.
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_CTX_set_cert_signature_algorithms)]
+    pub fn set_cert_signature_algorithms(
+        &mut self,
+        algorithms: &[SslSignatureAlgorithm],
+    ) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set_cert_signature_algorithms(
+                self.as_ptr(),
+                algorithms.as_ptr().cast(),
+                algorithms.len(),
+            ))
+            .map(|_| ())
+        }
     }
 
     /// Sets the context's supported signature verification algorithms.
@@ -3418,6 +3454,27 @@ impl SslRef {
     pub fn set_curves_list(&mut self, curves: &str) -> Result<(), ErrorStack> {
         let curves = CString::new(curves).map_err(ErrorStack::internal_error)?;
         unsafe { cvt_0i(ffi::SSL_set1_curves_list(self.as_ptr(), curves.as_ptr())).map(|_| ()) }
+    }
+
+    /// Sets the certificate signature algorithms advertised in ClientHello.
+    ///
+    /// An empty list disables `signature_algorithms_cert`. This does not change
+    /// certificate verification or `signature_algorithms`; configure the
+    /// certificate verifier consistently with this list.
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_set_cert_signature_algorithms)]
+    pub fn set_cert_signature_algorithms(
+        &mut self,
+        algorithms: &[SslSignatureAlgorithm],
+    ) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_set_cert_signature_algorithms(
+                self.as_ptr(),
+                algorithms.as_ptr().cast(),
+                algorithms.len(),
+            ))
+            .map(|_| ())
+        }
     }
 
     #[corresponds(SSL_set_verify_algorithm_prefs)]
