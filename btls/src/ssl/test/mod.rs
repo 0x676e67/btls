@@ -1794,3 +1794,6 @@ fn set_verify_algorithm_prefs_ssl_rejects_unsatisfiable() {
         .expect("verify prefs should be accepted by setter");
     let _err = ssl_builder.connect_err();
 }
+
+#[cfg(not(feature = "fips"))]
+mod tls_identity;
