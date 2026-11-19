@@ -2354,6 +2354,12 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_permute_extensions(self.as_ptr(), enabled as _) }
     }
 
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_CTX_set_client_hello_padding)]
+    pub fn set_client_hello_padding(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_CTX_set_client_hello_padding(self.as_ptr(), enabled as _) }
+    }
+
     /// Sets the context's supported signature verification algorithms.
     #[corresponds(SSL_CTX_set_verify_algorithm_prefs)]
     pub fn set_verify_algorithm_prefs(

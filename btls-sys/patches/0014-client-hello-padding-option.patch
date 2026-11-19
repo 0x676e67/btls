@@ -1,0 +1,127 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 6f5d90f..86a9400 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5902,6 +5902,8 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
+ // permute extensions. For now, this is only implemented for the ClientHello.
+ OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+ 
++OPENSSL_EXPORT void SSL_CTX_set_client_hello_padding(SSL_CTX *ctx, int enabled);
++
+ // SSL_CTX_set_extension_order sets the ClientHello extension order for
+ // connections created from |ctx|. Known IDs keep their given order. Unknown
+ // and duplicate IDs are ignored, and unlisted extensions are appended in
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 1c115b8..b29abd1 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -4724,6 +4724,9 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+   // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
+   // images aligned.
+   size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
++  const bool may_pad = hs->config->client_hello_padding &&
++                       !SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
++                       !ssl->s3->used_hello_retry_request;
+   if (custom_ech) {
+     if (!CBB_flush(&extensions)) {
+       return false;
+@@ -4731,10 +4734,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+     // A trailing empty extension needs a five-byte WebSphere workaround.
+     // The F5 workaround only applies to small messages, far below UINT16_MAX.
+     const size_t padding_reserve =
+-        last_was_empty && psk_len == 0 && !SSL_is_dtls(ssl) &&
+-                !SSL_is_quic(ssl) && !ssl->s3->used_hello_retry_request
+-            ? 5
+-            : 0;
++        may_pad && last_was_empty && psk_len == 0 ? 5 : 0;
+     const size_t old_len = CBB_len(&extensions);
+     if (ech_offset > old_len) {
+       OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+@@ -4755,8 +4755,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+       hs->extensions.sent |= (1u << ech_index);
+     }
+   }
+-  if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
+-      !ssl->s3->used_hello_retry_request) {
++  if (may_pad) {
+     msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
+     // The length of the padding extension, excluding the four-byte extension
+     // header.
+diff --git a/ssl/internal.h b/ssl/internal.h
+index db4d555..c940f6f 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -3764,6 +3764,7 @@ struct SSL_CONFIG {
+ 
+   // record_size_limit is the protected-record plaintext limit to advertise.
+   uint16_t record_size_limit = 0;
++  bool client_hello_padding = true;
+ 
+   // delegated_credentials, if not empty, is the set of signature algorithms
+   // supported by the client.
+@@ -4528,6 +4529,7 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+ 
+   // record_size_limit is the protected-record plaintext limit to advertise.
+   uint16_t record_size_limit = 0;
++  bool client_hello_padding = true;
+ 
+   // delegated_credentials, if not empty, is the set of signature algorithms
+   // supported by the client.
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 3b652af..2e4964c 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -569,6 +569,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
+   ssl->config->handoff = ctx_impl->handoff;
+   ssl->quic_method = ctx_impl->quic_method;
+   ssl->config->record_size_limit = ctx_impl->record_size_limit;
++  ssl->config->client_hello_padding = ctx_impl->client_hello_padding;
+ 
+   if (!ssl->method->ssl_new(ssl.get()) ||
+       !ssl->ctx->x509_method->ssl_new(ssl->s3->hs.get())) {
+@@ -3377,6 +3378,10 @@ void SSL_set_permute_extensions(SSL *ssl, int enabled) {
+   ssl_impl->config->permute_extensions = !!enabled;
+ }
+ 
++void SSL_CTX_set_client_hello_padding(SSL_CTX *ctx, int enabled) {
++  FromOpaque(ctx)->client_hello_padding = !!enabled;
++}
++
+ int SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, int num) {
+   Array<uint16_t> order;
+   if (num > 0) {
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index ced8b9a..49c918c 100644
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -1695,7 +1695,8 @@ static bool GetClientHello(SSL *ssl, std::vector<uint8_t> *out) {
+ // and ticket length. It returns the length of the ClientHello, not including
+ // the record header, on success and zero on error.
+ static size_t GetClientHelloLen(uint16_t max_version, uint16_t session_version,
+-                                size_t ticket_len) {
++                                size_t ticket_len,
++                                bool disable_padding = false) {
+   bssl::UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
+ 
+   // Reduce the number of supported groups, as we need ClientHellos smaller
+@@ -1710,6 +1711,10 @@ static size_t GetClientHelloLen(uint16_t max_version, uint16_t session_version,
+     return 0;
+   }
+ 
++  if (disable_padding) {
++    SSL_CTX_set_client_hello_padding(ctx.get(), 0);
++  }
++
+   // Set a one-element cipher list so the baseline ClientHello is unpadded.
+   bssl::UniquePtr<SSL> ssl(SSL_new(ctx.get()));
+   if (!ssl || !SSL_set_session(ssl.get(), session.get()) ||
+@@ -1786,6 +1791,9 @@ TEST(SSLTest, Padding) {
+                             1 + test.input_len - base_len);
+       EXPECT_EQ(padded_len, test.padded_len)
+           << "ClientHello was not padded to expected length";
++      EXPECT_EQ(GetClientHelloLen(versions.max_version, versions.session_version,
++                                  1 + test.input_len - base_len, true),
++                test.input_len);
+     }
+   }
+ }
