@@ -4,7 +4,6 @@
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr},
-    pin::Pin,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -388,7 +387,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut stream = SslStream::new(Ssl::new(acceptor.context())?, transport)?;
-    Pin::new(&mut stream).accept().await?;
+    stream.accept().await?;
 
     let ssl = stream.ssl();
     let suite = ssl

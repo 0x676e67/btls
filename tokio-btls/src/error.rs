@@ -15,12 +15,26 @@ pub(crate) fn cvt<T>(r: io::Result<T>) -> Poll<io::Result<T>> {
     }
 }
 
-/// Maps [`would_block`] errors to `Pending`.
-pub(crate) fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
+/// Maps a handshake that must wait to `Pending`: on the transport, as in [`would_block`], or on
+/// a callback that asked to retry later and wakes the task itself.
+pub(crate) fn cvt_handshake(r: Result<(), ssl::Error>) -> Poll<Result<(), ssl::Error>> {
     match r {
-        Err(ref e) if would_block(e) => Poll::Pending,
+        Err(ref e) if would_block(e) || callback_retry(e) => Poll::Pending,
         r => Poll::Ready(r),
     }
+}
+
+/// Whether a callback asked BoringSSL to retry the handshake later.
+fn callback_retry(e: &ssl::Error) -> bool {
+    matches!(
+        e.code(),
+        ErrorCode::WANT_X509_LOOKUP
+            | ErrorCode::PENDING_SESSION
+            | ErrorCode::PENDING_CERTIFICATE
+            | ErrorCode::WANT_PRIVATE_KEY_OPERATION
+            | ErrorCode::WANT_CERTIFICATE_VERIFY
+            | ErrorCode::PENDING_TICKET
+    )
 }
 
 /// Whether `e` asks to retry after a transport `Pending`, which registered the waker.

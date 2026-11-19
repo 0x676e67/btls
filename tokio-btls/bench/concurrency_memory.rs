@@ -8,7 +8,6 @@ use std::{
     env,
     future::Future,
     io::{self, BufRead, BufReader, Write},
-    pin::Pin,
     process::{Child, Command, Stdio},
     sync::Arc,
     time::Instant,
@@ -285,7 +284,7 @@ impl Connect for Btls {
             .verify_hostname(false)
             .into_ssl("localhost")?;
         let mut stream = SslStream::new(ssl, tcp)?;
-        Pin::new(&mut stream).connect().await?;
+        stream.connect().await?;
         Ok(stream)
     }
 }
@@ -522,7 +521,7 @@ async fn listen() -> Result<(), BoxError> {
                 tokio::spawn(async move {
                     let ssl = Ssl::new(acceptor.context())?;
                     let mut stream = SslStream::new(ssl, tcp)?;
-                    Pin::new(&mut stream).accept().await?;
+                    stream.accept().await?;
                     serve(stream).await
                 });
             }
