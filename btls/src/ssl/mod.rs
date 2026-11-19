@@ -69,8 +69,8 @@ use std::io::prelude::*;
 use std::io::{self, IoSlice};
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop, MaybeUninit};
-use std::ops::Deref;
-use std::panic::resume_unwind;
+use std::ops::{Deref, Range};
+use std::panic::{resume_unwind, RefUnwindSafe, UnwindSafe};
 use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::slice;
@@ -87,7 +87,7 @@ use crate::nid::Nid;
 use crate::pkey::Public;
 use crate::pkey::{HasPrivate, PKeyRef, Params, Private};
 use crate::srtp::{SrtpProtectionProfile, SrtpProtectionProfileRef};
-use crate::ssl::bio::BioMethod;
+use crate::ssl::bio::{BioMethod, StreamState};
 use crate::ssl::callbacks::*;
 use crate::ssl::ech::SslEchKeys;
 use crate::ssl::error::InnerError;
@@ -4522,6 +4522,67 @@ impl SslRef {
         }
     }
 
+    /// Opens at most one application data record in place at the start of `buf`, without
+    /// transport I/O apart from a fatal alert on an error.
+    ///
+    /// `buf` must start at a record boundary of the ciphertext read from the transport. On
+    /// [`Opened::Declined`], drop its first `consumed` bytes and read through
+    /// [`SslStream::ssl_read`], which handles every other state and reports a close_notify or
+    /// an error met here; no error is left queued for it.
+    ///
+    /// Always declines for DTLS and QUIC, and in FIPS builds, which lack the BoringSSL patch.
+    #[corresponds(SSL_open_app_data)]
+    pub fn open_app_data(&mut self, buf: &mut [u8]) -> Result<Opened, ErrorStack> {
+        #[cfg(not(feature = "fips"))]
+        {
+            use ffi::ssl_open_app_data_result_t as R;
+
+            let (mut consumed, mut out, mut out_len) = (0, ptr::null_mut(), 0);
+            // SAFETY: `self` is a live `SSL`, `buf` is valid for `buf.len()` reads and writes,
+            // and the out-pointers are valid for writes.
+            let res = unsafe {
+                ffi::SSL_open_app_data(
+                    self.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut consumed,
+                    &mut out,
+                    &mut out_len,
+                )
+            };
+            if res == R::ssl_open_app_data_partial {
+                return Ok(Opened::Partial { needed: consumed });
+            }
+            if consumed > buf.len() {
+                return Err(ErrorStack::internal_error_str(
+                    "SSL_open_app_data reported more than it was given",
+                ));
+            }
+            if res != R::ssl_open_app_data_success {
+                return Ok(Opened::Declined { consumed });
+            }
+            let start = if out_len == 0 {
+                0
+            } else {
+                out.addr().wrapping_sub(buf.as_ptr().addr())
+            };
+            match start.checked_add(out_len) {
+                Some(end) if end <= consumed => Ok(Opened::Record {
+                    consumed,
+                    plaintext: start..end,
+                }),
+                _ => Err(ErrorStack::internal_error_str(
+                    "SSL_open_app_data placed plaintext outside the record",
+                )),
+            }
+        }
+        #[cfg(feature = "fips")]
+        {
+            let _ = buf;
+            Ok(Opened::Declined { consumed: 0 })
+        }
+    }
+
     /// Sets the certificate.
     #[corresponds(SSL_use_certificate)]
     pub fn set_certificate(&mut self, cert: &X509Ref) -> Result<(), ErrorStack> {
@@ -4957,6 +5018,23 @@ pub struct Sealed {
     pub written: usize,
 }
 
+/// Outcome of [`SslRef::open_app_data`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Opened {
+    /// One record of `consumed` bytes was opened. Its plaintext is `buf[plaintext]`, empty for a
+    /// record without application data, such as a post-handshake message.
+    Record {
+        consumed: usize,
+        plaintext: Range<usize>,
+    },
+    /// `buf` holds no complete record. `needed` is the length it must reach before the next
+    /// attempt: a record header's while the header is incomplete, then the whole record's.
+    Partial { needed: usize },
+    /// Drop the first `consumed` bytes of `buf` and read through [`SslStream::ssl_read`].
+    Declined { consumed: usize },
+}
+
 // std guarantees that `IoSlice` is ABI-compatible with `iovec` on Unix, so it can be read as a
 // `CRYPTO_IVEC` when `iovec` has the same field layout.
 #[cfg(all(unix, not(feature = "fips")))]
@@ -5091,8 +5169,19 @@ impl<S> MidHandshakeSslStream<S> {
 pub struct SslStream<S> {
     ssl: ManuallyDrop<Ssl>,
     method: ManuallyDrop<BioMethod>,
+    // The state `ssl`'s BIO owns, kept to reach the stream without two FFI calls each time.
+    state: NonNull<StreamState<S>>,
     _p: PhantomData<S>,
 }
+
+// SAFETY: `state` is owned by the BIO and only reached through `&self` and `&mut self`, as a
+// field would be; `&self` only reaches the stream, so `S` decides both, as before it was cached.
+unsafe impl<S: Send> Send for SslStream<S> {}
+unsafe impl<S: Sync> Sync for SslStream<S> {}
+// Unwind safety follows `S`, as before `state` was cached: its stashed error and panic only
+// leave through `&mut self`.
+impl<S: UnwindSafe> UnwindSafe for SslStream<S> {}
+impl<S: RefUnwindSafe> RefUnwindSafe for SslStream<S> {}
 
 impl<S> Drop for SslStream<S> {
     fn drop(&mut self) {
@@ -5123,7 +5212,7 @@ impl<S: Read + Write> SslStream<S> {
     /// with the peer. The `connect` and `accept` methods can be used to
     /// explicitly perform the handshake.
     pub fn new(ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
-        let (bio, method) = bio::new(stream)?;
+        let (bio, method, state) = bio::new(stream)?;
 
         unsafe {
             ffi::SSL_set_bio(ssl.as_ptr(), bio, bio);
@@ -5132,6 +5221,7 @@ impl<S: Read + Write> SslStream<S> {
         Ok(SslStream {
             ssl: ManuallyDrop::new(ssl),
             method: ManuallyDrop::new(method),
+            state,
             _p: PhantomData,
         })
     }
@@ -5321,13 +5411,24 @@ impl<S> SslStream<S> {
     }
 
     fn check_panic(&mut self) {
-        if let Some(err) = unsafe { bio::take_panic::<S>(self.ssl.get_raw_rbio()) } {
+        if let Some(err) = self.state_mut().panic.take() {
             resume_unwind(err)
         }
     }
 
     fn get_bio_error(&mut self) -> Option<io::Error> {
-        unsafe { bio::take_error::<S>(self.ssl.get_raw_rbio()) }
+        self.state_mut().error.take()
+    }
+
+    fn state(&self) -> &StreamState<S> {
+        // SAFETY: the BIO owns the state until `into_inner` or its destruction, both of which
+        // end this stream, and BIO callbacks only reach it during calls taking `&mut self`.
+        unsafe { self.state.as_ref() }
+    }
+
+    fn state_mut(&mut self) -> &mut StreamState<S> {
+        // SAFETY: as in `state`, and `&mut self` makes the access unique.
+        unsafe { self.state.as_mut() }
     }
 
     /// Converts the SslStream to the underlying data stream.
@@ -5339,10 +5440,7 @@ impl<S> SslStream<S> {
     /// Returns a shared reference to the underlying stream.
     #[must_use]
     pub fn get_ref(&self) -> &S {
-        unsafe {
-            let bio = self.ssl.get_raw_rbio();
-            bio::get_ref(bio)
-        }
+        &self.state().stream
     }
 
     /// Returns a mutable reference to the underlying stream.
@@ -5352,10 +5450,7 @@ impl<S> SslStream<S> {
     /// It is inadvisable to read from or write to the underlying stream as it
     /// will most likely corrupt the SSL session.
     pub fn get_mut(&mut self) -> &mut S {
-        unsafe {
-            let bio = self.ssl.get_raw_rbio();
-            bio::get_mut(bio)
-        }
+        &mut self.state_mut().stream
     }
 
     /// Returns a shared reference to the `Ssl` object associated with this stream.
@@ -5510,10 +5605,7 @@ impl<S> SslStreamBuilder<S> {
     /// Returns a shared reference to the underlying stream.
     #[must_use]
     pub fn get_ref(&self) -> &S {
-        unsafe {
-            let bio = self.inner.ssl.get_raw_rbio();
-            bio::get_ref(bio)
-        }
+        self.inner.get_ref()
     }
 
     /// Returns a mutable reference to the underlying stream.
@@ -5523,10 +5615,7 @@ impl<S> SslStreamBuilder<S> {
     /// It is inadvisable to read from or write to the underlying stream as it
     /// will most likely corrupt the SSL session.
     pub fn get_mut(&mut self) -> &mut S {
-        unsafe {
-            let bio = self.inner.ssl.get_raw_rbio();
-            bio::get_mut(bio)
-        }
+        self.inner.get_mut()
     }
 
     /// Returns a shared reference to the `Ssl` object associated with this builder.

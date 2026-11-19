@@ -2,6 +2,7 @@
 
 use std::{
     io, mem,
+    panic::{catch_unwind, panic_any, AssertUnwindSafe},
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -22,10 +23,21 @@ use crate::{
     SslStream,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadFault {
+    Off,
+    Prefix,
+    Paused,
+    Unwind,
+}
+
+struct InjectedReadPanic;
+
 /// Duplex transport whose writes can stall, fail once, or keep returning `BrokenPipe`.
 ///
 /// A spent `budget` stalls writes, or fails them with `TimedOut` if `fail_when_spent` is set.
-/// It counts write polls and copies the bytes it accepts into `tap`.
+/// It counts write polls and copies the bytes it accepts into `tap`. Reads return at most
+/// `read_chunk` bytes.
 struct Gate {
     io: DuplexStream,
     open: bool,
@@ -36,6 +48,8 @@ struct Gate {
     broken: bool,
     polls: usize,
     tap: Vec<u8>,
+    read_chunk: usize,
+    read_fault: ReadFault,
     // Returned once instead of `Pending` when no data is left: EOF or an error.
     drained: Option<io::Result<()>>,
 }
@@ -52,6 +66,8 @@ impl Gate {
             broken: false,
             polls: 0,
             tap: Vec::new(),
+            read_chunk: usize::MAX,
+            read_fault: ReadFault::Off,
             drained: None,
         }
     }
@@ -63,7 +79,33 @@ impl AsyncRead for Gate {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match Pin::new(&mut self.io).poll_read(cx, buf) {
+        match self.read_fault {
+            ReadFault::Paused => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            ReadFault::Unwind => {
+                self.read_fault = ReadFault::Off;
+                panic_any(InjectedReadPanic);
+            }
+            ReadFault::Off | ReadFault::Prefix => {}
+        }
+        let before = buf.filled().len();
+        let read = if self.read_chunk < buf.remaining() {
+            let chunk = self.read_chunk;
+            let mut part = ReadBuf::new(buf.initialize_unfilled_to(chunk));
+            let read = Pin::new(&mut self.io).poll_read(cx, &mut part);
+            let filled = part.filled().len();
+            buf.advance(filled);
+            read
+        } else {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        };
+        if self.read_fault == ReadFault::Prefix && matches!(read, Poll::Ready(Ok(()))) {
+            assert_eq!(buf.filled().len() - before, self.read_chunk);
+            self.read_fault = ReadFault::Paused;
+        }
+        match read {
             Poll::Pending => self.drained.take().map_or(Poll::Pending, Poll::Ready),
             read => read,
         }
@@ -202,6 +244,104 @@ async fn read_takes_every_ready_record() {
     // The read stops once the buffered ciphertext is used, before the transport's end.
     assert!(client.get_ref().drained.is_some());
     assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+
+    // An end the transport reported once does not keep later reads from polling it.
+    server.write_all(b"late").await.unwrap();
+    server.flush().await.unwrap();
+    assert_eq!(client.read(&mut buf).await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn read_ends_after_quiet_shutdown() {
+    let (mut client, _server) = tls_pair().await;
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut buf = [0; 16];
+    let mut read = ReadBuf::new(&mut buf);
+
+    // An idle read leaves BoringSSL nothing to report, until the shutdown closes its read side.
+    assert!(Pin::new(&mut client)
+        .poll_read(&mut cx, &mut read)
+        .is_pending());
+    // SAFETY: `client.ssl()` is a live `SSL`.
+    unsafe { btls_sys::SSL_set_quiet_shutdown(client.ssl().as_ptr(), 1) };
+    client.shutdown().await.unwrap();
+    let res = Pin::new(&mut client).poll_read(&mut cx, &mut read);
+    assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
+    assert!(read.filled().is_empty());
+}
+
+async fn assert_read_recovers_after_transport_unwinds(version: SslVersion) {
+    let (mut client, mut server) = tls_pair_with(version, None).await;
+    server.write_all(b"warmup").await.unwrap();
+    server.flush().await.unwrap();
+    client.read_exact(&mut [0; 6]).await.unwrap();
+
+    let payload = b"the complete record";
+    server.write_all(payload).await.unwrap();
+    server.flush().await.unwrap();
+
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut bytes = [0; 64];
+    let mut read = ReadBuf::new(&mut bytes);
+    client.get_mut().read_chunk = 8;
+    client.get_mut().read_fault = ReadFault::Prefix;
+    assert!(Pin::new(&mut client)
+        .poll_read(&mut cx, &mut read)
+        .is_pending());
+    assert_eq!(client.get_mut().read_fault, ReadFault::Paused);
+    assert!(read.filled().is_empty());
+
+    client.get_mut().read_chunk = usize::MAX;
+    client.get_mut().read_fault = ReadFault::Unwind;
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        Pin::new(&mut client).poll_read(&mut cx, &mut read)
+    }))
+    .expect_err("the transport must unwind once");
+    assert!(unwind.is::<InjectedReadPanic>());
+    assert!(read.filled().is_empty());
+
+    let result = Pin::new(&mut client).poll_read(&mut cx, &mut read);
+    assert!(
+        matches!(result, Poll::Ready(Ok(()))),
+        "read did not recover: {result:?}"
+    );
+    assert_eq!(read.filled(), payload);
+}
+
+#[tokio::test]
+async fn tls12_read_recovers_after_transport_unwinds() {
+    assert_read_recovers_after_transport_unwinds(SslVersion::TLS1_2).await;
+}
+
+#[tokio::test]
+async fn tls13_read_recovers_after_transport_unwinds() {
+    assert_read_recovers_after_transport_unwinds(SslVersion::TLS1_3).await;
+}
+
+#[tokio::test]
+async fn read_reassembles_split_records() {
+    let payload: Vec<u8> = (0..2 * MAX_RECORD + 100).map(|i| i as u8).collect();
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        for chunk in [7, 1000] {
+            let (mut client, mut server) = tls_pair_with(version, None).await;
+            client.get_mut().read_chunk = chunk;
+            server.write_all(&payload).await.unwrap();
+            server.shutdown().await.unwrap();
+
+            // Records, TLS 1.3 tickets and close_notify arrive split across transport reads;
+            // reads shorter than a record leave plaintext for the next read.
+            let mut received = Vec::new();
+            let mut buf = [0; 1500];
+            loop {
+                let n = client.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(received, payload, "{version:?} chunk {chunk}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -826,7 +966,7 @@ async fn early_data_budget_keeps_full_records() {
     let mut cx = Context::from_waker(Waker::noop());
     let res = Pin::new(&mut client).poll_connect(&mut cx);
     assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
-    let early = vec![1; 14000];
+    let early: Vec<u8> = (0..14000).map(|i| i as u8).collect();
     client.write_all(&early).await.unwrap();
     client.flush().await.unwrap();
 
@@ -834,6 +974,14 @@ async fn early_data_budget_keeps_full_records() {
     // handshake on the way.
     let res = Pin::new(&mut server).poll_accept(&mut cx);
     assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
+    // Early data read in pieces stays in BoringSSL once the read buffer is drained.
+    let mut piece = [0; 1000];
+    for part in early[..2000].chunks(1000) {
+        let mut read = ReadBuf::new(&mut piece);
+        let res = Pin::new(&mut server).poll_read(&mut cx, &mut read);
+        assert!(matches!(res, Poll::Ready(Ok(()))), "{res:?}");
+        assert_eq!(read.filled(), part);
+    }
     client.get_mut().tap.clear();
     let data: Vec<u8> = (0..2 * MAX_RECORD).map(|i| i as u8).collect();
     let res = Pin::new(&mut client).poll_write(&mut cx, &data);
@@ -845,7 +993,7 @@ async fn early_data_budget_keeps_full_records() {
     let records = records(&client.get_ref().tap);
     assert_eq!(records.len(), 5, "{records:?}");
 
-    let mut received = vec![0; early.len() + data.len()];
+    let mut received = vec![0; early.len() - 2000 + data.len()];
     server.read_exact(&mut received).await.unwrap();
-    assert_eq!(received, [&early[..], &data].concat());
+    assert_eq!(received, [&early[2000..], &data].concat());
 }
