@@ -105,6 +105,7 @@ jobs:
           - x86_64-mingw
           - i686-msvc
           - x86_64-msvc
+          - aarch64-msvc
         include:
           - check_only: false
           - extra_test_args: ""
@@ -246,6 +247,13 @@ jobs:
               RUSTC_BOOTSTRAP: 1 # for -Z checksum-freshness
             # CI's Windows doesn't have required root certs
             extra_test_args: --workspace --exclude tokio-btls -Z checksum-freshness
+          - thing: aarch64-msvc
+            target: aarch64-pc-windows-msvc
+            rust: stable-aarch64-pc-windows-msvc
+            os: windows-11-arm
+            custom_env:
+              CMAKE_GENERATOR: "Visual Studio 18 2026"
+            extra_test_args: -p btls -p btls-sys
           - thing: x86_64-msvc-static
             target: x86_64-pc-windows-msvc
             rust: stable-x86_64-msvc
@@ -288,7 +296,7 @@ jobs:
         run: sudo apt update && sudo apt install -y ${{ matrix.apt_packages }}
         shell: bash
       - name: Install nasm
-        if: startsWith(matrix.os, 'windows')
+        if: startsWith(matrix.os, 'windows') && matrix.target != 'aarch64-pc-windows-msvc'
         run: choco install nasm
         shell: cmd
       - name: Setup 32-bit MSYS2
@@ -318,7 +326,8 @@ jobs:
           echo >> $GITHUB_ENV LIBRARY_PATH="$MSYS_ROOT\\mingw32\\lib"
           echo >> $GITHUB_ENV LDFLAGS="-L$MSYS_ROOT\\mingw32\\lib"
       - name: Install LLVM and Clang
-        if: startsWith(matrix.os, 'windows')
+        # Windows ARM64 uses the runner's native LLVM.
+        if: startsWith(matrix.os, 'windows') && matrix.target != 'aarch64-pc-windows-msvc'
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "11.0"
