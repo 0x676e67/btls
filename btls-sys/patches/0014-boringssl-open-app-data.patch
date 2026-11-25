@@ -27,19 +27,19 @@ The bssl_shim flag -open-app-data reads through it. A filter BIO holds
 the input the shim pulled ahead of BoringSSL, so SSL_read continues
 where opening stops, and the runner suite passes with the flag.
 ---
- include/openssl/ssl.h   |  38 ++++
+ include/openssl/ssl.h   |  41 ++++
  ssl/ssl_lib.cc          |  73 ++++++++
  ssl/ssl_test.cc         | 448 ++++++++++++++++++++++++++++++++++++++++++++++++
  ssl/test/bssl_shim.cc   | 202 ++++++++++++++++++++++
  ssl/test/test_config.cc |   1 +
  ssl/test/test_config.h  |   1 +
- 6 files changed, 763 insertions(+)
+ 6 files changed, 766 insertions(+)
 
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 6f5d90f..2140c9b 100644
+index 6f5d90f..9f16f98 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -392,6 +392,44 @@ OPENSSL_EXPORT enum ssl_seal_app_data_result_t SSL_seal_app_data(
+@@ -392,6 +392,47 @@ OPENSSL_EXPORT enum ssl_seal_app_data_result_t SSL_seal_app_data(
      SSL *ssl, uint8_t *out, size_t *out_len, size_t max_out,
      const CRYPTO_IVEC *in, size_t num_in, size_t max_in, size_t *out_consumed);
  
@@ -49,9 +49,8 @@ index 6f5d90f..2140c9b 100644
 +// `SSL_seal_app_data`. A caller that owns the transport's input buffer can
 +// open application data records in place in it, which skips the read buffer,
 +// the `BIO` and a copy per record. It never reads from the transport and
-+// writes to it only to send a fatal alert. Whenever it declines, read with
-+// `SSL_read`, which handles every other state of the connection. DTLS and
-+// QUIC connections always decline.
++// writes to it only to send a fatal alert. DTLS and QUIC connections always
++// decline.
 +
 +// ssl_open_app_data_result_t is the result of `SSL_open_app_data`.
 +enum ssl_open_app_data_result_t BORINGSSL_ENUM_INT {
@@ -65,12 +64,16 @@ index 6f5d90f..2140c9b 100644
 +  // `*out_consumed` is the length it must reach before the next attempt: a
 +  // record header's while the header is incomplete, then the whole record's.
 +  ssl_open_app_data_partial,
-+  // ssl_open_app_data_declined means the caller must read with `SSL_read`
-+  // after dropping the first `*out_consumed` bytes of `in`. It is zero, and
-+  // the connection's read state is unchanged, when the connection is in a
-+  // state only `SSL_read` handles or holds input of its own. Otherwise opening
-+  // met a close_notify or an error, which `SSL_read` then reports. The error
-+  // queue is left empty either way.
++  // ssl_open_app_data_declined means opening in place could not continue.
++  // For TLS and DTLS, discard the first `*out_consumed` bytes of `in` and
++  // read with `SSL_read`. If `SSL_read` needs input from the read `BIO`, the
++  // `BIO` must supply the remaining bytes of `in` before it reads new bytes
++  // from the transport. Read QUIC application data through the QUIC transport.
++  //
++  // `*out_consumed` is zero and the connection's read state is unchanged
++  // when opening in place is unavailable or the connection holds input of
++  // its own. Otherwise opening met a close_notify or an error, which
++  // `SSL_read` then reports. The error queue is left empty either way.
 +  ssl_open_app_data_declined,
 +};
 +

@@ -4525,12 +4525,15 @@ impl SslRef {
     /// Opens at most one application data record in place at the start of `buf`, without
     /// transport I/O apart from a fatal alert on an error.
     ///
-    /// `buf` must start at a record boundary of the ciphertext read from the transport. On
-    /// [`Opened::Declined`], drop its first `consumed` bytes and read through
-    /// [`SslStream::ssl_read`], which handles every other state and reports a close_notify or
-    /// an error met here; no error is left queued for it.
+    /// `buf` must start at a record boundary of the ciphertext read from the transport.
+    /// On [`Opened::Declined`] for TLS or DTLS, discard the first `consumed` bytes and continue
+    /// with [`SslStream::ssl_read`]. If it needs more input, its underlying stream must supply
+    /// `buf[consumed..]` before reading new bytes from the transport. `ssl_read` handles the
+    /// remaining connection states and reports any close_notify or error encountered here.
+    /// Errors encountered here are cleared from the error queue before returning.
     ///
     /// Always declines for DTLS and QUIC, and in FIPS builds, which lack the BoringSSL patch.
+    /// Read QUIC application data through the QUIC transport.
     #[corresponds(SSL_open_app_data)]
     pub fn open_app_data(&mut self, buf: &mut [u8]) -> Result<Opened, ErrorStack> {
         #[cfg(not(feature = "fips"))]
@@ -5031,7 +5034,10 @@ pub enum Opened {
     /// `buf` holds no complete record. `needed` is the length it must reach before the next
     /// attempt: a record header's while the header is incomplete, then the whole record's.
     Partial { needed: usize },
-    /// Drop the first `consumed` bytes of `buf` and read through [`SslStream::ssl_read`].
+    /// For TLS and DTLS, discard the first `consumed` bytes of `buf` and continue with
+    /// [`SslStream::ssl_read`]. If it needs more input, its underlying stream must supply
+    /// `buf[consumed..]` before reading new bytes from the transport. Read QUIC application
+    /// data through the QUIC transport.
     Declined { consumed: usize },
 }
 
