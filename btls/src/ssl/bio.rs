@@ -7,7 +7,7 @@ use std::any::Any;
 use std::io;
 use std::io::prelude::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::slice;
 
 use crate::cvt_p;
@@ -32,7 +32,10 @@ impl BioMethod {
 unsafe impl Sync for BioMethod {}
 unsafe impl Send for BioMethod {}
 
-pub fn new<S: Read + Write>(stream: S) -> Result<(*mut BIO, BioMethod), ErrorStack> {
+/// Returns the BIO, its method, and the stream state it owns until destroyed or taken.
+pub fn new<S: Read + Write>(
+    stream: S,
+) -> Result<(*mut BIO, BioMethod, NonNull<StreamState<S>>), ErrorStack> {
     let method = BioMethod::new::<S>();
 
     let state = Box::new(StreamState {
@@ -44,33 +47,12 @@ pub fn new<S: Read + Write>(stream: S) -> Result<(*mut BIO, BioMethod), ErrorSta
 
     unsafe {
         let bio = cvt_p(BIO_new(method.0.get()))?;
-        BIO_set_data(bio, Box::into_raw(state).cast());
+        let state = NonNull::from(Box::leak(state));
+        BIO_set_data(bio, state.as_ptr().cast());
         BIO_set_init(bio, 1);
 
-        Ok((bio, method))
+        Ok((bio, method, state))
     }
-}
-
-pub unsafe fn take_error<S>(bio: *mut BIO) -> Option<io::Error> {
-    unsafe {
-        let state = state::<S>(bio);
-        state.error.take()
-    }
-}
-
-pub unsafe fn take_panic<S>(bio: *mut BIO) -> Option<Box<dyn Any + Send>> {
-    unsafe {
-        let state = state::<S>(bio);
-        state.panic.take()
-    }
-}
-
-pub unsafe fn get_ref<'a, S: 'a>(bio: *mut BIO) -> &'a S {
-    unsafe { &state(bio).stream }
-}
-
-pub unsafe fn get_mut<'a, S: 'a>(bio: *mut BIO) -> &'a mut S {
-    unsafe { &mut state(bio).stream }
 }
 
 pub unsafe extern "C" fn take_stream<S>(bio: *mut BIO) -> S {

@@ -44,6 +44,9 @@ pub use generated::{SSL_seal_app_data, SSL_seal_app_data_limits}; // your includ
 #[cfg(not(feature = "fips"))]
 pub use generated::{SSL_CTX_set_ech_grease_callback, SSL_set_ech_grease_callback}; // your include path is incorrect or has a version of boringssl without patch 0013 (ech-grease-payload-policy)
 
+#[cfg(not(feature = "fips"))]
+pub use generated::SSL_open_app_data; // your include path is incorrect or has a version of boringssl without patch 0014 (open-app-data)
+
 pub use generated::*;
 #[cfg(target_pointer_width = "64")]
 pub type BN_ULONG = u64;

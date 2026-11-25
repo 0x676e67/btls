@@ -13,9 +13,9 @@ use foreign_types::ForeignTypeRef;
 use super::server::Server;
 use crate::ffi;
 use crate::ssl::{
-    with_ivecs, ExtensionType, Sealed, SslConnector, SslContextBuilder, SslMethod, SslOptions,
-    SslRef, SslSession, SslSessionCacheMode, SslSignatureAlgorithm, SslStream, SslVersion,
-    Tls13Cipher,
+    with_ivecs, ErrorCode, ExtensionType, Opened, Sealed, SslConnector, SslContextBuilder,
+    SslMethod, SslOptions, SslRef, SslSession, SslSessionCacheMode, SslSignatureAlgorithm,
+    SslStream, SslVersion, Tls13Cipher,
 };
 
 type RecordHeaders = Arc<Mutex<Vec<[u8; 5]>>>;
@@ -1120,6 +1120,55 @@ fn seal_app_data_sends_key_update_first() {
     stream.read_exact(&mut reply).unwrap();
     assert_eq!(&reply, b"reply");
     stream.shutdown().unwrap();
+}
+
+#[test]
+fn open_app_data_round_trip() {
+    let data = payload(40000, 5);
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        let mut server = Server::builder();
+        server.ctx().set_min_proto_version(Some(version)).unwrap();
+        server.ctx().set_max_proto_version(Some(version)).unwrap();
+        server.io_cb({
+            let data = data.clone();
+            move |mut stream| {
+                stream.write_all(&data).unwrap();
+                stream.shutdown().unwrap();
+            }
+        });
+        let server = server.build();
+        let mut stream = server.client_with_root_ca().connect();
+
+        // `buf[..len]` is transport input that starts at a record boundary.
+        let mut buf = vec![0; 17 * 1024];
+        let (mut len, mut received) = (0, Vec::new());
+        let closed = loop {
+            match stream.ssl_mut().open_app_data(&mut buf[..len]).unwrap() {
+                // TLS 1.3 tickets open as records without plaintext.
+                Opened::Record {
+                    consumed,
+                    plaintext,
+                } => {
+                    received.extend_from_slice(&buf[plaintext]);
+                    buf.copy_within(consumed..len, 0);
+                    len -= consumed;
+                }
+                Opened::Partial { needed } => {
+                    assert!(len < needed && needed <= buf.len());
+                    let n = stream.get_mut().read(&mut buf[len..]).unwrap();
+                    assert_ne!(n, 0, "the transport ended inside a record");
+                    len += n;
+                }
+                Opened::Declined { consumed } => break consumed,
+            }
+        };
+
+        // The close_notify is consumed, and `ssl_read` reports it.
+        assert_eq!(closed, len);
+        assert!(received == data, "corrupted data");
+        let err = stream.ssl_read(&mut [0; 1]).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ZERO_RETURN);
+    }
 }
 
 #[test]
