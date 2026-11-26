@@ -1,0 +1,153 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 9f16f98..c2ee75d 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -4859,6 +4859,12 @@ OPENSSL_EXPORT const char *SSL_early_data_reason_string(
+ //
+ // See RFC 9849.
+ 
++// SSL_CTX_set_ech_inner_encoding_nss configures the real ECH ClientHelloInner
++// encoding for new connections. It is disabled by default and has no effect on
++// ECH selection, the negotiated TLS version, or ECH GREASE.
++OPENSSL_EXPORT void SSL_CTX_set_ech_inner_encoding_nss(SSL_CTX *ctx,
++                                                     int enabled);
++
+ // SSL_set_enable_ech_grease configures whether the client will send a GREASE
+ // ECH extension when no supported ECHConfig is available.
+ OPENSSL_EXPORT void SSL_set_enable_ech_grease(SSL *ssl, int enable);
+diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
+index 31f4941..707381f 100644
+--- a/ssl/encrypted_client_hello.cc
++++ b/ssl/encrypted_client_hello.cc
+@@ -1085,6 +1085,10 @@ void SSL_CTX_set_ech_grease_callback(SSL_CTX *ctx, SSL_ech_grease_cb callback,
+   impl->ech_grease_callback_arg = arg;
+ }
+ 
++void SSL_CTX_set_ech_inner_encoding_nss(SSL_CTX *ctx, int enabled) {
++  FromOpaque(ctx)->ech_inner_encoding_nss = enabled != 0;
++}
++
+ int SSL_set1_ech_config_list(SSL *ssl, const uint8_t *ech_config_list,
+                              size_t ech_config_list_len) {
+   auto *ssl_impl = FromOpaque(ssl);
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 1c115b8..ce549f0 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -4540,6 +4540,19 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+   }
+ 
+   hs->inner_extensions_sent = 0;
++  if (hs->config->ech_inner_encoding_nss) {
++    // NSS starts the inner extension vector with the ECH marker. Reuse its
++    // normal serializer for both the transcript and the encoded inner.
++    uint32_t index;
++    const auto *ech =
++        tls_extension_find(&index, TLSEXT_TYPE_encrypted_client_hello);
++    if (ech == nullptr ||
++        !ech->add_clienthello(hs, &extensions, compressed.get(),
++                             ssl_client_hello_inner)) {
++      return false;
++    }
++    hs->inner_extensions_sent |= uint32_t{1} << index;
++  }
+ 
+   if (ssl->ctx->grease_enabled) {
+     // Add a fake empty extension. See RFC 8701. This always matches
+@@ -4555,8 +4568,10 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+     size_t i = hs->extension_permutation.empty()
+                    ? unpermuted
+                    : hs->extension_permutation[unpermuted];
+-    if (kExtensions[i].value == TLSEXT_TYPE_record_size_limit &&
+-        hs->record_size_limit == 0) {
++    if ((hs->config->ech_inner_encoding_nss &&
++         kExtensions[i].value == TLSEXT_TYPE_encrypted_client_hello) ||
++        (kExtensions[i].value == TLSEXT_TYPE_record_size_limit &&
++         hs->record_size_limit == 0)) {
+       continue;
+     }
+     const size_t len_before = CBB_len(&extensions);
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 5a300f1..cad8c5c 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -111,7 +111,12 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+     }
+   }
+ 
+-  if (hs->min_version < TLS1_3_VERSION && type != ssl_client_hello_inner) {
++  const bool nss_inner =
++      type == ssl_client_hello_inner && hs->config->ech_inner_encoding_nss;
++  // NSS uses the regular cipher vector in the inner preamble, but suppresses
++  // fallback SCSV there. The inner supported_versions extension is unchanged.
++  if (hs->min_version < TLS1_3_VERSION &&
++      (type != ssl_client_hello_inner || nss_inner)) {
+     bool any_enabled = false;
+     for (const SSL_CIPHER *cipher : SSL_get_ciphers(ssl)) {
+       // Skip disabled ciphers
+@@ -136,7 +141,7 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+     }
+   }
+ 
+-  if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV) {
++  if (!nss_inner && (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV)) {
+     if (!CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
+       return false;
+     }
+diff --git a/ssl/internal.h b/ssl/internal.h
+index db4d555..22441ae 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -3704,6 +3704,8 @@ struct SSL_CONFIG {
+   InplaceVector<uint8_t, kNumCertTypes> available_client_cert_types;
+ 
++  bool ech_inner_encoding_nss = false;
++
+   // ech_grease_callback overrides the current SSL_CTX's policy when non-null.
+   SSL_ech_grease_cb ech_grease_callback = nullptr;
+   // ech_grease_callback_arg is borrowed from the application until replacement.
+   void *ech_grease_callback_arg = nullptr;
+@@ -4291,6 +4293,8 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+ 
++  bool ech_inner_encoding_nss = false;
++
+   // ech_grease_callback is the default policy for connections using this
+   // context.
+   SSL_ech_grease_cb ech_grease_callback = nullptr;
+   // ech_grease_callback_arg is borrowed from the application until replacement.
+   void *ech_grease_callback_arg = nullptr;
+diff --git a/ssl/record_size_limit.cc b/ssl/record_size_limit.cc
+index e6190e4..434c6da 100644
+--- a/ssl/record_size_limit.cc
++++ b/ssl/record_size_limit.cc
+@@ -99,12 +99,17 @@ bool ssl_record_size_limit_disallows_handoff(const SSLImpl *ssl) {
+   return hs != nullptr && hs->record_size_limit != 0;
+ }
+ 
+-bool record_size_limit_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out, CBB *,
++bool record_size_limit_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
++                                       CBB *out_compressible,
+                                        ssl_client_hello_type_t) {
+   if (hs->record_size_limit == 0) {
+     return true;
+   }
+ 
++  // The handshake snapshot and maximum version are shared by both hellos.
++  if (hs->config->ech_inner_encoding_nss) {
++    out = out_compressible;
++  }
+   CBB data;
+   const uint16_t limit =
+       record_size_limit_for_version(hs->record_size_limit, hs->max_version);
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index f595572..31f168a 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -569,6 +569,7 @@ SSL *SSL_new(SSL_CTX *ctx) {
+   ssl->config->handoff = ctx_impl->handoff;
+   ssl->quic_method = ctx_impl->quic_method;
+   ssl->config->record_size_limit = ctx_impl->record_size_limit;
++  ssl->config->ech_inner_encoding_nss = ctx_impl->ech_inner_encoding_nss;
+ 
+   if (!ssl->method->ssl_new(ssl.get()) ||
+       !ssl->ctx->x509_method->ssl_new(ssl->s3->hs.get())) {

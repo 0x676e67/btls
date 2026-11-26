@@ -266,3 +266,159 @@ fn ech_rejection_does_not_invoke_custom_grease_policy() {
     assert!(failed.ssl().get_ech_retry_configs().is_some());
     assert!(!failed.ssl().ech_accepted());
 }
+
+#[cfg(not(feature = "fips"))]
+#[test]
+fn ech_inner_encoding_preserves_default_and_accepts_nss() {
+    use crate::ssl::{EchInnerEncoding, ExtensionType, SslVersion};
+
+    fn extension_ids(mut hello: &[u8], cipher_len: usize) -> Vec<u16> {
+        // Legacy version, random, then the variable-length legacy session ID.
+        hello = &hello[34..];
+        hello = &hello[1 + usize::from(hello[0])..];
+        hello = &hello[2 + cipher_len..];
+        hello = &hello[1 + usize::from(hello[0])..];
+        assert_eq!(
+            usize::from(u16::from_be_bytes([hello[0], hello[1]])),
+            hello.len() - 2
+        );
+        hello = &hello[2..];
+        let mut ids = Vec::new();
+        while !hello.is_empty() {
+            ids.push(u16::from_be_bytes([hello[0], hello[1]]));
+            let len = usize::from(u16::from_be_bytes([hello[2], hello[3]]));
+            hello = &hello[4 + len..];
+        }
+        ids
+    }
+
+    for encoding in [
+        None,
+        Some(EchInnerEncoding::Default),
+        Some(EchInnerEncoding::Nss),
+    ] {
+        let key = HpkeKey::dhkem_p256_sha256(ECH_KEY).unwrap();
+        let mut keys = SslEchKeys::builder().unwrap();
+        keys.add_key(true, ECH_CONFIG, key).unwrap();
+        let mut server = Server::builder();
+        server.ctx().set_ech_keys(&keys.build()).unwrap();
+        server.ctx().set_record_size_limit(1_024);
+        let observed = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&observed);
+        server.ctx().set_select_certificate_callback(move |hello| {
+            let ciphers = hello.ciphers();
+            *captured.lock().unwrap() = Some((
+                hello.ssl().ech_accepted(),
+                ciphers.to_vec(),
+                extension_ids(hello.as_bytes(), ciphers.len()),
+                hello
+                    .get_extension(ExtensionType::RECORD_SIZE_LIMIT)
+                    .unwrap()
+                    .to_vec(),
+            ));
+            Ok(())
+        });
+        let server = server.build();
+
+        let mut client = server.client_with_root_ca();
+        let ctx = client.ctx();
+        ctx.set_min_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+        ctx.set_cipher_list("ECDHE-RSA-AES128-GCM-SHA256").unwrap();
+        ctx.set_record_size_limit(1_024);
+        ctx.set_extension_permutation(&[
+            ExtensionType::SERVER_NAME,
+            ExtensionType::RECORD_SIZE_LIMIT,
+            ExtensionType::ENCRYPTED_CLIENT_HELLO,
+            ExtensionType::SUPPORTED_VERSIONS,
+        ])
+        .unwrap();
+        if let Some(encoding) = encoding {
+            ctx.set_ech_inner_encoding(encoding);
+        }
+        let mut client = client.build().builder();
+        client.ssl().set_ech_config_list(ECH_CONFIG_LIST).unwrap();
+        client.ssl().set_hostname("foobar.com").unwrap();
+        let stream = client.connect();
+        assert!(stream.ssl().ech_accepted());
+        assert_eq!(stream.ssl().version_str(), "TLSv1.3");
+
+        let (accepted, ciphers, ids, limit) = observed.lock().unwrap().take().unwrap();
+        assert!(accepted);
+        assert_eq!(limit, 1_024u16.to_be_bytes());
+        let nss = encoding == Some(EchInnerEncoding::Nss);
+        assert_eq!(
+            ids[0] == ExtensionType::ENCRYPTED_CLIENT_HELLO.as_raw(),
+            nss
+        );
+        assert_eq!(ciphers.chunks_exact(2).any(|id| id == [0xc0, 0x2f]), nss);
+        let limit_pos = ids
+            .iter()
+            .position(|id| *id == ExtensionType::RECORD_SIZE_LIMIT.as_raw())
+            .unwrap();
+        let versions_pos = ids
+            .iter()
+            .position(|id| *id == ExtensionType::SUPPORTED_VERSIONS.as_raw())
+            .unwrap();
+        assert_eq!(limit_pos > versions_pos, nss);
+    }
+}
+
+#[cfg(not(feature = "fips"))]
+#[test]
+fn ech_nss_encoding_across_hrr_and_resumption() {
+    use crate::ssl::{EchInnerEncoding, KeyShare, SslSessionCacheMode};
+
+    let key = HpkeKey::dhkem_p256_sha256(ECH_KEY).unwrap();
+    let mut keys = SslEchKeys::builder().unwrap();
+    keys.add_key(true, ECH_CONFIG, key).unwrap();
+    let mut server = Server::builder();
+    server.expected_connections_count(2);
+    server.ctx().set_ech_keys(&keys.build()).unwrap();
+    server.ctx().set_curves_list("P-384").unwrap();
+    let server = server.build();
+
+    let mut client = server.client_with_root_ca();
+    client.ctx().set_ech_inner_encoding(EchInnerEncoding::Nss);
+    client.ctx().set_curves_list("X25519:P-384").unwrap();
+    client
+        .ctx()
+        .set_session_cache_mode(SslSessionCacheMode::CLIENT);
+    let session = Arc::new(Mutex::new(None));
+    let saved = Arc::clone(&session);
+    client.ctx().set_new_session_callback(move |_, ticket| {
+        *saved.lock().unwrap() = Some(ticket);
+    });
+    let client = client.build();
+    let configure = |client: &mut ClientSslBuilder| {
+        client.ssl().set_ech_config_list(ECH_CONFIG_LIST).unwrap();
+        client.ssl().set_hostname("foobar.com").unwrap();
+    };
+
+    let mut first = client.builder();
+    configure(&mut first);
+    first
+        .ssl()
+        .set_client_key_shares(&[KeyShare::X25519])
+        .unwrap();
+    let first = first.connect();
+    assert!(first.ssl().used_hello_retry_request());
+    assert!(first.ssl().ech_accepted());
+    assert!(!first.ssl().session_reused());
+
+    let session = session
+        .lock()
+        .unwrap()
+        .take()
+        .expect("server sent a ticket");
+    let mut second = client.builder();
+    configure(&mut second);
+    second
+        .ssl()
+        .set_client_key_shares(&[KeyShare::P384])
+        .unwrap();
+    // This session was issued for the same origin and client context above.
+    unsafe { second.ssl().set_session(&session).unwrap() };
+    let resumed = second.connect();
+    assert!(resumed.ssl().ech_accepted());
+    assert!(resumed.ssl().session_reused());
+}
