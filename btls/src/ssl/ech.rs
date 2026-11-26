@@ -6,17 +6,6 @@ use crate::error::ErrorStack;
 use crate::hpke::HpkeKey;
 use crate::{cvt_0i, cvt_p};
 
-/// Client policy for offering Encrypted Client Hello (ECH).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum EchPolicy {
-    /// Offer ECH when a supported configuration is available. Otherwise, proceed without real ECH.
-    #[default]
-    Opportunistic,
-    /// Fail the handshake before sending the ClientHello if ECH cannot be offered.
-    Required,
-}
-
 pub struct SslEchKeysBuilder {
     keys: SslEchKeys,
 }

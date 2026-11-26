@@ -1,8 +1,8 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 9f16f98..c2ee75d 100644
+index 9f16f98..ca8abdb 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -4859,6 +4859,12 @@ OPENSSL_EXPORT const char *SSL_early_data_reason_string(
+@@ -4859,6 +4859,16 @@ OPENSSL_EXPORT const char *SSL_early_data_reason_string(
  //
  // See RFC 9849.
  
@@ -12,19 +12,30 @@ index 9f16f98..c2ee75d 100644
 +OPENSSL_EXPORT void SSL_CTX_set_ech_inner_encoding_nss(SSL_CTX *ctx,
 +                                                     int enabled);
 +
++// SSL_set_ech_inner_encoding_nss overrides the real ECH ClientHelloInner
++// encoding for a single client connection.
++OPENSSL_EXPORT void SSL_set_ech_inner_encoding_nss(SSL *ssl, int enabled);
++
  // SSL_set_enable_ech_grease configures whether the client will send a GREASE
  // ECH extension when no supported ECHConfig is available.
  OPENSSL_EXPORT void SSL_set_enable_ech_grease(SSL *ssl, int enable);
 diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
-index 31f4941..707381f 100644
+index 31f4941..73184a6 100644
 --- a/ssl/encrypted_client_hello.cc
 +++ b/ssl/encrypted_client_hello.cc
-@@ -1085,6 +1085,10 @@ void SSL_CTX_set_ech_grease_callback(SSL_CTX *ctx, SSL_ech_grease_cb callback,
+@@ -1085,6 +1085,17 @@ void SSL_CTX_set_ech_grease_callback(SSL_CTX *ctx, SSL_ech_grease_cb callback,
    impl->ech_grease_callback_arg = arg;
  }
  
 +void SSL_CTX_set_ech_inner_encoding_nss(SSL_CTX *ctx, int enabled) {
 +  FromOpaque(ctx)->ech_inner_encoding_nss = enabled != 0;
++}
++
++void SSL_set_ech_inner_encoding_nss(SSL *ssl, int enabled) {
++  auto *impl = FromOpaque(ssl);
++  if (impl->config) {
++    impl->config->ech_inner_encoding_nss = enabled != 0;
++  }
 +}
 +
  int SSL_set1_ech_config_list(SSL *ssl, const uint8_t *ech_config_list,
