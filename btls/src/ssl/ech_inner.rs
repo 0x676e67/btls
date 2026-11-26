@@ -1,8 +1,8 @@
+use crate::cvt_0i;
 use crate::error::ErrorStack;
-use crate::ssl::{SslContextBuilder, SslRef};
+use crate::ssl::SslRef;
 use btls_sys as ffi;
 use foreign_types::ForeignTypeRef;
-use openssl_macros::corresponds;
 use std::ffi::c_int;
 
 /// Serialization policy for the real ECH `ClientHelloInner`.
@@ -27,18 +27,10 @@ impl EchInnerEncoding {
     }
 }
 
-impl SslContextBuilder {
-    /// Sets the real ECH inner encoding for connections created from this
-    /// context. This does not enable ECH or change ECH GREASE.
-    #[corresponds(SSL_CTX_set_ech_inner_encoding_nss)]
-    pub fn set_ech_inner_encoding(&mut self, encoding: EchInnerEncoding) {
-        unsafe { ffi::SSL_CTX_set_ech_inner_encoding_nss(self.as_ptr(), encoding.as_raw()) }
-    }
-}
-
 impl SslRef {
-    /// Sets this connection's serialized ECHConfigList and overrides the context's
-    /// encoding policy for the real ECH `ClientHelloInner`.
+    /// Sets the serialized ECHConfigList and the real ECH `ClientHelloInner`
+    /// encoding for this client connection. [`SslRef::set_ech_config_list`]
+    /// selects [`EchInnerEncoding::Default`].
     ///
     /// If the list is invalid, neither setting is changed. The policy does not alter
     /// ECH configuration selection, fallback behavior, or ECH GREASE.
@@ -47,8 +39,14 @@ impl SslRef {
         ech_config_list: &[u8],
         encoding: EchInnerEncoding,
     ) -> Result<(), ErrorStack> {
-        self.set_ech_config_list(ech_config_list)?;
-        unsafe { ffi::SSL_set_ech_inner_encoding_nss(self.as_ptr(), encoding.as_raw()) };
-        Ok(())
+        unsafe {
+            cvt_0i(ffi::SSL_set1_ech_config_list_with_policy(
+                self.as_ptr(),
+                ech_config_list.as_ptr(),
+                ech_config_list.len(),
+                encoding.as_raw(),
+            ))
+            .map(|_| ())
+        }
     }
 }

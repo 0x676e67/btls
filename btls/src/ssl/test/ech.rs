@@ -294,12 +294,12 @@ fn ech_inner_encoding_preserves_default_and_accepts_nss() {
 
     use EchInnerEncoding::{Default, Nss};
 
-    for (context_encoding, connection_encoding, nss) in [
-        (None, None, false),
-        (Some(Default), None, false),
-        (Some(Nss), None, true),
-        (None, Some(Nss), true),
-        (Some(Nss), Some(Default), false),
+    for (start_with_nss, encoding, nss) in [
+        (false, None, false),
+        (false, Some(Default), false),
+        (false, Some(Nss), true),
+        (true, None, false),
+        (true, Some(Default), false),
     ] {
         let key = HpkeKey::dhkem_p256_sha256(ECH_KEY).unwrap();
         let mut keys = SslEchKeys::builder().unwrap();
@@ -336,11 +336,14 @@ fn ech_inner_encoding_preserves_default_and_accepts_nss() {
             ExtensionType::SUPPORTED_VERSIONS,
         ])
         .unwrap();
-        if let Some(encoding) = context_encoding {
-            ctx.set_ech_inner_encoding(encoding);
-        }
         let mut client = client.build().builder();
-        if let Some(encoding) = connection_encoding {
+        if start_with_nss {
+            client
+                .ssl()
+                .set_ech_config_list_with_policy(ECH_CONFIG_LIST, Nss)
+                .unwrap();
+        }
+        if let Some(encoding) = encoding {
             let ssl = client.ssl();
             ssl.set_ech_config_list_with_policy(ECH_CONFIG_LIST, encoding)
                 .unwrap();
