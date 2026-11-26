@@ -2,8 +2,8 @@ use crate::hpke::HpkeKey;
 use crate::ssl::ech::SslEchKeys;
 use crate::ssl::test::server::{ClientSslBuilder, Server};
 use crate::ssl::{
-    BoxSelectCertActionFinish, ClientHello, HandshakeError, NameType, SelectCertAction,
-    SelectCertError,
+    BoxSelectCertActionFinish, ClientHello, EchPolicy, HandshakeError, NameType, SelectCertAction,
+    SelectCertError, Ssl, SslContextBuilder, SslMethod, SslVersion,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,6 +49,92 @@ fn ech() {
 
     let ssl_stream = client.connect();
     assert!(ssl_stream.ssl().ech_accepted());
+}
+
+fn unsupported_ech_config_list() -> Vec<u8> {
+    let mut list = ECH_CONFIG_LIST.to_vec();
+    // The first two bytes are the list length; use an unknown ECHConfig version.
+    list[2..4].copy_from_slice(&0xffffu16.to_be_bytes());
+    list
+}
+
+fn new_ech_policy_client_ssl() -> Ssl {
+    let ctx = SslContextBuilder::new(SslMethod::tls()).unwrap().build();
+    Ssl::new(&ctx).unwrap()
+}
+
+fn assert_ech_policy_fails_before_client_hello(ssl: Ssl) {
+    let wire = std::io::Cursor::new(Vec::<u8>::new());
+    let HandshakeError::Failure(failed) = ssl.connect(wire).unwrap_err() else {
+        panic!("expected handshake failure");
+    };
+    let errors = failed.error().ssl_error().unwrap();
+    assert!(errors.errors().iter().any(|err| {
+        err.library_reason(crate::ffi::ERR_LIB_SSL)
+            == Some(crate::ffi::SSL_R_UNUSABLE_ECH_CONFIG_LIST)
+    }));
+    assert!(failed.get_ref().get_ref().is_empty());
+}
+
+#[test]
+fn ech_config_policy_required_rejects_unsupported_list_before_client_hello() {
+    let mut ssl = new_ech_policy_client_ssl();
+    ssl.set_enable_ech_grease(true);
+    ssl.set_ech_config_list_with_policy(&unsupported_ech_config_list(), EchPolicy::Required)
+        .unwrap();
+
+    assert_ech_policy_fails_before_client_hello(ssl);
+}
+
+#[test]
+fn ech_config_policy_required_rejects_tls_1_2_before_client_hello() {
+    let mut ssl = new_ech_policy_client_ssl();
+    ssl.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+    ssl.set_ech_config_list_with_policy(ECH_CONFIG_LIST, EchPolicy::Required)
+        .unwrap();
+
+    assert_ech_policy_fails_before_client_hello(ssl);
+}
+
+#[test]
+fn ech_config_policy_opportunistic_allows_unsupported_list() {
+    let list = unsupported_ech_config_list();
+    let (_server, client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, Some(&list));
+    assert!(!client.connect().ssl().ech_accepted());
+
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, None);
+    client
+        .ssl()
+        .set_ech_config_list_with_policy(&list, EchPolicy::Required)
+        .unwrap();
+    client
+        .ssl()
+        .set_ech_config_list_with_policy(&list, EchPolicy::Opportunistic)
+        .unwrap();
+    assert!(!client.connect().ssl().ech_accepted());
+}
+
+#[test]
+fn ech_config_policy_required_accepts_valid_config() {
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, None);
+    client
+        .ssl()
+        .set_ech_config_list_with_policy(ECH_CONFIG_LIST, EchPolicy::Required)
+        .unwrap();
+
+    assert!(client.connect().ssl().ech_accepted());
+}
+
+#[test]
+fn ech_config_policy_malformed_list_preserves_required_policy() {
+    let mut ssl = new_ech_policy_client_ssl();
+    ssl.set_ech_config_list_with_policy(&unsupported_ech_config_list(), EchPolicy::Required)
+        .unwrap();
+
+    assert!(ssl
+        .set_ech_config_list_with_policy(&[], EchPolicy::Opportunistic)
+        .is_err());
+    assert_ech_policy_fails_before_client_hello(ssl);
 }
 
 #[test]

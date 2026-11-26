@@ -116,7 +116,7 @@ pub use self::connector::{
 #[cfg(feature = "credential")]
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
 pub use self::early_data::EarlyDataReason;
-pub use self::ech::SslEchKeysRef;
+pub use self::ech::{EchPolicy, SslEchKeysRef};
 #[cfg(not(feature = "fips"))]
 pub use self::ech_grease::{
     EchGreaseAead, EchGreaseParameters, EchGreaseRounding, EchGreaseSizeInfo,
@@ -4660,6 +4660,30 @@ impl SslRef {
             ))
             .map(|_| ())
         }
+    }
+
+    /// Configures the serialized ECHConfigList and the ECH policy for this client connection.
+    ///
+    /// A malformed list returns an error without changing the policy. A well-formed list is
+    /// checked for usable configurations during the handshake. With [`EchPolicy::Required`],
+    /// the handshake fails before sending the ClientHello if no usable config is found or
+    /// TLS 1.3 is unavailable, even if ECH GREASE is enabled.
+    ///
+    /// If discovery returns no list, callers requiring ECH should fail without connecting.
+    /// After ECH rejection, retry only if [`SslRef::get_ech_retry_configs`] returns an
+    /// authenticated list, and apply the same policy to the new connection.
+    pub fn set_ech_config_list_with_policy(
+        &mut self,
+        ech_config_list: &[u8],
+        policy: EchPolicy,
+    ) -> Result<(), ErrorStack> {
+        self.set_ech_config_list(ech_config_list)?;
+        let required = match policy {
+            EchPolicy::Opportunistic => 0,
+            EchPolicy::Required => 1,
+        };
+        unsafe { ffi::SSL_set_reject_unusable_ech_config(self.as_ptr(), required) };
+        Ok(())
     }
 
     /// This function returns a serialized `ECHConfigList` as provided by the
