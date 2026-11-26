@@ -121,6 +121,8 @@ pub use self::ech::SslEchKeysRef;
 pub use self::ech_grease::{
     EchGreaseAead, EchGreaseParameters, EchGreaseRounding, EchGreaseSizeInfo,
 };
+#[cfg(not(feature = "fips"))]
+pub use self::ech_inner::EchInnerEncoding;
 pub use self::error::{Error, ErrorCode, HandshakeError};
 pub use self::quic::{QuicEncryptionLevel, QuicMethod, QuicMethodError};
 
@@ -136,6 +138,8 @@ mod early_data;
 mod ech;
 #[cfg(not(feature = "fips"))]
 mod ech_grease;
+#[cfg(not(feature = "fips"))]
+mod ech_inner;
 mod error;
 mod mut_only;
 mod quic;

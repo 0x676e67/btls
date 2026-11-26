@@ -550,6 +550,7 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
             "0012-boringssl-cheap-error-reset.patch",
             "0013-ech-grease-payload-policy.patch",
             "0014-boringssl-open-app-data.patch",
+            "0015-ech-inner-encoding.patch",
         ] {
             println!("cargo:warning=applying {patch_name} to boringssl");
             apply_patch(config, patch_name)?;
